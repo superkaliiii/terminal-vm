@@ -1,0 +1,11 @@
+{
+  "name": "terminal-linux",
+  "owner": { "name": "terminal-linux" },
+  "plugins": [
+    {
+      "name": "terminal-linux",
+      "description": "A separate Linux desktop (QEMU/KVM) for computer-use agents.",
+      "source": "./"
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "name": "terminal-linux",
+  "version": "0.2.0",
+  "description": "A separate Linux desktop (QEMU/KVM) for computer-use agents: MCP tools and a skill.",
+  "license": "MIT",
+  "skills": "./skills",
+  "mcpServers": {
+    "terminal-linux": {
+      "command": "python3",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/terminal_linux.py", "mcp", "default"]
+    }
+  }
+}
