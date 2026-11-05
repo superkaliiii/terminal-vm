@@ -156,6 +156,14 @@ VM data lives in `~/Library/Application Support/terminal-mac/machines/NAME/`. `T
 
 An interrupted or failed installation leaves its directory and `installed: false` for diagnosis. It is never silently overwritten. To retry, ensure no installer/VM is running, move that incomplete directory aside, then create the VM again. There is deliberately no destructive VM-delete command yet.
 
+## Host control (no guest helper)
+
+`terminal-mac create NAME --host-control` (or `up NAME --host-control`, or `control NAME --host` on a stopped VM) drives the guest from the VM process instead of the guest helper. Screenshots, frames and input go through the VM's own display, so nothing is installed in the guest, no guest permissions are needed, and agents can operate the login window and Setup Assistant. The MCP tools, `action` and `view` work unchanged.
+
+It uses Virtualization's built-in VNC server, which is **private Apple API** (the same one `tart --vnc-experimental` uses): a future macOS may remove or change it. `terminal-mac doctor` reports `hostControlAvailable`, and `control NAME --guest` switches back. The VNC server gets a random password per boot, known only to the VM process; host control attaches no shared folders to the guest. Typed text is sent as X11 keysyms and Command as Super, so non-US guest keyboard layouts and some shortcuts may behave differently than with the helper.
+
+`stop NAME` now waits up to `--timeout` seconds (default 60) for the guest to shut down and fails with a hint when it does not, for example when the guest shows a confirmation dialog.
+
 ## Isolation model
 
 - Host input and screen APIs are not used for agent actions. The helper refuses to run unless `hw.model` starts with `VirtualMac`. That check prevents accidental host execution; it is not hardware attestation or a defense against a compromised host.

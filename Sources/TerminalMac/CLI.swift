@@ -27,7 +27,8 @@ final class CLI {
             _ = try Arguments(tail)
             try printJSON(["architecture": "arm64", "virtualizationSupported": String(VZVirtualMachine.isSupported),
                            "macOS": ProcessInfo.processInfo.operatingSystemVersionString, "dataDirectory": store.root.path,
-                           "guestToolsBundled": String(FileManager.default.fileExists(atPath: toolsURL.appendingPathComponent("TerminalMacGuest.app").path))])
+                           "guestToolsBundled": String(FileManager.default.fileExists(atPath: toolsURL.appendingPathComponent("TerminalMacGuest.app").path)),
+                           "hostControlAvailable": String(HostDisplayServer.isAvailable)])
         case "image":
             let args = try Arguments(tail, options: ["output"])
             guard args.positionals.isEmpty else { throw Failure("Usage: terminal-mac image [--output /path/to/restore.ipsw]") }
@@ -45,7 +46,7 @@ final class CLI {
             try FileManager.default.moveItem(at: temporary, to: destination)
             print(destination.path)
         case "create":
-            let args = try Arguments(tail, flags: ["offline", "standard"], options: ["ipsw", "cpus", "memory", "disk", "width", "height"])
+            let args = try Arguments(tail, flags: ["offline", "standard", "host-control"], options: ["ipsw", "cpus", "memory", "disk", "width", "height"])
             try await VirtualMachines.create(args, store: store)
         case "ls", "list":
             _ = try Arguments(tail)
@@ -94,15 +95,42 @@ final class CLI {
             try await runtime!.start(show: args.flags.contains("window"))
             // Keep the app event loop and runtime alive until guest shutdown.
             while true { try await Task.sleep(nanoseconds: 1_000_000_000) }
-        case "status", "show", "hide", "pause", "resume", "stop":
-            let args = try Arguments(tail, flags: command == "stop" ? ["force"] : [])
+        case "status", "show", "hide", "pause", "resume":
+            let args = try Arguments(tail)
             let name = try args.machineName()
             _ = try store.load(name)
             if command == "status", !runtimeIsLocked(try store.directory(name)) {
                 try printJSON(["name": name, "state": "stopped"]); return
             }
-            let reply = try await host(name, action: command, arguments: ["force": String(args.flags.contains("force"))])
+            let reply = try await host(name, action: command)
             try printJSON(reply.values)
+        case "stop":
+            let args = try Arguments(tail, flags: ["force"], options: ["timeout"])
+            let name = try args.machineName()
+            _ = try store.load(name)
+            let directory = try store.directory(name)
+            guard runtimeIsLocked(directory) else { try printJSON(["name": name, "state": "stopped"]); return }
+            let timeout = try args.integer("timeout", default: 60, range: 0...3600)
+            let force = args.flags.contains("force")
+            let reply = try await host(name, action: "stop", arguments: ["force": String(force)])
+            if force || timeout == 0 { try printJSON(reply.values); return }
+            // Wait for the VM process to exit, so callers learn whether the guest actually shut down.
+            let deadline = Date().addingTimeInterval(Double(timeout))
+            while runtimeIsLocked(directory) && Date() < deadline { try await Task.sleep(nanoseconds: 250_000_000) }
+            guard !runtimeIsLocked(directory) else {
+                throw Failure("The guest has not shut down after \(timeout) seconds; it may be showing a confirmation dialog. Check with terminal-mac view \(name), or power off with terminal-mac stop \(name) --force (unsaved guest work can be lost).")
+            }
+            try printJSON(["name": name, "state": "stopped"])
+        case "control":
+            let args = try Arguments(tail, flags: ["host", "guest"])
+            let name = try args.machineName()
+            var machine = try store.load(name)
+            guard args.flags.count == 1 else { throw Failure("Usage: terminal-mac control [NAME] --host|--guest") }
+            guard !runtimeIsLocked(try store.directory(name)) else { throw Failure("Stop the VM first: terminal-mac stop \(name). The control mode applies at the next boot.") }
+            if args.flags.contains("host") && !HostDisplayServer.isAvailable { throw Failure("Host control needs Virtualization's display server, which this macOS does not have") }
+            machine.control = args.flags.contains("host") ? "host" : nil
+            try store.save(machine)
+            try printJSON(["name": name, "control": machine.usesHostControl ? "host" : "guest"])
         case "display":
             let args = try Arguments(tail, flags: ["hidpi", "standard"])
             let name = try args.machineName()
@@ -245,13 +273,16 @@ final class CLI {
     create [NAME] --ipsw PATH     Install a new virtual Mac (default name: default)
       [--cpus 4 --memory 4 --disk 64 --width 1280 --height 800 --offline]
       [--standard]                1x display; new VMs default to sharp 2x HiDPI
+      [--host-control]            Drive the guest from the host: no guest helper or permissions
     display [NAME] --hidpi|--standard  Switch a stopped VM between 2x and 1x
+    control [NAME] --host|--guest      Switch a stopped VM between host control and the guest helper
     start [NAME] [--window]       Boot in the background; show setup window if requested
     view [NAME] [--read-only]     Live terminal desktop (Ghostty, Kitty, iTerm2)
       [--protocol kitty|iterm]    Ctrl+G opens Mac shortcuts; Ctrl+] exits
     show|hide [NAME]             Show or hide the native VM window
     status|pause|resume [NAME]   Manage the VM
-    stop [NAME] [--force]        Request guest shutdown (or immediately power off)
+    stop [NAME] [--force]        Request guest shutdown and wait for it (or immediately power off)
+      [--timeout 60]             Seconds to wait; 0 returns right after the request
     ls                          List installed VMs as JSON
     doctor                      Check host support and bundled guest tools
 
@@ -270,8 +301,9 @@ final class CLI {
     skills get|path|install     The agent skill for this version; install copies it
       [--dir ~/.claude/skills]  into an agent's skills folder
 
-    Actions require TerminalMacGuest.app running inside the logged-in guest.
-    Screen Recording and Accessibility are granted inside the guest only.
+    With guest control (default), actions require TerminalMacGuest.app running inside the
+    logged-in guest; Screen Recording and Accessibility are granted inside the guest only.
+    With host control, the VM process reads the display and sends input itself.
     TERMINAL_MAC_HOME overrides the host data directory.
     """
 }

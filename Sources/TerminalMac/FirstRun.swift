@@ -4,7 +4,7 @@ import TerminalMacCore
 
 extension CLI {
     func up(_ input: [String]) async throws {
-        let args = try Arguments(input, flags: ["plan", "no-view", "detach", "offline"], options: ["ipsw", "cpus", "memory", "disk", "width", "height", "timeout", "protocol"])
+        let args = try Arguments(input, flags: ["plan", "no-view", "detach", "offline", "host-control"], options: ["ipsw", "cpus", "memory", "disk", "width", "height", "timeout", "protocol"])
         let name = try args.machineName()
         let directory = try store.directory(name)
         let existing = FileManager.default.fileExists(atPath: directory.appendingPathComponent("machine.json").path) ? try store.load(name) : nil
@@ -38,10 +38,10 @@ extension CLI {
             for key in ["cpus", "memory", "disk", "width", "height"] {
                 if let value = args.options[key] { createInput += ["--\(key)", value] }
             }
-            if args.flags.contains("offline") { createInput += ["--offline"] }
-            try await VirtualMachines.create(Arguments(createInput, flags: ["offline"], options: ["ipsw", "cpus", "memory", "disk", "width", "height"]), store: store, retryIncomplete: true)
-        } else if !Set(args.options.keys).intersection(["ipsw", "cpus", "memory", "disk", "width", "height"]).isEmpty || args.flags.contains("offline") {
-            throw Failure("This VM already exists. Creation options only apply to a new VM; run terminal-mac up \(name) without them.")
+            for flag in ["offline", "host-control"] where args.flags.contains(flag) { createInput += ["--\(flag)"] }
+            try await VirtualMachines.create(Arguments(createInput, flags: ["offline", "host-control"], options: ["ipsw", "cpus", "memory", "disk", "width", "height"]), store: store, retryIncomplete: true)
+        } else if !Set(args.options.keys).intersection(["ipsw", "cpus", "memory", "disk", "width", "height"]).isEmpty || args.flags.contains("offline") || args.flags.contains("host-control") {
+            throw Failure("This VM already exists. Creation options only apply to a new VM; run terminal-mac up \(name) without them (use terminal-mac control \(name) --host to switch control mode).")
         }
         try await run(["start", name], quietStartup: true)
         let lifecycle = try await host(name, action: "status", timeout: 30)
