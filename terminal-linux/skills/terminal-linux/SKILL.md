@@ -9,7 +9,7 @@ terminal-linux gives you computer use inside a separate virtual Linux machine. Y
 
 ## Tools (MCP server `terminal-linux mcp NAME`)
 
-`screenshot`, `click` (`clicks: 2|3`, `button: right|middle`), `move`, `drag`, `scroll` (`dy`, negative scrolls down, 100 per notch), `type`, `key`, `status`. Coordinates are pixels of the latest `screenshot`. Action tools accept `screenshot: true` to return a fresh screenshot with the result.
+`screenshot`, `click` (`clicks: 2|3`, `button: right|middle`), `move`, `drag`, `scroll` (`dy`, negative scrolls down, 100 per notch), `type`, `key`, `status`, `wait` (until the screen stops changing, then a screenshot; `stable` seconds, `timeout`; a blinking cursor can keep it from settling, so read `stable` in the reply). Coordinates are pixels of the latest `screenshot`. Action tools accept `screenshot: true` to return a fresh screenshot with the result.
 
 ## Loop: observe -> act -> verify
 
@@ -20,8 +20,12 @@ terminal-linux gives you computer use inside a separate virtual Linux machine. Y
 
 ## Text and keys
 
-- `type` sends text in the guest's keyboard layout (set per VM with `--layout us|fr`). Characters outside that layout go through Ctrl+Shift+U Unicode entry, which works in GTK/Qt apps but not in raw consoles.
+- `type` sends text in the guest's keyboard layout (set per VM with `--layout us|fr`, changed with `terminal-linux layout NAME us|fr`). `type` and `key` accept `layout: us|fr` for one call, e.g. when the guest's active keyboard differs (wrong letters such as `q` for `a` are the symptom). Characters outside that layout go through Ctrl+Shift+U Unicode entry, which works in GTK/Qt apps but not in raw consoles.
 - `key` takes chords such as `ctrl+a`, `alt+tab`, `ctrl+alt+t`, `return`, `escape`, `super`, `f5`. Letters name the letter in the guest layout.
+
+## Windows guests
+
+`terminal-linux ls` shows each VM's `os`. Windows guests log on automatically after their unattended install; use Windows shortcuts (`super` opens Start, `super+r` Run, `ctrl+shift+escape` Task Manager). `status` reports users as unknown there: rely on the screenshot.
 
 ## When to ask the user
 
@@ -31,3 +35,5 @@ terminal-linux gives you computer use inside a separate virtual Linux machine. Y
 ## Lifecycle (CLI)
 
 `terminal-linux ls`, `status NAME`, `pause NAME`, `resume NAME`, `stop NAME` (asks the guest; it may show a confirmation dialog you can click), `stop NAME --force` (power cut, can lose work: only when the user agrees). Do not delete VM data.
+
+Before a risky step, `terminal-linux snapshot NAME save TAG` (running VM: memory included); `snapshot NAME load TAG` returns to it, `snapshot NAME ls` lists them. Files: `terminal-linux push NAME LOCAL GUEST` / `pull NAME GUEST LOCAL` (needs qemu-guest-agent in the guest). `rm` and `reset` destroy data: only when the user asks.
