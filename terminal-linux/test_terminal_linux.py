@@ -252,9 +252,14 @@ class WindowsGuests(unittest.TestCase):
             self.assertEqual("/IMAGE/INDEX" in xml, os_name == "win2025")
             self.assertEqual("HideOnlineAccountScreens" in xml, os_name != "win7")
             self.assertIn("EnableHexNumpad", xml)
+            # set in the first session, then a reboot so the agent's session (auto-logon again) has it
+            self.assertLess(xml.index("EnableHexNumpad"), xml.index("shutdown /r"))
+            self.assertIn("<FirstLogonCommands>", xml)
             self.assertIn("<AdministratorPassword><Value>p&lt;&amp;&gt;w-Aa1</Value>", xml)  # Server OOBE stops without it
             spec = root.find(f"{ns}settings[@pass='specialize']")  # default profile, so the first session has it
-            self.assertIn(r"HKU\TLDefault", ET.tostring(spec, encoding="unicode"))
+            spec_xml = ET.tostring(spec, encoding="unicode")
+            for needle in ("ShutdownWithoutLogon", "monitor-timeout-ac 0", "CONSOLELOCK 0"):
+                self.assertIn(needle, spec_xml)   # stoppable and never locked or blanked for the agent
         self.assertIn("W269N-WFGWX-YVC9B-4J6C9-T83GX", tl.autounattend(tl.PROFILES["win10"], "us", "u", "p", tl.PROFILES["win10"]["key"]))
         self.assertNotIn("<ProductKey>", tl.autounattend(tl.PROFILES["win2025"], "us", "u", "p", None))
 

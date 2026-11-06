@@ -514,12 +514,20 @@ def autounattend(p, layout, user, password, key, ui="en-US"):
             + ("<SkipMachineOOBE>true</SkipMachineOOBE><SkipUserOOBE>true</SkipUserOOBE>" if p["oobe"] == "win7" else
                "<HideOEMRegistrationScreen>true</HideOEMRegistrationScreen><HideOnlineAccountScreens>true</HideOnlineAccountScreens>"
                "<HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>") + "</OOBE>")
-    # EnableHexNumpad is read at logon: write it to the default profile before the user's profile is copied from it,
-    # so it works from the first session (a FirstLogonCommands HKCU write only applies from the second)
-    hexpad = "".join(f'<RunSynchronousCommand wcm:action="add"><Order>{i}</Order><Path>{c}</Path></RunSynchronousCommand>'
-                     for i, c in enumerate(('reg load HKU\\TLDefault %SystemDrive%\\Users\\Default\\NTUSER.DAT',
-                                            'reg add "HKU\\TLDefault\\Control Panel\\Input Method" /v EnableHexNumpad /t REG_SZ /d 1 /f',
-                                            'reg unload HKU\\TLDefault'), 1))
+    # An agent's VM must stay visible and stoppable: no display-off, sleep or lock on idle (the screen went black,
+    # then locked), and honour the ACPI power button at the lock screen (Server ignores it there by default).
+    machine = "".join(f'<RunSynchronousCommand wcm:action="add"><Order>{i}</Order><Path>{c}</Path></RunSynchronousCommand>'
+                      for i, c in enumerate(('reg add HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System '
+                                            '/v ShutdownWithoutLogon /t REG_DWORD /d 1 /f',
+                                            'powercfg /change monitor-timeout-ac 0',
+                                            'powercfg /change standby-timeout-ac 0',
+                                            'powercfg /setacvalueindex SCHEME_CURRENT SUB_NONE CONSOLELOCK 0'), 1))
+    # EnableHexNumpad is read at logon: set it in the first session, then reboot so the session the agent gets
+    # (auto-logon again) has it. Writing it to the Default profile in specialize was tried and did not reach the user.
+    first = ("<FirstLogonCommands>" + "".join(
+        f'<SynchronousCommand wcm:action="add"><Order>{i}</Order><CommandLine>{c}</CommandLine></SynchronousCommand>'
+        for i, c in enumerate(('reg add "HKCU\\Control Panel\\Input Method" /v EnableHexNumpad /t REG_SZ /d 1 /f',
+                               'shutdown /r /t 5'), 1)) + "</FirstLogonCommands>")
     shell = "Microsoft-Windows-Shell-Setup"
     return ('<?xml version="1.0" encoding="utf-8"?>\n<unattend xmlns="urn:schemas-microsoft-com:unattend" '
             'xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">'
@@ -527,14 +535,14 @@ def autounattend(p, layout, user, password, key, ui="en-US"):
                                                  f"<SetupUILanguage><UILanguage>{escape(ui)}</UILanguage></SetupUILanguage>" + intl())
             + comp("Microsoft-Windows-Setup", setup) + '</settings>'
             '<settings pass="specialize">' + comp(shell, "<ComputerName>*</ComputerName>")
-            + comp("Microsoft-Windows-Deployment", f"<RunSynchronous>{hexpad}</RunSynchronous>") + '</settings>'
+            + comp("Microsoft-Windows-Deployment", f"<RunSynchronous>{machine}</RunSynchronous>") + '</settings>'
             '<settings pass="oobeSystem">' + comp("Microsoft-Windows-International-Core", intl())
             # AdministratorPassword: Server OOBE otherwise stops on the built-in Administrator's password page
             + comp(shell, f'<UserAccounts><AdministratorPassword><Value>{escape(password)}</Value><PlainText>true</PlainText>'
                           f'</AdministratorPassword><LocalAccounts><LocalAccount wcm:action="add">{pw}<Name>{escape(user)}</Name>'
                           f'<Group>Administrators</Group></LocalAccount></LocalAccounts></UserAccounts>'
                           f'<AutoLogon>{pw}<Enabled>true</Enabled><LogonCount>9999</LogonCount><Username>{escape(user)}</Username></AutoLogon>'
-                          + oobe) + '</settings></unattend>\n')
+                          + oobe + first) + '</settings></unattend>\n')
 
 
 def winnt_sif(layout, password, key):
@@ -680,7 +688,8 @@ def stop(name, force=False, timeout=60):
     q = qmp(name)
     q.cmd("system_powerdown")
     q.close()
-    for _ in range(timeout * 2):  # QEMU exits after the guest powers off; os.kill(pid, 0) would kill on Windows
+    deadline = time.monotonic() + timeout  # a wall-clock bound: each state() poll can itself wait for QMP
+    while time.monotonic() < deadline:  # QEMU exits after the guest powers off; os.kill(pid, 0) would kill on Windows
         if state(name) == "stopped":
             print(json.dumps({"stopped": name})); return
         time.sleep(0.5)
