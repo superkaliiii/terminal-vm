@@ -343,6 +343,25 @@ class StoppedVm(unittest.TestCase):
         self.quiet(tl.rm, "v")
         self.assertFalse(os.path.exists(self.d))
 
+    def test_clone_protects_its_base(self):
+        self.quiet(tl.clone, "v", "c")
+        create = next(c for c in self.calls if c[1] == "create")
+        self.assertEqual(create[2:7], ["-f", "qcow2", "-F", "qcow2", "-b"])
+        self.assertEqual(create[7], os.path.join(self.d, "disk.qcow2"))
+        self.assertEqual(tl.load("c")["base"], "v")
+        for f, *a in ((tl.rm, "v"), (tl.reset, "v"), (tl.snapshot, "v", "save", "x"), (tl.start, "v")):
+            with self.assertRaises(SystemExit):  # writing the base would corrupt the clone
+                f(*a)
+        self.quiet(tl.rm, "c")
+        self.quiet(tl.rm, "v")
+
+    def test_install_cache_until_installed(self):
+        m = {"os": "win2025", "iso": "/x.iso", "memory_mb": 2048, "cpus": 2}
+        os.makedirs(os.path.join(self.d, "answers"))
+        self.assertIn("cache=unsafe", " ".join(tl.qemu_args("v", m, False)))
+        m["installed"] = True
+        self.assertNotIn("cache=unsafe", " ".join(tl.qemu_args("v", m, False)))
+
 
 @unittest.skipUnless(os.name == "nt", "Winsock AF_UNIX: Windows hosts only")
 class WindowsUnixSocket(unittest.TestCase):

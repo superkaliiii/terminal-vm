@@ -13,6 +13,7 @@ unattended. Hosts: Linux (KVM) and Windows (WHPX).
   ls | status NAME | doctor | help | version
   start NAME [--window] | stop NAME [--force] [--timeout 60] | pause NAME | resume NAME
   rm NAME | reset NAME     delete a stopped VM | blank its disk to reinstall
+  clone SRC NEW            instant copy-on-write copy of a stopped VM (SRC then stays read-only)
   snapshot NAME save|load|rm TAG | snapshot NAME ls
   display NAME --width W --height H    screen size at the next start
   layout NAME [us|fr]      keyboard layout for type/key (us = QWERTY, fr = AZERTY); action ... --layout: one call
@@ -566,6 +567,11 @@ def accelerators():
     return (["-accel", "kvm"], "host") if os.access("/dev/kvm", os.R_OK | os.W_OK) else (["-accel", "tcg"], "max")
 
 
+def installing(d, m):
+    """Windows answers present and no clean shutdown yet (the first one marks the VM installed)."""
+    return os.path.isdir(os.path.join(d, "answers")) and not m.get("installed")
+
+
 def qemu_args(name, m, window, vnc_port=None):
     """Full QEMU command line for a VM (pure: no I/O), so every OS profile is testable.
     vnc_port: Windows hosts, VNC on localhost TCP with a password (set over QMP after start)."""
@@ -576,7 +582,9 @@ def qemu_args(name, m, window, vnc_port=None):
     w, h = m.get("width", 1280), m.get("height", 800)
     vga = p["vga"] if p["vga"] == "cirrus-vga" else f"{p['vga']},xres={w},yres={h}"  # cirrus has no preferred mode
     args = ["-name", name, *accel, "-cpu", cpu, "-machine", p["machine"], "-m", str(m["memory_mb"]), "-smp", str(m["cpus"]),
-            "-drive", f"file={os.path.join(d, 'disk.qcow2')},if={p['disk_bus']}",  # QEMU locks the image: one VM per disk
+            # QEMU locks the image: one VM per disk. During an unattended install, ignore guest flushes (much faster):
+            # a host crash then loses the install, never a finished VM.
+            "-drive", f"file={os.path.join(d, 'disk.qcow2')},if={p['disk_bus']}" + (",cache=unsafe" if installing(d, m) else ""),
             "-cdrom", m["iso"], "-boot", "order=cd", "-device", vga,
             *(["-usb"] if p["usb"] == "uhci" else ["-device", p["usb"]]), "-device", "usb-tablet",
             "-nic", "none" if m.get("offline") else f"user,model={p['nic']}",
@@ -646,6 +654,7 @@ def create(name, iso, os_name="linux", cpus=None, memory=None, disk=None, width=
 
 def start(name, window=False):
     d, m = vm_dir(name), load(name)
+    _no_clones(name, "start")
     if state(name) != "stopped":
         raise SystemExit(f"{name} is already running")
     if len(os.path.join(d, "qmp-view.sock").encode()) >= 108:  # sun_path limit
@@ -691,6 +700,9 @@ def stop(name, force=False, timeout=60):
     deadline = time.monotonic() + timeout  # a wall-clock bound: each state() poll can itself wait for QMP
     while time.monotonic() < deadline:  # QEMU exits after the guest powers off; os.kill(pid, 0) would kill on Windows
         if state(name) == "stopped":
+            m = load(name)
+            if installing(vm_dir(name), m):
+                m["installed"] = True; save(name, m)
             print(json.dumps({"stopped": name})); return
         time.sleep(0.5)
     print(f"{name}: guest ignored the shutdown request for {timeout}s (no ACPI handling, or a confirmation "
@@ -712,7 +724,8 @@ def ls():
             if os.path.isfile(os.path.join(STORE, n, "machine.json")):
                 m = load(n)
                 out.append({"name": n, "os": m.get("os", "linux"), "status": state(n), "cpus": m["cpus"], "memory_gb": m["memory_mb"] // 1024,
-                            "display": f"{m.get('width', 1280)}x{m.get('height', 800)}", "layout": m.get("layout", "us")})
+                            "display": f"{m.get('width', 1280)}x{m.get('height', 800)}", "layout": m.get("layout", "us"),
+                            **({"base": m["base"]} if m.get("base") else {})})
     print(json.dumps(out, indent=1))
 
 
@@ -726,8 +739,33 @@ def _stopped(name):
         raise SystemExit(f"{name} is running; stop it first: terminal-linux stop {name}")
 
 
+def _no_clones(name, what):
+    """A clone's disk is an overlay on its source's: changing the source would corrupt every clone."""
+    clones = [n for n in sorted(os.listdir(STORE)) if n != name and os.path.isfile(os.path.join(STORE, n, "machine.json"))
+              and load(n).get("base") == name] if os.path.isdir(STORE) else []
+    if clones:
+        raise SystemExit(f"cannot {what} {name}: it is the base of {', '.join(clones)} (remove those first)")
+
+
+def clone(src, new):
+    """New VM whose disk is a copy-on-write overlay on SRC's (instant, small). SRC becomes read-only:
+    it cannot start, reset, be removed or change snapshots while clones exist."""
+    _stopped(src)
+    d = vm_dir(new)
+    if os.path.exists(os.path.join(d, "machine.json")):
+        raise SystemExit(f"VM {new!r} already exists in {d}")
+    m = load(src)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    subprocess.run([qemu_bin("qemu-img"), "create", "-f", "qcow2", "-F", "qcow2", "-b",
+                    os.path.join(vm_dir(src), "disk.qcow2"), os.path.join(d, "disk.qcow2")], check=True, stdout=subprocess.DEVNULL)
+    m.update(base=src, installed=True)  # no answers drive in the clone: it boots the installed disk
+    save(new, m)
+    print(json.dumps({"cloned": src, "to": new}))
+
+
 def rm(name):
     _stopped(name)
+    _no_clones(name, "remove")
     shutil.rmtree(vm_dir(name))
     print(json.dumps({"removed": name}))
 
@@ -736,11 +774,15 @@ def reset(name):
     """Blank disk of the same size, so the next start installs again (Windows answers and password kept).
     Deletes the disk's snapshots too."""
     _stopped(name)
+    _no_clones(name, "reset")
     disk = os.path.join(vm_dir(name), "disk.qcow2")
     info = subprocess.run([qemu_bin("qemu-img"), "info", "--output=json", disk], check=True, capture_output=True, text=True)
     subprocess.run([qemu_bin("qemu-img"), "create", "-f", "qcow2", disk + ".new", str(json.loads(info.stdout)["virtual-size"])],
                    check=True, stdout=subprocess.DEVNULL)
     os.replace(disk + ".new", disk)  # the old disk survives a failed create
+    m = load(name)
+    if m.pop("installed", None):
+        save(name, m)
     print(json.dumps({"reset": name}))
 
 
@@ -750,6 +792,8 @@ def snapshot(name, cmd, tag=None):
     load(name)
     if cmd != "ls" and not re.fullmatch(r"[\w.-]{1,64}", tag or ""):
         raise SystemExit(f"snapshot {cmd} needs a TAG (letters, digits, . _ -)")
+    if cmd != "ls":
+        _no_clones(name, "change snapshots of")
     if state(name) == "stopped":
         flag = {"save": "-c", "load": "-a", "rm": "-d", "ls": "-l"}[cmd]
         r = subprocess.run([qemu_bin("qemu-img"), "snapshot", flag, *([tag] if tag else []), os.path.join(vm_dir(name), "disk.qcow2")],
@@ -1248,6 +1292,7 @@ def main(argv=None):
     for n in ("view", "show"):
         v = sub.add_parser(n); v.add_argument("name"); v.add_argument("--read-only", action="store_true")
     sub.add_parser("ls"); sub.add_parser("doctor"); sub.add_parser("help"); sub.add_parser("version")
+    cl = sub.add_parser("clone"); cl.add_argument("src"); cl.add_argument("new")
     sn = sub.add_parser("snapshot"); sn.add_argument("name"); sn.add_argument("snap_cmd", choices=["save", "load", "rm", "ls"])
     sn.add_argument("tag", nargs="?")
     di = sub.add_parser("display"); di.add_argument("name")
@@ -1280,6 +1325,7 @@ def main(argv=None):
         if o.cmd == "version": return print(f"terminal-linux {VERSION}")
         if o.cmd == "rm": return rm(o.name)
         if o.cmd == "reset": return reset(o.name)
+        if o.cmd == "clone": return clone(o.src, o.new)
         if o.cmd == "snapshot": return snapshot(o.name, o.snap_cmd, o.tag)
         if o.cmd == "display": return display(o.name, o.width, o.height)
         if o.cmd == "layout": return set_layout(o.name, o.layout)
