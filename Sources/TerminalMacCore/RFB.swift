@@ -104,7 +104,7 @@ public final class RFBClient: @unchecked Sendable {
             setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
             try Self.writeAll(fd, [0, 0, 0, 0] + RFB.pixelFormat)                                       // SetPixelFormat
             try Self.writeAll(fd, [2, 0] + RFB.be16(2) + RFB.be32(0) + RFB.be32(UInt32(bitPattern: -223)))  // Raw, DesktopSize
-        } catch { close(fd); throw error }
+        } catch { Darwin.close(fd); throw error }
         self.fd = fd
         pixels = Data(count: width * height * 4)
         try requestUpdate(incremental: false)
