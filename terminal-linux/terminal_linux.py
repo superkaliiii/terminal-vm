@@ -1189,8 +1189,8 @@ def view(name, fps=30, read_only=False):
             g = term_geometry(cell)
             if data != last or g != geom:
                 cols, rows, cw, ch = g
-                if g != geom:
-                    out.write(b"\x1b[2J")
+                if g != geom:  # a fresh alternate screen: ED 2 leaves Sixel images behind in Windows Terminal
+                    out.write(b"\x1b[?1049l\x1b[?1049h\x1b[2J")
                     shown = None
                 last, geom = data, g
                 if proto == "kitty":
