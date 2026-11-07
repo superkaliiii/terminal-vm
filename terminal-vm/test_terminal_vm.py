@@ -347,6 +347,8 @@ class WindowsGuests(unittest.TestCase):
         tools = os.path.join(self.tmp, "tools.exe")
         with open(tools, "wb") as f: f.write(b"MZ fake")
         old_tools, tl.guest_tools = tl.guest_tools, lambda: tools   # no download in tests
+        with open(os.path.join(self.tmp, "quota.json"), "w") as f:
+            json.dump({"disk_gb": 1000, "memory_gb": 64, "cpus": 64}, f)   # independent of this host's free space
         try:
             with self.assertRaises(SystemExit):  # Windows 8 and XP need the user's key
                 tl.create("w8", iso, os_name="win8")
@@ -442,6 +444,8 @@ class StoppedVm(unittest.TestCase):
         with open(os.path.join(self.d, "machine.json"), "w") as f:
             json.dump({"cpus": 1, "memory_mb": 1024, "width": 1280, "height": 800}, f)
         with open(os.path.join(self.d, "disk.qcow2"), "w") as f: f.write("old")
+        with open(os.path.join(self.tmp, "quota.json"), "w") as f:
+            json.dump({"disk_gb": 1000, "memory_gb": 64, "cpus": 64}, f)   # independent of this host
         self.calls, self.old = [], (tl.subprocess.run, tl.qemu_bin)
         def run(argv, **k):
             self.calls.append(argv)
@@ -568,6 +572,33 @@ class StoppedVm(unittest.TestCase):
         self.assertIn(("device_add", {"driver": "max-x86_64-cpu", "id": "cpu1-0", "socket-id": 1, "node-id": 0}),
                       first)   # one more, with every property QEMU listed for that slot
         self.assertEqual(out["guest_memory_gb"], 3.0)
+
+    def test_quota(self):
+        """No command gets past the quota: start, more CPUs, clone and create are refused beyond it."""
+        q = tl.quota()
+        self.assertEqual((q["cpus"]["limit"], q["cpus"]["source"]), (64, "user"))
+        self.assertEqual(q["vms"]["source"], "host default")
+        self.assertEqual(q["disk_gb"]["used"], 64)                      # v's virtual size (qemu-img info, faked)
+        tl.quota({"cpus": 3, "memory_gb": 4, "disk_gb": 100, "vms": 1})
+        m = tl.load("v"); m.update(cpus=2, memory_mb=2048, os="linux", iso="/x.iso"); tl.save("v", m)
+        os.makedirs(os.path.join(self.tmp, "w"))
+        tl.save("w", dict(m, cpus=2))
+        old = tl.state
+        tl.state = lambda n: "running" if n == "w" else "stopped"      # w runs: 2 CPUs, 2 GiB, 1 VM
+        try:
+            with self.assertRaises(SystemExit) as e:
+                tl.start("v")                                           # a second VM: vms 1 > 1, cpus 4 > 3
+            self.assertIn("quota exceeded", str(e.exception))
+            with self.assertRaises(SystemExit):
+                tl.resources("w", cpus=4)                               # live CPUs: 2 + 2 > 3
+        finally:
+            tl.state = old
+        with self.assertRaises(SystemExit):
+            tl.clone("v", "c")                                          # 64 + 64 virtual GiB > 100
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "c")))
+        with self.assertRaises(SystemExit):
+            tl.quota({"cpus": 0})
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, ".quota.lock")))   # lock always released
 
     def test_sandbox_journal(self):
         """Every MCP action on a sandboxed VM lands in actions.log, failures included."""

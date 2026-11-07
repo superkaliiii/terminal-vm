@@ -17,6 +17,7 @@ Virtualization), which is also the default for `up` and `create` without `--os`.
   clone SRC NEW            instant copy-on-write copy of a stopped VM (SRC then stays read-only)
   snapshot NAME save|load|rm TAG | snapshot NAME ls
   display NAME --width W --height H    screen size at the next start
+  quota [--cpus N --memory GiB --disk GiB --vms N]   host-wide ceiling for all VMs (default from the host)
   resources NAME [--cpus N] [--memory GiB]   within the VM's ceiling (create --max-cpus/--max-memory); live where possible
   sandbox NAME [on|off]   no network, no guest agent or file copy, disk reset at each stop, actions logged
   layout NAME [us|fr]      keyboard layout for type/key (us = QWERTY, fr = AZERTY); action ... --layout: one call
@@ -505,12 +506,22 @@ def host_memory_gb():
     return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") // 2 ** 30
 
 
+def _quota_file():
+    try:
+        with open(os.path.join(STORE, "quota.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
 def limits(m):
-    """(max CPUs, max GiB) a VM may use: chosen at create, else its template's, never above the host."""
-    p = PROFILES[m.get("os", "linux")]
+    """(max CPUs, max GiB) a VM may use: chosen at create, else its template's; never above the host or the
+    quota (a bigger ceiling could never start)."""
+    p, q = PROFILES[m.get("os", "linux")], _quota_file()
     cpus = m.get("max_cpus") or p.get("max_cpus", TEMPLATE_MAX[0])
     mem = m.get("max_memory_mb", 0) // 1024 or p.get("max_memory", TEMPLATE_MAX[1])
-    return min(cpus, os.cpu_count()), max(1, min(mem, host_memory_gb()))
+    return (max(1, min(cpus, os.cpu_count(), q.get("cpus", max(1, os.cpu_count() - 1)))),
+            max(1, min(mem, host_memory_gb(), q.get("memory_gb", max(1, host_memory_gb() * 3 // 4)))))
 
 
 def hot_cpus(m):
@@ -630,7 +641,7 @@ def qemu_args(name, m, window, vnc_port=None):
     max_cpus, max_gb = limits(m)
     # Balloon: the guest gets its ceiling of RAM and gives back what is above memory_mb, so memory can change
     # live. Only where the guest has the driver (Linux; Windows with the virtio-win tools), or it would keep it all.
-    ram = max(max_gb * 1024, m["memory_mb"]) if m.get("balloon") else m["memory_mb"]
+    ram = vm_ram_mb(m)
     smp = f"{m['cpus']},maxcpus={max(max_cpus, m['cpus'])}" if hot_cpus(m) else str(m["cpus"])
     args = ["-name", name, *accel, "-cpu", cpu, "-machine", p["machine"], "-m", str(ram), "-smp", smp,
             *(["-device", "virtio-balloon-pci,free-page-reporting=on"] if m.get("balloon") else []),
@@ -688,12 +699,21 @@ def create(name, iso, os_name="linux", cpus=None, memory=None, disk=None, width=
         raise SystemExit(f"{os_name} setup needs your product key: --product-key XXXXX-XXXXX-XXXXX-XXXXX-XXXXX")
     if key and not re.fullmatch(r"[A-Za-z0-9]{5}(-[A-Za-z0-9]{5}){4}", key):
         raise SystemExit("product key format: XXXXX-XXXXX-XXXXX-XXXXX-XXXXX")
-    os.makedirs(d, mode=0o700, exist_ok=True)
+    lim = quota_limits()[0]
+    if cpus > lim["cpus"] or top[1] > lim["memory_gb"]:
+        raise SystemExit(f"this VM could never start within the quota ({lim['cpus']} CPUs, {lim['memory_gb']} GiB "
+                         f"for its memory ceiling of {top[1]}): lower --cpus/--max-memory, or raise the quota")
+    with quota_lock():
+        quota_check({"disk_gb": disk})
+        os.makedirs(d, mode=0o700, exist_ok=True)  # under the lock: the disk now counts for the next check
+        with open(os.path.join(d, "machine.json"), "w") as f:
+            json.dump({"os": os_name, "memory_mb": memory * 1024, "cpus": cpus, "disk_gb": disk}, f)
     subprocess.run([qemu_bin("qemu-img"), "create", "-f", "qcow2", os.path.join(d, "disk.qcow2"), f"{disk}G"],
                    check=True, stdout=subprocess.DEVNULL)
     m = {"os": os_name, "iso": os.path.abspath(iso), "memory_mb": memory * 1024, "cpus": cpus, "width": width,
          "height": height, "layout": layout, "offline": offline or sandbox, **({"sandbox": True} if sandbox else {}),
-         "max_cpus": top[0], "max_memory_mb": top[1] * 1024, **({"balloon": True} if p["family"] == "linux" else {})}
+         "max_cpus": top[0], "max_memory_mb": top[1] * 1024, "disk_gb": disk,
+         **({"balloon": True} if p["family"] == "linux" else {})}
     if p["family"] == "windows":
         # 12 characters: within XP's 14-character limit, and the suffix meets Server's complexity policy
         # (an unmet policy would stop the unattended install at a password prompt).
@@ -721,6 +741,14 @@ def create(name, iso, os_name="linux", cpus=None, memory=None, disk=None, width=
 
 
 def start(name, window=False):
+    with quota_lock():
+        m = load(name)
+        if state(name) == "stopped":
+            quota_check({"cpus": m["cpus"], "memory_gb": vm_ram_mb(m) / 1024, "vms": 1})
+        _start(name, window)
+
+
+def _start(name, window=False):
     d, m = vm_dir(name), load(name)
     _no_clones(name, "start")
     if state(name) != "stopped":
@@ -850,6 +878,102 @@ def mac_machines():
              "memory_gb": m.get("memoryGiB"), "display": f"{m.get('width')}x{m.get('height')}"} for m in machines]
 
 
+# ---------- quota ----------
+# One ceiling for everything this host runs, set by the user (`quota`), by default from the host. Checked under a
+# lock at create, clone, start and resources, so no sequence of commands, human or agent, gets past it. Memory counts
+# each running VM's ceiling (QEMU's -m): a guest may refuse to give memory back through the balloon.
+QUOTA_KEYS = ("cpus", "memory_gb", "disk_gb", "vms")
+
+
+def vm_ram_mb(m):
+    """Memory QEMU gets for this VM: its ceiling with a balloon, else its allocation."""
+    return max(limits(m)[1] * 1024, m["memory_mb"]) if m.get("balloon") else m["memory_mb"]
+
+
+def vm_disk_gb(name, m):
+    """Virtual disk size, what the guest can fill (stored at create; read once for older VMs)."""
+    if "disk_gb" not in m:
+        r = subprocess.run([qemu_bin("qemu-img"), "info", "-U", "--output=json", os.path.join(vm_dir(name), "disk.qcow2")],
+                           capture_output=True, text=True)
+        try:
+            m["disk_gb"] = -(-json.loads(r.stdout)["virtual-size"] // 2 ** 30)
+        except (ValueError, KeyError):
+            return 0
+        save(name, m)
+    return m["disk_gb"]
+
+
+def machines():
+    return sorted(n for n in os.listdir(STORE) if os.path.isfile(os.path.join(STORE, n, "machine.json"))) \
+        if os.path.isdir(STORE) else []
+
+
+def quota_usage():
+    use = {"cpus": 0, "memory_gb": 0, "disk_gb": 0, "vms": 0}
+    for n in machines():
+        m = load(n)
+        use["disk_gb"] += vm_disk_gb(n, m)
+        if state(n) != "stopped":
+            use["cpus"] += m["cpus"]; use["memory_gb"] += vm_ram_mb(m) / 1024; use["vms"] += 1
+    return use
+
+
+def quota_limits(use=None):
+    """The user's quota, defaults from the host for what was never set: cores - 1, 75% of RAM, half of the disk
+    space VMs can have (free now plus what their disk files already take), 8 running VMs. Disks count at their
+    virtual size (a guest can fill it), so on a small drive the default leaves little room for new VMs."""
+    set_ = _quota_file()
+    top = STORE if os.path.isdir(STORE) else os.path.dirname(STORE)
+    held = sum(os.path.getsize(f) for f in (os.path.join(STORE, n, "disk.qcow2") for n in machines()) if os.path.isfile(f))
+    default = {"cpus": max(1, os.cpu_count() - 1), "memory_gb": max(1, host_memory_gb() * 3 // 4),
+               "disk_gb": (shutil.disk_usage(top).free + held) // 2 ** 31, "vms": 8}
+    return {k: set_.get(k, default[k]) for k in QUOTA_KEYS}, {k: k in set_ for k in QUOTA_KEYS}
+
+
+class quota_lock:
+    """Cross-process lock (an atomic mkdir), so two commands cannot both pass the check and then both start."""
+    def __enter__(self):
+        os.makedirs(STORE, exist_ok=True)
+        self.path = os.path.join(STORE, ".quota.lock")
+        for _ in range(300):
+            try:
+                os.mkdir(self.path); return self
+            except FileExistsError:
+                if time.time() - os.path.getmtime(self.path) > 120:  # left by a crashed command
+                    os.rmdir(self.path)
+                time.sleep(0.1)
+        raise SystemExit("another terminal-vm command holds the quota lock; try again")
+
+    def __exit__(self, *exc):
+        os.rmdir(self.path)
+
+
+def quota_check(add):
+    """Refuse when adding `add` (cpus, memory_gb, disk_gb, vms) to current use would pass the quota."""
+    use = quota_usage()
+    lim = quota_limits(use)[0]
+    over = [f"{k}: {use[k]:g} used + {add[k]:g} > {lim[k]}" for k in QUOTA_KEYS if add.get(k) and use[k] + add[k] > lim[k]]
+    if over:
+        raise SystemExit("quota exceeded (" + "; ".join(over) + "). Free resources (stop or shrink VMs), "
+                         "or the user raises the quota: terminal-vm quota --cpus/--memory/--disk/--vms")
+
+
+def quota(set_=None):
+    """Show the quota and its use, or (user only) change it."""
+    if set_:
+        if any(v is not None and v < 1 for v in set_.values()):
+            raise SystemExit("quota values must be at least 1")
+        with quota_lock():
+            stored = _quota_file()
+            stored.update({k: v for k, v in set_.items() if v is not None})
+            with open(os.path.join(STORE, "quota.json"), "w") as f:
+                json.dump(stored, f)
+    use = quota_usage()
+    lim, chosen = quota_limits(use)
+    return {k: {"limit": lim[k], "used": round(use[k], 1), "free": round(lim[k] - use[k], 1),
+                "source": "user" if chosen[k] else "host default"} for k in QUOTA_KEYS}
+
+
 def ls():
     out = []
     if os.path.isdir(STORE):
@@ -888,7 +1012,10 @@ def clone(src, new):
     if os.path.exists(os.path.join(d, "machine.json")):
         raise SystemExit(f"VM {new!r} already exists in {d}")
     m = load(src)
-    os.makedirs(d, mode=0o700, exist_ok=True)
+    with quota_lock():
+        quota_check({"disk_gb": vm_disk_gb(src, m)})  # the overlay can grow to the base's size
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        save(new, dict(m, base=src))
     subprocess.run([qemu_bin("qemu-img"), "create", "-f", "qcow2", "-F", "qcow2", "-b",
                     os.path.join(vm_dir(src), "disk.qcow2"), os.path.join(d, "disk.qcow2")], check=True, stdout=subprocess.DEVNULL)
     m.update(base=src, installed=True)  # no answers drive in the clone: it boots the installed disk
@@ -999,6 +1126,15 @@ def _online_vcpus(name):
 
 
 def resources(name, cpus=None, memory=None):
+    """See _resources. More CPUs on a running VM go through the quota, under its lock until they are added."""
+    if cpus is not None and state(name) != "stopped" and cpus > load(name)["cpus"]:
+        with quota_lock():
+            quota_check({"cpus": cpus - load(name)["cpus"]})  # memory moves under the ceiling, already counted
+            return _resources(name, cpus, memory)
+    return _resources(name, cpus, memory)
+
+
+def _resources(name, cpus=None, memory=None):
     """Show or change CPUs and memory (GiB) within the VM's ceiling. Running VM: memory changes now through the
     balloon; CPUs are added now on Linux guests. Anything else (fewer CPUs, Windows CPUs, no balloon) is saved for
     the next start, and the reply says which."""
@@ -1729,6 +1865,8 @@ TOOLS = [
      _schema({"text": {"type": "string"}, **_LAYOUT, **_SHOT}, ["text"])),
     ("key", "Press a key chord, e.g. ctrl+a, alt+tab, return, super.", _schema({"key": {"type": "string"}, **_LAYOUT, **_SHOT}, ["key"])),
     ("status", "VM run state, screen size and logged-in guest users.", _schema({})),
+    ("quota", "Host-wide quota and its use: running vCPUs, memory ceilings of running VMs (GiB), virtual disk "
+              "(GiB), running VMs. Only the user can change it.", _schema({})),
     ("resources", "Show the VM's CPUs and memory and their ceiling, or change them within it: give cpus and/or "
                   "memory_gb. Memory changes live where the guest has a balloon driver; CPUs are added live on Linux "
                   "guests; otherwise the change applies at the next start (the reply says which).",
@@ -1783,7 +1921,8 @@ def mcp(name):
                         raise RuntimeError("The guest has no logged-in session (login screen). Ask the user to sign in: "
                                            f"terminal-vm view {name}")
                 # resources opens its own QMP session (QEMU takes one client at a time), so not through act()
-                out = resources(name, a.get("cpus"), a.get("memory_gb")) if tool == "resources" else act(name, tool, a)
+                out = (resources(name, a.get("cpus"), a.get("memory_gb")) if tool == "resources" else
+                       quota() if tool == "quota" else act(name, tool, a))
                 record(tool, a)
                 if tool == "screenshot":
                     content = [image(out[0])]
@@ -1850,6 +1989,10 @@ def main(argv=None):
     a.add_argument("--layout", choices=sorted(LAYOUTS), help="this call only: us (QWERTY) or fr (AZERTY)")
     lo = sub.add_parser("layout"); lo.add_argument("name"); lo.add_argument("layout", nargs="?", choices=sorted(LAYOUTS))
     sb = sub.add_parser("sandbox"); sb.add_argument("name"); sb.add_argument("value", nargs="?", choices=["on", "off"])
+    qu = sub.add_parser("quota")
+    for k, h in (("cpus", "running vCPUs"), ("memory", "GiB of running VMs' memory ceilings"),
+                 ("disk", "GiB of virtual disks"), ("vms", "running VMs")):
+        qu.add_argument(f"--{k}", type=int, help=h)
     rs = sub.add_parser("resources"); rs.add_argument("name"); rs.add_argument("--cpus", type=int)
     rs.add_argument("--memory", type=int, help="GiB")
     o = p.parse_args(argv)
@@ -1874,6 +2017,9 @@ def main(argv=None):
         if o.cmd == "layout": return set_layout(o.name, o.layout)
         if o.cmd == "sandbox": return set_sandbox(o.name, o.value)
         if o.cmd == "resources": return print(json.dumps(resources(o.name, o.cpus, o.memory)))
+        if o.cmd == "quota":
+            change = {"cpus": o.cpus, "memory_gb": o.memory, "disk_gb": o.disk, "vms": o.vms}
+            return print(json.dumps(quota(change if any(v is not None for v in change.values()) else None), indent=1))
         if o.cmd == "image": return print(json.dumps({"image": default_image(o.plan, o.os_name)}))
         if o.cmd in ("push", "pull"): return transfer(o.name, o.cmd, o.src, o.dest)
         if o.cmd == "view": return view(o.name, read_only=o.read_only)
