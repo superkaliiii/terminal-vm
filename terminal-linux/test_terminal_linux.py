@@ -77,19 +77,21 @@ class Viewer(unittest.TestCase):
         self.assertEqual(P("\x1b[6;20;10ta"), [("cell", 20, 10), ("text", "a")])   # reply to CSI 16 t
 
     def test_sixel(self):
-        """Decode the encoder's output back to palette indices with an independent reader."""
+        """Decode the encoder's output with an independent reader: every pixel shows its own colour (5 bits/channel)."""
         w, h = 9, 8
-        # palette colours exactly (multiples of 51): the dither leaves them alone, so the expected index is exact
-        rgb = bytes(51 * v for i in range(w * h) for v in (i % 6, i * 5 % 6, 5 if i % 5 else 0))
-        cube = lambda r, g, b: round(r * 5 / 255) * 36 + round(g * 5 / 255) * 6 + round(b * 5 / 255)
+        colours = [(255, 0, 0), (0, 136, 255), (17, 34, 51), (240, 240, 240), (0, 0, 0)]
+        rgb = bytes(v for i in range(w * h) for v in colours[i * 7 % 5])
+        key = lambda r, g, b: (r >> 3) << 10 | (g >> 3) << 5 | b >> 3
+        pal = tl.make_palette(rgb, w, h)
+        self.assertEqual(sorted(pal[0]), sorted(key(*c) for c in colours))
         for W, H in ((9, 8), (5, 4), (7, 6), (14, 13)):  # same, half, uneven, larger
-            s = tl.sixel(tl.sixel_rows(rgb, w, h, W, H)).decode()
+            s = tl.sixel(tl.sixel_rows(rgb, w, h, W, H, pal), pal[0]).decode()
             self.assertTrue(s.startswith("\x1bPq") and s.endswith("\x1b\\"))
             self.assertIn(f'"1;1;{W};{H}', s)
-            self.assertIn("#215;2;100;100;100", s)
+            regs = {int(i): (int(r), int(g), int(b)) for i, r, g, b in re.findall(r"#(\d+);2;(\d+);(\d+);(\d+)", s)}
+            self.assertEqual(regs[pal[0].index(key(0, 136, 255))], (0, 55, 100))   # percent of 5-bit levels
             got = [[None] * W for _ in range(H)]
-            body = s[s.index("#0;2;"):-2]
-            body = re.sub(r"#\d+;2;\d+;\d+;\d+", "", body)
+            body = re.sub(r"#\d+;2;\d+;\d+;\d+", "", s[s.index("#"):-2])
             for band_no, band in enumerate(body.split("-")[:-1]):
                 for layer in band.split("$"):
                     c, data = re.match(r"#(\d+)(.*)", layer).groups()
@@ -99,18 +101,18 @@ class Viewer(unittest.TestCase):
                         for k in range(6):
                             if (ord(ch) - 63) >> k & 1:
                                 self.assertIsNone(got[band_no * 6 + k][x])  # one colour per pixel
-                                got[band_no * 6 + k][x] = int(c)
+                                got[band_no * 6 + k][x] = pal[0][int(c)]
             src = lambda X, Y: (Y * h // H * w + X * w // W) * 3   # nearest source pixel
-            want = [[cube(*rgb[src(X, Y):src(X, Y) + 3]) for X in range(W)] for Y in range(H)]
+            want = [[key(*rgb[src(X, Y):src(X, Y) + 3]) for X in range(W)] for Y in range(H)]
             self.assertEqual(got, want)
 
-    def test_dither(self):
-        """A grey between two levels comes out as a mix of both, in proportion; exact levels stay flat."""
-        grey = lambda v: tl.sixel_rows(bytes([v]) * (8 * 8 * 3), 8, 8, 8, 8)
-        mixed = b"".join(grey(128))                         # 128 = 2.51 levels of 51
-        self.assertEqual(set(mixed), {2 * 43, 3 * 43})      # grey index: level * (36 + 6 + 1)
-        self.assertAlmostEqual(mixed.count(3 * 43) / 64, 0.5, delta=0.07)
-        self.assertEqual(set(b"".join(grey(153))), {3 * 43})
+    def test_palette_nearest(self):
+        """Colours outside the palette take the nearest register; the most frequent colours are kept."""
+        rgb = bytes([255, 0, 0]) * 50 + bytes([0, 0, 255]) * 40 + bytes([240, 16, 16]) * 10   # 10 x 10
+        keys, lut = tl.make_palette(rgb, 10, 10, size=2)
+        self.assertEqual(keys, [31 << 10, 31])
+        row = tl.sixel_rows(bytes([224, 32, 0]) * 10, 10, 1, 10, 1, (keys, lut))[0]  # dark red: unseen
+        self.assertEqual(set(row), {0})
 
     def test_changed(self):
         old = [bytes(12) for _ in range(5)]

@@ -25,7 +25,7 @@ unattended. Hosts: Linux (KVM) and Windows (WHPX).
   mcp [NAME]         stdio MCP server
   skills get | skills path | skills install [--dir DIR]
 """
-import argparse, base64, hashlib, json, os, queue, re, secrets, shutil, signal, socket, struct, subprocess, sys, \
+import argparse, base64, collections, hashlib, json, os, queue, re, secrets, shutil, signal, socket, struct, subprocess, sys, \
     threading, time, urllib.parse, urllib.request
 from xml.sax.saxutils import escape
 
@@ -1011,35 +1011,62 @@ def screen_pixels(name, q):
     return data[-w * h * 3:], (w, h)
 
 
-_BAYER = ((0, 8, 2, 10), (12, 4, 14, 6), (3, 11, 1, 9), (15, 7, 13, 5))
-# _CUBE[y % 4][x % 4][channel]: channel byte -> its share of a 6x6x6 index, after the ordered-dither offset of that
-# position, at half strength: 6 levels alone band smooth gradients, a full dither shows as grain once the terminal
-# enlarges the pixels; half mixes the two nearest levels only near their midpoint
-_CUBE = [[[bytes(min(5, max(0, round((v + ((b + 0.5) / 16 - 0.5) * 25) / 51))) * f for v in range(256))
-           for f in (36, 6, 1)] for b in row] for row in _BAYER]
-_IS = [bytes(int(i == c) for i in range(256)) for c in range(216)]
+# 15-bit colour key, 5 bits per channel (4 bits banded smooth gradients): r << 10 | g << 5 | b, as two bytes
+_HI_R, _HI_G = bytes(v >> 3 << 2 for v in range(256)), bytes(v >> 6 for v in range(256))
+_LO_G, _LO_B = bytes((v >> 3 & 7) << 5 for v in range(256)), bytes(v >> 3 for v in range(256))
+_IS = [bytes(int(i == c) for i in range(256)) for c in range(256)]
 _RLE = re.compile(rb"(.)\1{3,}")
 
 
-def sixel_rows(rgb, w, h, W, H, old=None, prev=None):
-    """RGB bytes (w x h) -> W x H rows of 6x6x6 colour-cube indices (ordered dither, nearest-neighbour scaling). No per-pixel Python
-    loop: bytes.translate maps whole rows, big-integer sums combine them byte-wise (no sum exceeds 255: no carry),
-    and map() picks the scaled columns. prev: the rows this returned for the frame old (same sizes); rows whose
-    source line did not change are reused, so a moving pointer costs a few lines, not a frame."""
+def colour_keys(line):
+    """RGB bytes -> one 15-bit colour key per pixel, as a memoryview of ints (byte sums never carry)."""
+    n, keys = len(line) // 3, bytearray(2 * len(line) // 3)
+    r, g, b = line[0::3], line[1::3], line[2::3]
+    keys[1::2] = (int.from_bytes(r.translate(_HI_R), "big") + int.from_bytes(g.translate(_HI_G), "big")).to_bytes(n, "big")
+    keys[0::2] = (int.from_bytes(g.translate(_LO_G), "big") + int.from_bytes(b.translate(_LO_B), "big")).to_bytes(n, "big")
+    return memoryview(keys).cast("H")  # native order is little-endian on x86/ARM: low byte first
+
+
+def make_palette(rgb, w, h, size=255):
+    """The screen's most frequent colours (15-bit keys) and a key -> register table (255: not mapped yet).
+    An adaptive palette keeps interface colours nearly exact, where a fixed cube needed a grainy dither."""
+    counts = collections.Counter()
+    for y in range(0, h, 2):  # every other row ranks the colours just as well, in half the time
+        counts.update(colour_keys(rgb[y * w * 3:(y + 1) * w * 3]))
+    keys = [k for k, _ in counts.most_common(size)]
+    lut = bytearray(b"\xff" * 32768)
+    for i, k in enumerate(keys):
+        lut[k] = i
+    return keys, lut
+
+
+def _nearest(keys, k):
+    rgb = lambda k: (k >> 10, k >> 5 & 31, k & 31)
+    want = rgb(k)
+    return min(range(len(keys)), key=lambda i: sum((a - b) ** 2 for a, b in zip(rgb(keys[i]), want)))
+
+
+def sixel_rows(rgb, w, h, W, H, palette, old=None, prev=None):
+    """RGB bytes (w x h) -> W x H rows of palette registers (nearest-neighbour scaling). No per-pixel Python loop
+    except map(): bytes.translate and big-integer sums build the colour keys of a whole row at once. prev: the rows
+    this returned for the frame old (same sizes): rows whose source line did not change are reused, so a moving
+    pointer costs a few lines, not a frame. Colours missing from the palette get their nearest register."""
+    keys, lut = palette
     xs, rows, cache = [x * w // W for x in range(W)], [], {}
     for Y, y in enumerate(y * h // H for y in range(H)):
         line = rgb[y * w * 3:(y + 1) * w * 3]
         if prev and old[y * w * 3:(y + 1) * w * 3] == line:
             rows.append(prev[Y]); continue
         if y not in cache:
-            q = 0
-            for c in range(3):
-                plane = bytearray(w)
-                for x in range(4):  # every 4th pixel shares a dither offset: one translate per phase
-                    plane[x::4] = line[c + 3 * x::12].translate(_CUBE[y % 4][x][c])
-                q += int.from_bytes(plane, "big")
-            q = q.to_bytes(w, "big")
-            cache[y] = q if W == w else bytes(map(q.__getitem__, xs))
+            mv = colour_keys(line)
+            vals = mv if W == w else list(map(mv.__getitem__, xs))
+            row = bytes(map(lut.__getitem__, vals))
+            if 255 in row:
+                for k in set(vals):
+                    if lut[k] == 255:
+                        lut[k] = _nearest(keys, k)
+                row = bytes(map(lut.__getitem__, vals))
+            cache[y] = row
         rows.append(cache[y])
     return rows
 
@@ -1064,11 +1091,13 @@ def changed(old, new, gap=20):
     return boxes
 
 
-def sixel(rows):
-    """Rows of colour-cube indices, all the same length -> DEC Sixel image."""
+def sixel(rows, keys):
+    """Rows of palette registers, all the same length -> DEC Sixel image; keys: the palette's 15-bit colours."""
     n = len(rows[0])
     out = [b'\x1bPq"1;1;%d;%d' % (n, len(rows))]
-    out += [b"#%d;2;%d;%d;%d" % (i, i // 36 * 20, i // 6 % 6 * 20, i % 6 * 20) for i in range(216)]
+    pct = lambda v: round(v * 100 / 31)
+    out += [b"#%d;2;%d;%d;%d" % (i, pct(keys[i] >> 10), pct(keys[i] >> 5 & 31), pct(keys[i] & 31))
+            for i in sorted(set(b"".join(rows)))]  # only the registers this image uses
     offset = int.from_bytes(b"?" * n, "big")  # sixel characters start at '?' (63)
     for y in range(0, len(rows), 6):
         band, layers = rows[y:y + 6], []
@@ -1077,6 +1106,40 @@ def sixel(rows):
             layers.append(b"#%d" % c + _RLE.sub(lambda m: b"!%d%c" % (len(m[0]), m[1][0]), bits.to_bytes(n, "big")))
         out.append(b"$".join(layers) + b"-")
     return b"".join(out) + b"\x1b\\"
+
+
+def cell_refiner():
+    """Windows Terminal reports the mouse by cell only (no SGR-pixel mode), so the guest pointer would snap to cell
+    centres. On Windows, pair each report with the host cursor (GetCursorPos, physical pixels) and fit, per axis,
+    cell = a + b * pixel over recent reports: the fit places the pointer within the cell. Returns refine(col, row)
+    -> fractional (col, row), centre of a cell = its integer; elsewhere, or until the fit has data, the cell itself."""
+    if not WINDOWS:
+        return lambda c, r: (c, r)
+    import ctypes
+    user32, pt, samples = ctypes.windll.user32, (ctypes.c_long * 2)(), []
+    try:
+        user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))  # physical pixels, as the terminal draws
+    except AttributeError:
+        pass
+
+    def refine(c, r):
+        user32.GetCursorPos(pt)
+        samples.append(((c, r), (pt[0], pt[1])))
+        del samples[:-200]
+        out = []
+        for i, cell in enumerate((c, r)):
+            cs, ps = [s_[0][i] for s_ in samples], [s_[1][i] for s_ in samples]
+            mc, mp = sum(cs) / len(cs), sum(ps) / len(ps)
+            var = sum((v - mp) ** 2 for v in ps)
+            if len(set(cs)) < 3 or not var:
+                out.append(cell); continue
+            f = mc + sum((v - mp) * (u - mc) for v, u in zip(ps, cs)) / var * (pt[i] - mp)
+            if abs(f - cell) > 1:  # window moved or resized: start the fit again
+                samples[:] = samples[-1:]
+                f = cell
+            out.append(min(cell + 0.5, max(cell - 0.5, f)))  # never leave the reported cell
+        return tuple(out)
+    return refine
 
 
 def raw_terminal():
@@ -1119,7 +1182,7 @@ def view(name, fps=30, read_only=False):
     threading.Thread(target=reader, daemon=True).start()
     # alt screen, hide cursor, all mouse motion as SGR (in pixels where the terminal can), ask the cell size in pixels
     out.write(b"\x1b[?1049h\x1b[?25l\x1b[?1003h\x1b[?1006h" + (b"\x1b[?1016h" if proto == "kitty" else b"") + b"\x1b[16t")
-    last, geom, held, cell, shown, prev_rgb = None, None, set(), (20, 10), None, b""
+    last, geom, held, cell, shown, prev_rgb, refine = None, None, set(), (20, 10), None, b"", cell_refiner()
     try:
         while True:
             data, (w, h) = screenshot(name, q, "view.png") if proto == "kitty" else screen_pixels(name, q)
@@ -1145,7 +1208,11 @@ def view(name, fps=30, read_only=False):
                     dw, dh = max(1, int(w * scale)), max(1, int(h * scale))
                     ox, oy = int((cols * cw - dw) / 2 // cw), int(((rows - 1) * ch - dh) / 2 // ch)
                     same = shown is not None and len(prev_rgb) == len(data)
-                    frame = sixel_rows(data, w, h, dw, dh, prev_rgb, shown) if same else sixel_rows(data, w, h, dw, dh)
+                    if same and sum(data[i:i + w * 3] != prev_rgb[i:i + w * 3] for i in range(0, len(data), w * 3)) > h // 3:
+                        same, shown = False, None  # a new screen: new palette, full redraw
+                    if not same:
+                        palette = make_palette(data, w, h)
+                    frame = sixel_rows(data, w, h, dw, dh, palette, prev_rgb, shown) if same else sixel_rows(data, w, h, dw, dh, palette)
                     prev_rgb = data
                     boxes = [(0, 0, dw, dh)] if shown is None or cw % 1 or ch % 1 else changed(shown, frame, int(ch))
                     for box in boxes:  # redraw only the cells that changed: a moving pointer costs a few cells
@@ -1153,7 +1220,7 @@ def view(name, fps=30, read_only=False):
                         x0, y0 = box[0] // cw_ * cw_, box[1] // ch_ * ch_
                         y1 = min(dh, y0 + -(-(box[3] - y0) // 6) * 6)  # whole sixel bands: no blank rows below
                         out.write(b"\x1b[%d;%dH" % (oy + y0 // ch_ + 1, ox + x0 // cw_ + 1))
-                        out.write(sixel([r[x0:box[2]] for r in frame[y0:y1]]))
+                        out.write(sixel([r[x0:box[2]] for r in frame[y0:y1]], palette[0]))
                     shown = frame
                 out.write(f"\x1b[{rows};1H\x1b[2K\x1b[2m {name} · {w}x{h} · Ctrl+] exit · Ctrl+O window\x1b[0m".encode())
                 out.flush()
@@ -1184,7 +1251,8 @@ def view(name, fps=30, read_only=False):
                     if motion(e) and i + 1 < len(events) and motion(events[i + 1]):
                         continue  # only the latest of a run of moves: the pointer follows without a backlog
                     code, px, py, pressed = e[1:]
-                    if proto == "sixel":  # 1-based cells: the middle of the cell, in pixels
+                    if proto == "sixel":  # 1-based cells, refined within the cell where the host allows it
+                        px, py = refine(px, py)
                         px, py = (px - 0.5) * cw, (py - 0.5) * ch
                     x, y = (px - ox * cw) * w / dw, (py - oy * ch) * h / dh
                     if not (0 <= x < w and 0 <= y < h):
