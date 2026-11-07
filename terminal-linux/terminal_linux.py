@@ -1046,18 +1046,34 @@ def _nearest(keys, k):
     return min(range(len(keys)), key=lambda i: sum((a - b) ** 2 for a, b in zip(rgb(keys[i]), want)))
 
 
+_HALF = bytes(v >> 1 for v in range(256))
+
+
+def _blend(a, b):
+    """Byte-wise average of two equal-length byte strings (halves summed as big integers: no carry)."""
+    return (int.from_bytes(a.translate(_HALF), "big") + int.from_bytes(b.translate(_HALF), "big")).to_bytes(len(a), "big")
+
+
 def sixel_rows(rgb, w, h, W, H, palette, old=None, prev=None):
-    """RGB bytes (w x h) -> W x H rows of palette registers (nearest-neighbour scaling). No per-pixel Python loop
-    except map(): bytes.translate and big-integer sums build the colour keys of a whole row at once. prev: the rows
-    this returned for the frame old (same sizes): rows whose source line did not change are reused, so a moving
-    pointer costs a few lines, not a frame. Colours missing from the palette get their nearest register."""
+    """RGB bytes (w x h) -> W x H rows of palette registers. Shrinking averages each pixel with its right and lower
+    neighbours first, so 1-pixel strokes of small text soften instead of vanishing with the skipped columns; growing
+    is nearest-neighbour. No per-pixel Python loop except map(): bytes.translate and big-integer sums work on whole
+    rows. prev: the rows this returned for the frame old (same sizes): rows whose source lines did not change are
+    reused, so a moving pointer costs a few lines, not a frame. Colours missing from the palette get their nearest
+    register."""
     keys, lut = palette
-    xs, rows, cache = [x * w // W for x in range(W)], [], {}
+    xs, rows, cache, row_len = [x * w // W for x in range(W)], [], {}, w * 3
+    taps = 2 if H < h else 1  # source lines behind one output line
+
+    def source(y):
+        line = rgb[y * row_len:(y + 1) * row_len]
+        return _blend(line, line[3:] + line[-3:]) if W < w else line
     for Y, y in enumerate(y * h // H for y in range(H)):
-        line = rgb[y * w * 3:(y + 1) * w * 3]
-        if prev and old[y * w * 3:(y + 1) * w * 3] == line:
+        span = slice(y * row_len, min(y + taps, h) * row_len)
+        if prev and old[span] == rgb[span]:
             rows.append(prev[Y]); continue
         if y not in cache:
+            line = source(y) if taps == 1 or y + 1 >= h else _blend(source(y), source(y + 1))
             mv = colour_keys(line)
             vals = mv if W == w else list(map(mv.__getitem__, xs))
             row = bytes(map(lut.__getitem__, vals))

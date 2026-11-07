@@ -84,7 +84,7 @@ class Viewer(unittest.TestCase):
         key = lambda r, g, b: (r >> 3) << 10 | (g >> 3) << 5 | b >> 3
         pal = tl.make_palette(rgb, w, h)
         self.assertEqual(sorted(pal[0]), sorted(key(*c) for c in colours))
-        for W, H in ((9, 8), (5, 4), (7, 6), (14, 13)):  # same, half, uneven, larger
+        for W, H in ((9, 8), (14, 13), (23, 20)):  # same and larger: nearest pixel, colours exact
             s = tl.sixel(tl.sixel_rows(rgb, w, h, W, H, pal), pal[0]).decode()
             self.assertTrue(s.startswith("\x1bPq") and s.endswith("\x1b\\"))
             self.assertIn(f'"1;1;{W};{H}', s)
@@ -105,6 +105,18 @@ class Viewer(unittest.TestCase):
             src = lambda X, Y: (Y * h // H * w + X * w // W) * 3   # nearest source pixel
             want = [[key(*rgb[src(X, Y):src(X, Y) + 3]) for X in range(W)] for Y in range(H)]
             self.assertEqual(got, want)
+
+    def test_shrink_keeps_thin_lines(self):
+        """Shrinking blends neighbours: a 1-pixel line that nearest-neighbour would skip still shows."""
+        w, h = 12, 12
+        white, black = bytes([255, 255, 255]), bytes([0, 0, 0])
+        rgb = b"".join(black if x == 7 else white for y in range(h) for x in range(w))   # vertical line at x=7
+        pal = tl.make_palette(rgb, w, h)
+        self.assertNotIn(7, [x * w // 9 for x in range(9)])                  # 12 -> 9 skips column 7
+        rows = tl.sixel_rows(rgb, w, h, 9, 9, pal)
+        white_reg = pal[1][(31 << 10) | (31 << 5) | 31]
+        self.assertTrue(all(any(c != white_reg for c in r) for r in rows))   # every row still shows the line
+        self.assertEqual({r[0] for r in rows}, {white_reg})                  # away from it, plain white
 
     def test_palette_nearest(self):
         """Colours outside the palette take the nearest register; the most frequent colours are kept."""
