@@ -121,9 +121,9 @@ class Viewer(unittest.TestCase):
     def test_palette_nearest(self):
         """Colours outside the palette take the nearest register; the most frequent colours are kept."""
         rgb = bytes([255, 0, 0]) * 50 + bytes([0, 0, 255]) * 40 + bytes([240, 16, 16]) * 10   # 10 x 10
-        keys, lut = tl.make_palette(rgb, 10, 10, size=2)
+        keys, lut, cells = tl.make_palette(rgb, 10, 10, size=2)
         self.assertEqual(keys, [31 << 10, 31])
-        row = tl.sixel_rows(bytes([224, 32, 0]) * 10, 10, 1, 10, 1, (keys, lut))[0]  # dark red: unseen
+        row = tl.sixel_rows(bytes([224, 32, 0]) * 10, 10, 1, 10, 1, (keys, lut, cells))[0]  # dark red: unseen
         self.assertEqual(set(row), {0})
 
     def test_changed(self):

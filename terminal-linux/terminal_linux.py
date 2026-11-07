@@ -1037,13 +1037,21 @@ def make_palette(rgb, w, h, size=255):
     lut = bytearray(b"\xff" * 32768)
     for i, k in enumerate(keys):
         lut[k] = i
-    return keys, lut
+    return keys, lut, {}
 
 
-def _nearest(keys, k):
-    rgb = lambda k: (k >> 10, k >> 5 & 31, k & 31)
-    want = rgb(k)
-    return min(range(len(keys)), key=lambda i: sum((a - b) ** 2 for a, b in zip(rgb(keys[i]), want)))
+def _nearest(palette, k):
+    """Nearest register to colour key k, searched once per 4-bit cell and cached: smoothing small text brings
+    thousands of in-between shades, and one search per shade froze the viewer for a second on each new screen."""
+    keys, _, cells = palette
+    c = k & 0x7BDE  # each channel's lowest bit dropped
+    if c not in cells:
+        if None not in cells:
+            cells[None] = [(i, q >> 10, q >> 5 & 31, q & 31) for i, q in enumerate(keys)]
+        c2 = c | 0x421  # middle of the cell
+        r, g, b = c2 >> 10, c2 >> 5 & 31, c2 & 31
+        cells[c] = min(((r - pr) ** 2 + (g - pg) ** 2 + (b - pb) ** 2, i) for i, pr, pg, pb in cells[None])[1]
+    return cells[c]
 
 
 _HALF = bytes(v >> 1 for v in range(256))
@@ -1061,7 +1069,7 @@ def sixel_rows(rgb, w, h, W, H, palette, old=None, prev=None):
     rows. prev: the rows this returned for the frame old (same sizes): rows whose source lines did not change are
     reused, so a moving pointer costs a few lines, not a frame. Colours missing from the palette get their nearest
     register."""
-    keys, lut = palette
+    lut = palette[1]
     xs, rows, cache, row_len = [x * w // W for x in range(W)], [], {}, w * 3
     taps = 2 if H < h else 1  # source lines behind one output line
 
@@ -1075,12 +1083,13 @@ def sixel_rows(rgb, w, h, W, H, palette, old=None, prev=None):
         if y not in cache:
             line = source(y) if taps == 1 or y + 1 >= h else _blend(source(y), source(y + 1))
             mv = colour_keys(line)
-            vals = mv if W == w else list(map(mv.__getitem__, xs))
+            vals = mv if W == w else map(mv.__getitem__, xs)
             row = bytes(map(lut.__getitem__, vals))
-            if 255 in row:
+            if 255 in row:  # colours not in the palette yet: map them, then this row again
+                vals = mv if W == w else list(map(mv.__getitem__, xs))
                 for k in set(vals):
                     if lut[k] == 255:
-                        lut[k] = _nearest(keys, k)
+                        lut[k] = _nearest(palette, k)
                 row = bytes(map(lut.__getitem__, vals))
             cache[y] = row
         rows.append(cache[y])
