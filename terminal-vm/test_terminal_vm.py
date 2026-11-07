@@ -573,6 +573,27 @@ class StoppedVm(unittest.TestCase):
                       first)   # one more, with every property QEMU listed for that slot
         self.assertEqual(out["guest_memory_gb"], 3.0)
 
+    def test_net_switch(self):
+        tl.net_create("lab")
+        sw, v, w, x = (socket.socket(socket.AF_INET, socket.SOCK_DGRAM) for _ in range(4))
+        for s in (sw, v, w, x):
+            s.bind(("127.0.0.1", 0)); s.settimeout(2)
+        sw.settimeout(0.2)
+        t = threading.Thread(target=tl.net_switch, args=("lab", sw, lambda: False)); t.start()
+        to, mv, mw, mx = sw.getsockname(), b"\x02" + b"v" * 5, b"\x02" + b"w" * 5, b"\x02" + b"x" * 5
+        x.sendto(b"\xff" * 6 + mx + b"\x08\x06hello", to)     # x joins
+        w.sendto(b"\xff" * 6 + mw + b"\x08\x06arp", to)       # broadcast from w: flooded to x
+        self.assertEqual(x.recv(100)[6:12], mw)
+        v.sendto(mw + mv + b"\x08\x00ping", to)                # unicast to w's MAC: only w gets it
+        self.assertEqual(w.recv(100), mw + mv + b"\x08\x00ping")
+        x.settimeout(0.3)
+        with self.assertRaises(socket.timeout):
+            x.recv(100)
+        t.join(5)
+        self.assertFalse(t.is_alive())                             # no VM running: the switch exits
+        for s in (sw, v, w, x):
+            s.close()
+
     def test_networks(self):
         m = tl.load("v"); m.update(os="linux", iso="/x.iso"); tl.save("v", m)
         os.makedirs(os.path.join(self.tmp, "w")); tl.save("w", dict(m))
@@ -586,7 +607,9 @@ class StoppedVm(unittest.TestCase):
         self.assertNotEqual((a["mac"], a["ip"]), (b["mac"], b["ip"]))
         self.assertEqual(tl.net_attach("v", "lab")["mac"], a["mac"])            # stable, idempotent
         args = " ".join(tl.qemu_args("v", tl.load("v"), False))
-        self.assertIn("-netdev socket,id=n-lab,mcast=230.77.1.1:40001,localaddr=127.0.0.1", args)  # loopback only
+        self.assertIn(f"-netdev dgram,id=n-lab,local.type=inet,local.host=127.0.0.1,local.port={a['port']},"
+                      "remote.type=inet,remote.host=127.0.0.1,remote.port=40001", args)  # loopback only
+        self.assertNotEqual(a["port"], b["port"])
         self.assertIn(f"virtio-net-pci,netdev=n-lab,mac={a['mac']}", args)
         self.assertEqual([x["vm"] for x in tl.net_ls()[1]["vms"]], ["v", "w"])  # ls is sorted: dmz, lab
         with self.assertRaises(SystemExit):

@@ -773,6 +773,9 @@ def _start(name, window=False):
     log = open(os.path.join(d, "qemu.log"), "ab")
     detach = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS} if WINDOWS
               else {"start_new_session": True})
+    for net in m.get("networks", {}):  # a second switch for the same network exits at once
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "_switch", net], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=log, **detach)
     subprocess.Popen([qemu_bin("qemu-system-x86_64")] + qemu_args(name, m, window, vnc_port), stdout=log, stderr=log, **detach)
     for _ in range(100):
         if state(name) != "stopped":
@@ -886,9 +889,9 @@ def mac_machines():
 
 
 # ---------- networks ----------
-# Isolated networks between VMs, no administrator rights: each network is a UDP multicast group bound to the
-# loopback interface, which QEMU uses as a virtual switch. Nothing reaches the LAN or the internet; a local process
-# that joins the same group could see the traffic. No DHCP: give guests static addresses (net ls suggests one per
+# Isolated networks between VMs, no administrator rights: each network is a small learning switch (net_switch, UDP
+# on the loopback interface) and each NIC a QEMU dgram socket plugged into it. Nothing reaches the LAN or the
+# internet; a local process could send to or read from the switch port. No DHCP: give guests static addresses (net ls suggests one per
 # VM), or run a DHCP server in one of them, as in a real network.
 NET_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,30}")
 
@@ -925,7 +928,7 @@ def net_create(net):
         idx = next((i for i in range(1, 251) if i not in used), None)
         if idx is None:
             raise SystemExit("250 networks at most")
-        cfg = {"name": net, "index": idx, "mcast": f"230.77.{idx}.1:{40000 + idx}", "subnet": f"10.77.{idx}.0/24"}
+        cfg = {"name": net, "index": idx, "port": 40000 + idx, "subnet": f"10.77.{idx}.0/24"}
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as f:
             json.dump(cfg, f)
@@ -956,12 +959,16 @@ def net_attach(name, net, attach=True):
             raise SystemExit(f"{name} is not on {net}")
         save(name, m)
         return {"vm": name, "detached": net}
+    ports = {a.get("port") for n in machines() for a in load(n).get("networks", {}).values()}
+    port = next(p for p in range(41000, 65536) if p not in ports)
     if net in nets:
+        nets[net].setdefault("port", port)  # attachments made before the switch had none
+        save(name, m)
         return {"vm": name, "network": net, **nets[net]}
     taken = {int(a["ip"].rsplit(".", 1)[1]) for _, a in net_members(net)}
     host = next(i for i in range(10, 255) if i not in taken)
     mac = "52:54:00:" + ":".join(f"{b:02x}" for b in hashlib.sha256(f"{name}/{net}".encode()).digest()[:3])
-    nets[net] = {"mac": mac, "ip": f"10.77.{cfg['index']}.{host}"}
+    nets[net] = {"mac": mac, "ip": f"10.77.{cfg['index']}.{host}", "port": port}
     save(name, m)
     return {"vm": name, "network": net, **nets[net], "netmask": "255.255.255.0",
             "note": "no DHCP on this network: set this address in the guest"}
@@ -987,9 +994,47 @@ def net_args(m, nic):
     args = []
     for net, a in sorted(m.get("networks", {}).items()):
         cfg = net_load(net)
-        args += ["-netdev", f"socket,id=n-{net},mcast={cfg['mcast']},localaddr=127.0.0.1",
+        if "port" not in a or "port" not in cfg:
+            raise SystemExit(f"network {net!r} predates the switch: recreate it, or run net attach again for this VM")
+        args += ["-netdev", f"dgram,id=n-{net},local.type=inet,local.host=127.0.0.1,local.port={a['port']},"
+                 f"remote.type=inet,remote.host=127.0.0.1,remote.port={cfg['port']}",
                  "-device", f"{nic},netdev=n-{net},mac={a['mac']}"]
     return args
+
+
+def net_switch(net, sock=None, alive=None):
+    """Run network NET's switch: forward each Ethernet frame to the port that sent its destination MAC, flood the
+    rest. Exits when the port is taken (a switch already runs) or once none of the network's VMs runs."""
+    port = net_load(net)["port"]
+    if sock is None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            return
+        sock.settimeout(30)
+    alive = alive or (lambda: any(state(n) != "stopped" for n, _ in net_members(net)))
+    macs, peers, idle = {}, set(), 0
+    while idle < 2:  # two checks in a row: the VM that started this switch may still be booting QEMU
+        try:
+            frame, src = sock.recvfrom(65536)
+        except socket.timeout:
+            idle = 0 if alive() else idle + 1
+            continue
+        except ConnectionResetError:  # Windows reports an earlier send to a VM that has stopped
+            continue
+        if len(frame) < 14:
+            continue
+        # shortcut: peers are learned from what they send and never forgotten; a VM that stays silent gets no
+        # broadcasts until it sends one frame (every OS does at boot). Ports are fixed per NIC, so the set stays small.
+        peers.add(src)
+        macs[frame[6:12]] = src
+        dst = macs.get(frame[0:6]) if not frame[0] & 1 else None  # group bit set: broadcast or multicast
+        for p in [dst] if dst else peers - {src}:
+            try:
+                sock.sendto(frame, p)
+            except OSError:
+                pass
 
 
 # ---------- monitoring ----------
@@ -2143,6 +2188,8 @@ def mcp(name):
 # ---------- CLI ----------
 
 def main(argv=None):
+    if (sys.argv[1:] if argv is None else argv)[:1] == ["_switch"]:  # internal: started by start for its networks
+        return net_switch((sys.argv[2:] if argv is None else argv[1:])[0])
     mac_args = macos_handoff(sys.argv[1:] if argv is None else argv)
     if mac_args is not None:
         sys.exit(run_mac(mac_args))
