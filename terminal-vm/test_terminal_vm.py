@@ -494,6 +494,54 @@ class StoppedVm(unittest.TestCase):
         self.quiet(tl.rm, "c")
         self.quiet(tl.rm, "v")
 
+    def test_sandbox(self):
+        m = {"os": "win2025", "iso": "/x.iso", "memory_mb": 2048, "cpus": 2, "sandbox": True}
+        os.makedirs(os.path.join(self.d, "answers"))
+        setup = " ".join(tl.qemu_args("v", m, False))   # still installing: answers drive, real disk writes
+        self.assertIn("vvfat", setup)
+        self.assertNotIn("snapshot=on", setup)
+        m["installed"] = True
+        run = " ".join(tl.qemu_args("v", m, False))
+        for needle in ("-nic none", "snapshot=on"):
+            self.assertIn(needle, run)
+        for needle in ("guest_agent", "vvfat", "user,model"):
+            self.assertNotIn(needle, run)
+        self.assertEqual("-sandbox on" in run, os.name != "nt")   # seccomp: QEMU on Linux hosts only
+        plain = " ".join(tl.qemu_args("v", dict(m, sandbox=False), False))
+        self.assertIn("guest_agent", plain)
+        self.assertNotIn("snapshot=on", plain)
+        self.assertTrue(self.quiet(tl.set_sandbox, "v", "on")["sandbox"])
+        with self.assertRaises(SystemExit):
+            tl.transfer("v", "push", "a", "b")
+        old = tl.state
+        tl.state = lambda n: "running"
+        try:
+            with self.assertRaises(SystemExit):   # changes are thrown away at stop: a snapshot now would be lost
+                tl.snapshot("v", "save", "x")
+            with self.assertRaises(SystemExit):
+                tl.set_sandbox("v", "off")
+        finally:
+            tl.state = old
+        self.assertFalse(self.quiet(tl.set_sandbox, "v", "off")["sandbox"])
+        self.assertNotIn("sandbox", tl.load("v"))
+
+    def test_sandbox_journal(self):
+        """Every MCP action on a sandboxed VM lands in actions.log, failures included."""
+        m = tl.load("v"); m["sandbox"] = True; tl.save("v", m)
+        req = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "click", "arguments": {"x": 5, "y": 6}}}
+        old = sys.stdin
+        sys.stdin = io.StringIO(json.dumps(req) + "\n")
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                tl.mcp("v")   # the VM is not running: the click fails, and is still recorded
+        finally:
+            sys.stdin = old
+        self.assertTrue(json.loads(out.getvalue())["result"]["isError"])
+        with open(os.path.join(self.d, "actions.log"), encoding="utf-8") as f:
+            entry = json.loads(f.read().splitlines()[0])
+        self.assertEqual((entry["tool"], entry["arguments"]), ("click", {"x": 5, "y": 6}))
+        self.assertIn("error", entry)
+
     def test_install_cache_until_installed(self):
         m = {"os": "win2025", "iso": "/x.iso", "memory_mb": 2048, "cpus": 2}
         os.makedirs(os.path.join(self.d, "answers"))

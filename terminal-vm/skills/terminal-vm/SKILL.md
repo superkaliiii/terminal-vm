@@ -37,3 +37,5 @@ terminal-vm gives you computer use inside a separate virtual machine (Linux, Win
 `terminal-vm ls`, `status NAME`, `pause NAME`, `resume NAME`, `stop NAME` (asks the guest; it may show a confirmation dialog you can click; a locked Windows session ignores it: unlock with `key ctrl+alt+delete`, the password, `key enter`), `stop NAME --force` (power cut, can lose work: only when the user agrees). Do not delete VM data.
 
 Before a risky step, `terminal-vm snapshot NAME save TAG` (running VM: memory included); `snapshot NAME load TAG` returns to it, `snapshot NAME ls` lists them. Files: `terminal-vm push NAME LOCAL GUEST` / `pull NAME GUEST LOCAL` (needs qemu-guest-agent in the guest). `rm` and `reset` destroy data: only when the user asks.
+
+A sandboxed VM (`ls` shows `"sandbox": true`) has no network and forgets its disk changes when it stops; your actions are logged. Do not count on downloads, file copies or saved work there.

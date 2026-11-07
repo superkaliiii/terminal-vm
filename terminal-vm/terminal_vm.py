@@ -17,6 +17,7 @@ Virtualization), which is also the default for `up` and `create` without `--os`.
   clone SRC NEW            instant copy-on-write copy of a stopped VM (SRC then stays read-only)
   snapshot NAME save|load|rm TAG | snapshot NAME ls
   display NAME --width W --height H    screen size at the next start
+  sandbox NAME [on|off]   no network, no guest agent or file copy, disk reset at each stop, actions logged
   layout NAME [us|fr]      keyboard layout for type/key (us = QWERTY, fr = AZERTY); action ... --layout: one call
   image [--os OS] [--plan]             download the installation image only
   push NAME LOCAL GUEST | pull NAME GUEST LOCAL   files, through qemu-guest-agent
@@ -592,23 +593,31 @@ def qemu_args(name, m, window, vnc_port=None):
     cpu = p.get("cpu", cpu)
     ep = lambda k: f"unix:{os.path.join(d, k + '.sock')}"
     w, h = m.get("width", 1280), m.get("height", 800)
+    # Sandbox: no network, no guest agent channel, disk writes thrown away at stop (once installed), QEMU confined
+    # by seccomp where it has it (Linux hosts). Only the screen and input reach the guest.
+    sandbox, setup = m.get("sandbox"), installing(d, m)
     vga = p["vga"] if p["vga"] == "cirrus-vga" else f"{p['vga']},xres={w},yres={h}"  # cirrus has no preferred mode
     args = ["-name", name, *accel, "-cpu", cpu, "-machine", p["machine"], "-m", str(m["memory_mb"]), "-smp", str(m["cpus"]),
             # QEMU locks the image: one VM per disk. During an unattended install, ignore guest flushes (much faster):
             # a host crash then loses the install, never a finished VM.
-            "-drive", f"file={os.path.join(d, 'disk.qcow2')},if={p['disk_bus']}" + (",cache=unsafe" if installing(d, m) else ""),
+            "-drive", f"file={os.path.join(d, 'disk.qcow2')},if={p['disk_bus']}" + (",cache=unsafe" if setup else "")
+            + (",snapshot=on" if sandbox and not setup else ""),
             "-cdrom", m["iso"], "-boot", "order=cd", "-device", vga,
             *(["-usb"] if p["usb"] == "uhci" else ["-device", p["usb"]]), "-device", "usb-tablet",
-            "-nic", "none" if m.get("offline") else f"user,model={p['nic']}",
-            "-device", "virtio-serial-pci",
-            "-chardev", "socket,path=" + os.path.join(d, "qga.sock") + ",server=on,wait=off,id=qga0",
-            "-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
+            "-nic", "none" if m.get("offline") or sandbox else f"user,model={p['nic']}",
+            *([] if sandbox else ["-device", "virtio-serial-pci",
+                                  "-chardev", "socket,path=" + os.path.join(d, "qga.sock") + ",server=on,wait=off,id=qga0",
+                                  "-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0"]),
+            *(["-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"]
+              if sandbox and not WINDOWS else []),  # QEMU for Windows is built without seccomp
             "-qmp", ep("qmp") + ",server=on,wait=off",
             "-qmp", ep("qmp-view") + ",server=on,wait=off",  # the viewer's own monitor
             # VNC takes a display number; password=on refuses every client until the password is set
             "-vnc", ep("vnc") if vnc_port is None else f"127.0.0.1:{vnc_port - 5900},password=on",
             "-pidfile", os.path.join(d, "qemu.pid"), "-display", ("sdl" if WINDOWS else "gtk") if window else "none"]
     answers = os.path.join(d, "answers")
+    if sandbox and not setup:
+        return args  # the answers drive is only for Setup
     if p["unattend"] == "xml" and os.path.isdir(answers):  # Setup reads autounattend.xml from removable drives
         # removable=on: Setup only searches removable media; a fixed USB disk is ignored
         args += ["-drive", f"if=none,id=answers,driver=vvfat,dir={answers},rw=off", "-device", "usb-storage,drive=answers,removable=on"]
@@ -618,7 +627,7 @@ def qemu_args(name, m, window, vnc_port=None):
 
 
 def create(name, iso, os_name="linux", cpus=None, memory=None, disk=None, width=1280, height=800, layout="us",
-           offline=False, product_key=None, ui_language="en-US"):
+           offline=False, product_key=None, ui_language="en-US", sandbox=False):
     d = vm_dir(name)
     p = PROFILES.get(os_name)
     if p is None:
@@ -641,7 +650,7 @@ def create(name, iso, os_name="linux", cpus=None, memory=None, disk=None, width=
     subprocess.run([qemu_bin("qemu-img"), "create", "-f", "qcow2", os.path.join(d, "disk.qcow2"), f"{disk}G"],
                    check=True, stdout=subprocess.DEVNULL)
     m = {"os": os_name, "iso": os.path.abspath(iso), "memory_mb": memory * 1024, "cpus": cpus, "width": width,
-         "height": height, "layout": layout, "offline": offline}
+         "height": height, "layout": layout, "offline": offline or sandbox, **({"sandbox": True} if sandbox else {})}
     if p["family"] == "windows":
         # 12 characters: within XP's 14-character limit, and the suffix meets Server's complexity policy
         # (an unmet policy would stop the unattended install at a password prompt).
@@ -799,7 +808,7 @@ def ls():
                 m = load(n)
                 out.append({"name": n, "os": m.get("os", "linux"), "status": state(n), "cpus": m["cpus"], "memory_gb": m["memory_mb"] // 1024,
                             "display": f"{m.get('width', 1280)}x{m.get('height', 800)}", "layout": m.get("layout", "us"),
-                            **({"base": m["base"]} if m.get("base") else {})})
+                            **({"base": m["base"]} if m.get("base") else {}), **({"sandbox": True} if m.get("sandbox") else {})})
     print(json.dumps(out + mac_machines(), indent=1))
 
 
@@ -868,6 +877,9 @@ def snapshot(name, cmd, tag=None):
         raise SystemExit(f"snapshot {cmd} needs a TAG (letters, digits, . _ -)")
     if cmd != "ls":
         _no_clones(name, "change snapshots of")
+        if load(name).get("sandbox") and state(name) != "stopped":
+            raise SystemExit(f"{name} is sandboxed: its disk changes are discarded at stop, so stop it first "
+                             "(a stopped VM's snapshot is the state each sandboxed run starts from)")
     if state(name) == "stopped":
         flag = {"save": "-c", "load": "-a", "rm": "-d", "ls": "-l"}[cmd]
         r = subprocess.run([qemu_bin("qemu-img"), "snapshot", flag, *([tag] if tag else []), os.path.join(vm_dir(name), "disk.qcow2")],
@@ -921,8 +933,25 @@ def set_layout(name, layout=None):
     print(json.dumps({"name": name, "layout": m.get("layout", "us")}))
 
 
+def set_sandbox(name, value=None):
+    """Show or change sandbox mode (stopped VM: it shapes the QEMU command line at the next start)."""
+    m = load(name)
+    if value:
+        if state(name) != "stopped":
+            raise SystemExit(f"{name} is running; stop it first: terminal-vm stop {name}")
+        m["sandbox"] = value == "on"
+        if not m["sandbox"]:
+            m.pop("sandbox")
+        save(name, m)
+    print(json.dumps({"name": name, "sandbox": bool(m.get("sandbox")),
+                      **({"note": "no network, no guest agent or file copy, disk changes discarded at stop, "
+                                  "MCP actions logged to actions.log"} if m.get("sandbox") else {})}))
+
+
 def transfer(name, direction, src, dest):
     """Copy a file to (push) or from (pull) the guest through qemu-guest-agent."""
+    if load(name).get("sandbox"):
+        raise SystemExit(f"{name} is sandboxed: no file copy in or out (terminal-vm sandbox {name} off to allow it)")
     try:
         g = QGA(name)
     except OSError:
@@ -1596,6 +1625,13 @@ def image(data):
 
 def mcp(name):
     agent = None  # whether qemu-guest-agent answered once; unknown until asked
+    journal = os.path.join(vm_dir(name), "actions.log") if load(name).get("sandbox") else None
+
+    def record(tool, a, error=None):  # sandbox: every agent action, for review
+        if journal:
+            with open(journal, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"time": time.strftime("%Y-%m-%dT%H:%M:%S"), "tool": tool, "arguments": a,
+                                    **({"error": error} if error else {})}) + "\n")
 
     def send(msg):
         sys.stdout.write(json.dumps(msg) + "\n"); sys.stdout.flush()
@@ -1626,6 +1662,7 @@ def mcp(name):
                         raise RuntimeError("The guest has no logged-in session (login screen). Ask the user to sign in: "
                                            f"terminal-vm view {name}")
                 out = act(name, tool, a)
+                record(tool, a)
                 if tool == "screenshot":
                     content = [image(out[0])]
                 else:
@@ -1634,6 +1671,7 @@ def mcp(name):
                         time.sleep(0.3); content.append(image(screenshot(name)[0]))
                 send({"jsonrpc": "2.0", "id": rid, "result": {"content": content}})
             except Exception as e:  # report tool failures to the agent instead of dying
+                record(tool, a, str(e))
                 send({"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": str(e)}], "isError": True}})
         elif method == "ping":
             send({"jsonrpc": "2.0", "id": rid, "result": {}})
@@ -1658,6 +1696,7 @@ def main(argv=None):
         sp.add_argument("--memory", type=int, help="GiB, default: per --os"); sp.add_argument("--disk", type=int, help="GiB, default: per --os")
         sp.add_argument("--width", type=int, default=1280); sp.add_argument("--height", type=int, default=800)
         sp.add_argument("--layout", default="us", choices=sorted(LAYOUTS)); sp.add_argument("--offline", action="store_true")
+        sp.add_argument("--sandbox", action="store_true", help="no network or file sharing, disposable disk, actions logged")
     u = sub.add_parser("up"); u.add_argument("name", nargs="?", default="default"); u.add_argument("--iso")
     u.add_argument("--no-view", action="store_true"); u.add_argument("--plan", action="store_true"); sizes(u)
     c = sub.add_parser("create"); c.add_argument("name"); c.add_argument("--iso"); sizes(c)
@@ -1686,9 +1725,10 @@ def main(argv=None):
     a.add_argument("--timeout", type=float, default=30); a.add_argument("--stable", type=float, default=1)
     a.add_argument("--layout", choices=sorted(LAYOUTS), help="this call only: us (QWERTY) or fr (AZERTY)")
     lo = sub.add_parser("layout"); lo.add_argument("name"); lo.add_argument("layout", nargs="?", choices=sorted(LAYOUTS))
+    sb = sub.add_parser("sandbox"); sb.add_argument("name"); sb.add_argument("value", nargs="?", choices=["on", "off"])
     o = p.parse_args(argv)
 
-    opts = ({k: getattr(o, k) for k in ("os_name", "cpus", "memory", "disk", "width", "height", "layout", "offline", "product_key", "ui_language")}
+    opts = ({k: getattr(o, k) for k in ("os_name", "cpus", "memory", "disk", "width", "height", "layout", "offline", "product_key", "ui_language", "sandbox")}
             if o.cmd in ("up", "create") else {})
     try:
         if o.cmd == "up": return up(o.name, o.iso, o.no_view, o.plan, **opts)
@@ -1706,6 +1746,7 @@ def main(argv=None):
         if o.cmd == "snapshot": return snapshot(o.name, o.snap_cmd, o.tag)
         if o.cmd == "display": return display(o.name, o.width, o.height)
         if o.cmd == "layout": return set_layout(o.name, o.layout)
+        if o.cmd == "sandbox": return set_sandbox(o.name, o.value)
         if o.cmd == "image": return print(json.dumps({"image": default_image(o.plan, o.os_name)}))
         if o.cmd in ("push", "pull"): return transfer(o.name, o.cmd, o.src, o.dest)
         if o.cmd == "view": return view(o.name, read_only=o.read_only)

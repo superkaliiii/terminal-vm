@@ -84,6 +84,21 @@ Only Windows Server 2025 evaluation media is downloaded automatically (straight 
 
 The same file runs on Windows 10/11 and Windows Server hosts with Python 3.8+ and QEMU (`winget install SoftwareFreedomConservancy.QEMU`). Enable the Windows Hypervisor Platform for speed (as administrator: `Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform`, then restart); without it QEMU falls back to slow emulation. `doctor` checks both. QMP and the guest agent use unix sockets in the VM's folder under your profile, as on Linux, so other users cannot reach them (Windows 10 1803+ and QEMU >= 7.2; Python reaches them through Winsock). VNC listens on a random localhost port behind a password generated at each start, which `show` prints for the viewer's prompt. Snapshots of a running VM are refused by QEMU on Windows hosts (no dirty-memory tracking): stop the VM first, then `snapshot NAME save TAG` (disk only). `view` draws the guest inside Windows Terminal (Sixel, keyboard and mouse through VT input), centred and scaled to the window, redrawing only what changed. Windows Terminal reports the mouse by cell only; on a Windows host the viewer refines it with the host cursor position, so the two pointers line up (the guest needs an absolute pointer: Windows and current Linux desktops have one, TinyCore's Xvesa does not). For the sharpest image, shrink the font (Ctrl+-) until the window holds the guest screen at 1:1 (about 103x39 cells for 1024x768). Other Windows terminals (WezTerm included) pass no images through ConPTY: `view` opens a VNC window there (TigerVNC), or use `start NAME --window`. Use `terminal-vm.cmd` from this folder as the launcher.
 
+## Sandbox
+
+`create NAME --sandbox` (or `sandbox NAME on` for a stopped VM) isolates a VM for an untrusted agent. Only the screen and input reach the guest:
+
+| | Sandbox |
+|---|---|
+| Network | none (`-nic none`) |
+| Guest agent, `push`/`pull` | no agent channel; file copy refused |
+| Disk | writes discarded at every stop (`snapshot=on`): each run starts from the same state. Prepare that state with sandbox off, or `snapshot NAME load TAG` while stopped. A Windows install still writes for real until it is finished |
+| QEMU | seccomp on Linux hosts (`-sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny`); QEMU for Windows has none |
+| MCP | screen and input tools only (as always); every call, failures included, is appended to `actions.log` in the VM folder |
+| Snapshots | refused while running (they would be discarded) |
+
+Not covered: running QEMU under a dedicated system user (needs administrator setup) and host-side CPU or I/O quotas. Verified on Windows Server 2025 in WSL: no network adapter in the guest, a folder created during a run gone after restart, actions logged.
+
 ## Keyboard layouts and text
 
 `type` sends key presses in the guest's layout (`--layout us|fr` at creation, stored per VM, changed with `layout NAME us|fr`; the MCP `type` and `key` tools also take an optional `layout`). It must match the layout active in the guest. Characters outside the layout use Ctrl+Shift+U Unicode entry (GTK/Qt apps). Key chords name letters as the guest layout prints them (`ctrl+a` on an AZERTY guest presses the physical Q key).
