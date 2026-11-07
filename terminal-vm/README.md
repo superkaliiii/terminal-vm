@@ -97,6 +97,8 @@ One quota covers everything the host runs, so neither people nor agents can over
 
 Every check runs under a host-wide lock, so two commands cannot both pass and then both start. A VM's default ceiling never exceeds the quota. VMs already above the disk quota still start; new disks wait for room. Under WSL, `df` reports the virtual disk of the distribution, not the Windows drive: set `--disk` to what the drive can really hold.
 
+`top` (also an MCP tool) lists every running VM's real use of the host, QEMU's CPU % of one core and resident memory, read from `/proc` or the Windows process API, next to its allotment and ceiling, followed by the quota.
+
 ## Resources
 
 Each VM has a ceiling of CPUs and memory: its template's (`--os`: 8 CPUs and 16 GiB, Windows XP 2 and 3), never above the host, or `create --max-cpus N --max-memory GiB`. Within it, `resources NAME --cpus N --memory GiB` (MCP tool `resources`, so agents size their own VM) changes what the VM uses, live where QEMU and the guest allow it:

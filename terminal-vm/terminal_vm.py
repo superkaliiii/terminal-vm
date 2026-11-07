@@ -17,6 +17,7 @@ Virtualization), which is also the default for `up` and `create` without `--os`.
   clone SRC NEW            instant copy-on-write copy of a stopped VM (SRC then stays read-only)
   snapshot NAME save|load|rm TAG | snapshot NAME ls
   display NAME --width W --height H    screen size at the next start
+  top                      running VMs' real CPU and memory on the host, allotments, quota
   quota [--cpus N --memory GiB --disk GiB --vms N]   host-wide ceiling for all VMs (default from the host)
   resources NAME [--cpus N] [--memory GiB]   within the VM's ceiling (create --max-cpus/--max-memory); live where possible
   sandbox NAME [on|off]   no network, no guest agent or file copy, disk reset at each stop, actions logged
@@ -876,6 +877,67 @@ def mac_machines():
         return []
     return [{"name": m["name"], "os": "macos", "engine": "terminal-mac", "cpus": m.get("cpu"),
              "memory_gb": m.get("memoryGiB"), "display": f"{m.get('width')}x{m.get('height')}"} for m in machines]
+
+
+# ---------- monitoring ----------
+
+def _proc_times(pid):
+    """(CPU seconds used, resident bytes) of a host process, or None if it is gone."""
+    try:
+        if WINDOWS:
+            import ctypes
+            from ctypes import wintypes
+            k = ctypes.windll.kernel32
+            k.OpenProcess.restype = wintypes.HANDLE
+            h = k.OpenProcess(0x1000 | 0x0010, False, pid)  # QUERY_LIMITED_INFORMATION | VM_READ
+            if not h:
+                return None
+            try:
+                t = [wintypes.FILETIME() for _ in range(4)]
+                k.GetProcessTimes(h, *[ctypes.byref(x) for x in t])
+                cpu = sum((x.dwHighDateTime << 32 | x.dwLowDateTime) for x in t[2:]) / 1e7
+
+                class Mem(ctypes.Structure):
+                    _fields_ = [("cb", wintypes.DWORD), ("faults", wintypes.DWORD)] + \
+                               [(n, ctypes.c_size_t) for n in ("peak_ws", "ws", "qpp", "qp", "qnpp", "qnp", "pf", "ppf")]
+                mem = Mem(); mem.cb = ctypes.sizeof(mem)
+                ctypes.windll.psapi.GetProcessMemoryInfo(h, ctypes.byref(mem), mem.cb)
+                return cpu, mem.ws
+            finally:
+                k.CloseHandle(h)
+        with open(f"/proc/{pid}/stat") as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+        with open(f"/proc/{pid}/statm") as f:
+            rss = int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+        return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK"), rss
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def top(sample=0.5):
+    """Real host use of each running VM (QEMU's CPU % of one core, resident memory) next to what it is allotted,
+    and the quota. Read-only: for people and agents to see where they stand."""
+    running = []
+    for n in machines():
+        if state(n) == "stopped":
+            continue
+        try:
+            with open(os.path.join(vm_dir(n), "qemu.pid")) as f:
+                running.append((n, int(f.read().strip())))
+        except (OSError, ValueError):
+            pass
+    before = {n: _proc_times(pid) for n, pid in running}
+    time.sleep(sample if running else 0)
+    vms = []
+    for n, pid in running:
+        m, a, b = load(n), before[n], _proc_times(pid)
+        top_cpus, top_gb = limits(m)
+        vms.append({"name": n, "os": m.get("os", "linux"), "cpus": m["cpus"], "max_cpus": top_cpus,
+                    "memory_gb": m["memory_mb"] // 1024, "max_memory_gb": top_gb,
+                    **({"cpu_percent": round((b[0] - a[0]) / sample * 100), "host_memory_gb": round(b[1] / 2 ** 30, 2)}
+                       if a and b else {}),
+                    **({"sandbox": True} if m.get("sandbox") else {})})
+    return {"vms": vms, "quota": quota()}
 
 
 # ---------- quota ----------
@@ -1865,6 +1927,8 @@ TOOLS = [
      _schema({"text": {"type": "string"}, **_LAYOUT, **_SHOT}, ["text"])),
     ("key", "Press a key chord, e.g. ctrl+a, alt+tab, return, super.", _schema({"key": {"type": "string"}, **_LAYOUT, **_SHOT}, ["key"])),
     ("status", "VM run state, screen size and logged-in guest users.", _schema({})),
+    ("top", "Every running VM's real host use (CPU % of one core, resident memory GiB) next to its allotment and "
+            "ceiling, plus the quota. Read-only.", _schema({})),
     ("quota", "Host-wide quota and its use: running vCPUs, memory ceilings of running VMs (GiB), virtual disk "
               "(GiB), running VMs. Only the user can change it.", _schema({})),
     ("resources", "Show the VM's CPUs and memory and their ceiling, or change them within it: give cpus and/or "
@@ -1922,7 +1986,7 @@ def mcp(name):
                                            f"terminal-vm view {name}")
                 # resources opens its own QMP session (QEMU takes one client at a time), so not through act()
                 out = (resources(name, a.get("cpus"), a.get("memory_gb")) if tool == "resources" else
-                       quota() if tool == "quota" else act(name, tool, a))
+                       quota() if tool == "quota" else top() if tool == "top" else act(name, tool, a))
                 record(tool, a)
                 if tool == "screenshot":
                     content = [image(out[0])]
@@ -1989,6 +2053,7 @@ def main(argv=None):
     a.add_argument("--layout", choices=sorted(LAYOUTS), help="this call only: us (QWERTY) or fr (AZERTY)")
     lo = sub.add_parser("layout"); lo.add_argument("name"); lo.add_argument("layout", nargs="?", choices=sorted(LAYOUTS))
     sb = sub.add_parser("sandbox"); sb.add_argument("name"); sb.add_argument("value", nargs="?", choices=["on", "off"])
+    sub.add_parser("top")
     qu = sub.add_parser("quota")
     for k, h in (("cpus", "running vCPUs"), ("memory", "GiB of running VMs' memory ceilings"),
                  ("disk", "GiB of virtual disks"), ("vms", "running VMs")):
@@ -2020,6 +2085,7 @@ def main(argv=None):
         if o.cmd == "quota":
             change = {"cpus": o.cpus, "memory_gb": o.memory, "disk_gb": o.disk, "vms": o.vms}
             return print(json.dumps(quota(change if any(v is not None for v in change.values()) else None), indent=1))
+        if o.cmd == "top": return print(json.dumps(top(), indent=1))
         if o.cmd == "image": return print(json.dumps({"image": default_image(o.plan, o.os_name)}))
         if o.cmd in ("push", "pull"): return transfer(o.name, o.cmd, o.src, o.dest)
         if o.cmd == "view": return view(o.name, read_only=o.read_only)

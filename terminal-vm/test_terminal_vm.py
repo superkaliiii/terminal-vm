@@ -573,6 +573,14 @@ class StoppedVm(unittest.TestCase):
                       first)   # one more, with every property QEMU listed for that slot
         self.assertEqual(out["guest_memory_gb"], 3.0)
 
+    def test_top(self):
+        cpu, rss = tl._proc_times(os.getpid())          # this test process, on Linux and Windows alike
+        self.assertTrue(cpu >= 0 and rss > 1 << 20)
+        self.assertIsNone(tl._proc_times(2 ** 22 + 7))  # no such process
+        out = tl.top()
+        self.assertEqual(out["vms"], [])                 # nothing running here
+        self.assertIn("cpus", out["quota"])
+
     def test_quota(self):
         """No command gets past the quota: start, more CPUs, clone and create are refused beyond it."""
         q = tl.quota()
