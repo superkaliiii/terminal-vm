@@ -1185,7 +1185,15 @@ def view(name, fps=30, read_only=False):
     last, geom, held, cell, shown, prev_rgb, refine = None, None, set(), (20, 10), None, b"", cell_refiner()
     try:
         while True:
-            data, (w, h) = screenshot(name, q, "view.png") if proto == "kitty" else screen_pixels(name, q)
+            try:
+                data, (w, h) = screenshot(name, q, "view.png") if proto == "kitty" else screen_pixels(name, q)
+            except (OSError, RuntimeError):  # a capture can stall >10 s on a loaded host: reconnect, keep viewing
+                q.close()
+                if state(name) == "stopped":
+                    return
+                time.sleep(0.5)
+                q = QMP(endpoint(name, "qmp-view"))
+                continue
             g = term_geometry(cell)
             if data != last or g != geom:
                 cols, rows, cw, ch = g
