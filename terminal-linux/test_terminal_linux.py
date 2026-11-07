@@ -336,7 +336,7 @@ class StoppedVm(unittest.TestCase):
         def run(argv, **k):
             self.calls.append(argv)
             if argv[1] == "create":
-                open(argv[4], "w").close()
+                open([a for a in argv if a.endswith((".qcow2", ".new"))][-1], "w").close()  # the image created
             out = '{"virtual-size": 68719476736}' if argv[1] == "info" else \
                 "ID TAG VM SIZE DATE\n1 clean 0 B 2026-11-06 10:00:00\n" if argv[1:3] == ["snapshot", "-l"] else ""
             return tl.subprocess.CompletedProcess(argv, 0, out, "")
