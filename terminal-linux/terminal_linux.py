@@ -974,6 +974,8 @@ def graphics():
     """Inline image protocol of this terminal, from its environment (no query round-trip): kitty, sixel or None.
     WT_SESSION: Windows Terminal (Sixel since 1.22); WT also passes it into WSL."""
     e = os.environ
+    if WINDOWS:  # other terminals reach Windows programs through ConPTY, which drops image sequences (WezTerm tested)
+        return "sixel" if "WT_SESSION" in e else None
     if "KITTY_WINDOW_ID" in e or e.get("TERM") == "xterm-kitty" or e.get("TERM_PROGRAM", "").lower() in ("ghostty", "wezterm"):
         return "kitty"
     if "WT_SESSION" in e or e.get("TERM") in ("foot", "foot-extra", "mlterm") or e.get("TERM_PROGRAM") == "mintty":
@@ -1000,28 +1002,70 @@ def fit(w, h, cols, rows, cw, ch):
 
 def screen_pixels(name, q):
     """Raw RGB of the guest screen: screendump's default PPM, so nothing to decode."""
-    path = os.path.join(vm_dir(name), "view.ppm")
+    path = os.path.join(vm_dir(name), f"view-{os.getpid()}.ppm")  # one file per viewer
     q.cmd("screendump", filename=path)
     with open(path, "rb") as f:
         data = f.read()
+    os.remove(path)
     w, h = map(int, data.split(maxsplit=3)[1:3])  # "P6\n<w> <h>\n255\n" then the pixels
     return data[-w * h * 3:], (w, h)
 
 
-_LEVEL = [round(v * 5 / 255) for v in range(256)]
-_CUBE = [bytes(_LEVEL[v] * f for v in range(256)) for f in (36, 6, 1)]  # channel byte -> its share of a 6x6x6 index
+_BAYER = ((0, 8, 2, 10), (12, 4, 14, 6), (3, 11, 1, 9), (15, 7, 13, 5))
+# _CUBE[y % 4][x % 4][channel]: channel byte -> its share of a 6x6x6 index, after the ordered-dither offset of that
+# position, at half strength: 6 levels alone band smooth gradients, a full dither shows as grain once the terminal
+# enlarges the pixels; half mixes the two nearest levels only near their midpoint
+_CUBE = [[[bytes(min(5, max(0, round((v + ((b + 0.5) / 16 - 0.5) * 25) / 51))) * f for v in range(256))
+           for f in (36, 6, 1)] for b in row] for row in _BAYER]
 _IS = [bytes(int(i == c) for i in range(256)) for c in range(216)]
 _RLE = re.compile(rb"(.)\1{3,}")
 
 
-def sixel(rgb, w, h, step=1):
-    """RGB bytes -> DEC Sixel image of every step-th pixel, in the 6x6x6 colour cube. No per-pixel Python loop:
-    bytes.translate maps whole rows, and big-integer sums combine them byte-wise (no sum exceeds 255: no carry)."""
-    rows = []
-    for y in range(0, h, step):
+def sixel_rows(rgb, w, h, W, H, old=None, prev=None):
+    """RGB bytes (w x h) -> W x H rows of 6x6x6 colour-cube indices (ordered dither, nearest-neighbour scaling). No per-pixel Python
+    loop: bytes.translate maps whole rows, big-integer sums combine them byte-wise (no sum exceeds 255: no carry),
+    and map() picks the scaled columns. prev: the rows this returned for the frame old (same sizes); rows whose
+    source line did not change are reused, so a moving pointer costs a few lines, not a frame."""
+    xs, rows, cache = [x * w // W for x in range(W)], [], {}
+    for Y, y in enumerate(y * h // H for y in range(H)):
         line = rgb[y * w * 3:(y + 1) * w * 3]
-        n = len(line[0::3 * step])
-        rows.append(sum(int.from_bytes(line[c::3 * step].translate(_CUBE[c]), "big") for c in range(3)).to_bytes(n, "big"))
+        if prev and old[y * w * 3:(y + 1) * w * 3] == line:
+            rows.append(prev[Y]); continue
+        if y not in cache:
+            q = 0
+            for c in range(3):
+                plane = bytearray(w)
+                for x in range(4):  # every 4th pixel shares a dither offset: one translate per phase
+                    plane[x::4] = line[c + 3 * x::12].translate(_CUBE[y % 4][x][c])
+                q += int.from_bytes(plane, "big")
+            q = q.to_bytes(w, "big")
+            cache[y] = q if W == w else bytes(map(q.__getitem__, xs))
+        rows.append(cache[y])
+    return rows
+
+
+def changed(old, new, gap=20):
+    """Boxes (x0, y0, x1, y1) around the bytes that differ between two equal-sized row lists: one per run of
+    changed rows (runs closer than gap rows merge), so a pointer that jumped redraws two small boxes, not one big."""
+    ys = [y for y, (a, b) in enumerate(zip(old, new)) if a != b]
+    runs = []
+    for y in ys:
+        if runs and y - runs[-1][-1] <= gap:
+            runs[-1].append(y)
+        else:
+            runs.append([y])
+    boxes, n = [], len(new[0])
+    for run in runs:
+        x0, x1 = n, 0
+        for y in run:  # xor of the rows as big integers: lowest and highest differing byte, no per-byte loop
+            d = int.from_bytes(old[y], "big") ^ int.from_bytes(new[y], "big")
+            x0, x1 = min(x0, n - 1 - (d.bit_length() - 1) // 8), max(x1, n - ((d & -d).bit_length() - 1) // 8)
+        boxes.append((x0, run[0], x1, run[-1] + 1))
+    return boxes
+
+
+def sixel(rows):
+    """Rows of colour-cube indices, all the same length -> DEC Sixel image."""
     n = len(rows[0])
     out = [b'\x1bPq"1;1;%d;%d' % (n, len(rows))]
     out += [b"#%d;2;%d;%d;%d" % (i, i // 36 * 20, i // 6 % 6 * 20, i % 6 * 20) for i in range(216)]
@@ -1054,7 +1098,7 @@ def raw_terminal():
     return lambda: termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-def view(name, fps=8, read_only=False):
+def view(name, fps=30, read_only=False):
     proto = graphics()
     if not proto:
         print("This terminal shows no inline images (Kitty or Sixel); opening the native window instead.", file=sys.stderr)
@@ -1073,37 +1117,57 @@ def view(name, fps=8, read_only=False):
             if not chunk:
                 return
     threading.Thread(target=reader, daemon=True).start()
-    # alt screen, hide cursor, all mouse motion as SGR (in pixels with Kitty), ask the cell size in pixels
+    # alt screen, hide cursor, all mouse motion as SGR (in pixels where the terminal can), ask the cell size in pixels
     out.write(b"\x1b[?1049h\x1b[?25l\x1b[?1003h\x1b[?1006h" + (b"\x1b[?1016h" if proto == "kitty" else b"") + b"\x1b[16t")
-    last, geom, held, cell = None, None, set(), (20, 10)
+    last, geom, held, cell, shown, prev_rgb = None, None, set(), (20, 10), None, b""
     try:
         while True:
             data, (w, h) = screenshot(name, q, "view.png") if proto == "kitty" else screen_pixels(name, q)
             g = term_geometry(cell)
             if data != last or g != geom:
                 cols, rows, cw, ch = g
-                out.write(b"\x1b[H" if g == geom else b"\x1b[2J\x1b[H")
+                if g != geom:
+                    out.write(b"\x1b[2J")
+                    shown = None
                 last, geom = data, g
                 if proto == "kitty":
                     cu, ru = fit(w, h, cols, rows, cw, ch)
                     dw, dh = cu * cw, ru * ch  # displayed size in pixels
+                    ox, oy = (cols - cu) // 2, (rows - 1 - ru) // 2  # centred, in cells
                     b64 = base64.standard_b64encode(data)
+                    out.write(b"\x1b[%d;%dH" % (oy + 1, ox + 1))
                     for i in range(0, len(b64), 4096):
                         head = b"a=T,f=100,i=1,c=%d,r=%d,C=1,q=2," % (cu, ru) if i == 0 else b""
                         out.write(b"\x1b_G%sm=%d;%s\x1b\\" % (head, i + 4096 < len(b64), b64[i:i + 4096]))
-                else:  # Sixel has no scaling: keep every step-th pixel so the image fits above the status line
-                    step = max(1, -(-w // int(cols * cw)), -(-h // int((rows - 1) * ch)))
-                    dw, dh = -(-w // step), -(-h // step)
-                    out.write(sixel(data, w, h, step))
+                else:  # Sixel has no scaling: scale here to fill the window above the status line
+                    # shortcut: at most 2x up, the cost grows with the output; raise it for very large windows
+                    scale = min(cols * cw / w, (rows - 1) * ch / h, 2)
+                    dw, dh = max(1, int(w * scale)), max(1, int(h * scale))
+                    ox, oy = int((cols * cw - dw) / 2 // cw), int(((rows - 1) * ch - dh) / 2 // ch)
+                    same = shown is not None and len(prev_rgb) == len(data)
+                    frame = sixel_rows(data, w, h, dw, dh, prev_rgb, shown) if same else sixel_rows(data, w, h, dw, dh)
+                    prev_rgb = data
+                    boxes = [(0, 0, dw, dh)] if shown is None or cw % 1 or ch % 1 else changed(shown, frame, int(ch))
+                    for box in boxes:  # redraw only the cells that changed: a moving pointer costs a few cells
+                        cw_, ch_ = int(cw), int(ch)
+                        x0, y0 = box[0] // cw_ * cw_, box[1] // ch_ * ch_
+                        y1 = min(dh, y0 + -(-(box[3] - y0) // 6) * 6)  # whole sixel bands: no blank rows below
+                        out.write(b"\x1b[%d;%dH" % (oy + y0 // ch_ + 1, ox + x0 // cw_ + 1))
+                        out.write(sixel([r[x0:box[2]] for r in frame[y0:y1]]))
+                    shown = frame
                 out.write(f"\x1b[{rows};1H\x1b[2K\x1b[2m {name} · {w}x{h} · Ctrl+] exit · Ctrl+O window\x1b[0m".encode())
                 out.flush()
             try:
                 chunk = keys.get(timeout=1 / fps)
+                while not keys.empty() and chunk:  # take everything typed meanwhile
+                    chunk += keys.get_nowait()
             except queue.Empty:
                 continue
             if not chunk:
                 return
-            for e in parse_input(chunk.decode("utf-8", "replace")):
+            events = parse_input(chunk.decode("utf-8", "replace"))
+            motion = lambda e: e[0] == "mouse" and e[1] & 32 and e[1] & 3 == 3  # pointer moves, no button held
+            for i, e in enumerate(events):
                 if e[0] == "quit":
                     return
                 if e[0] == "cell":
@@ -1117,11 +1181,13 @@ def view(name, fps=8, read_only=False):
                 elif e[0] == "key":
                     send_keys(q, chord_keys(e[1], layout))
                 elif e[0] == "mouse":
+                    if motion(e) and i + 1 < len(events) and motion(events[i + 1]):
+                        continue  # only the latest of a run of moves: the pointer follows without a backlog
                     code, px, py, pressed = e[1:]
                     if proto == "sixel":  # 1-based cells: the middle of the cell, in pixels
                         px, py = (px - 0.5) * cw, (py - 0.5) * ch
-                    x, y = px * w / dw, py * h / dh
-                    if x >= w or y >= h:
+                    x, y = (px - ox * cw) * w / dw, (py - oy * ch) * h / dh
+                    if not (0 <= x < w and 0 <= y < h):
                         continue  # outside the image (status line or margin)
                     move(q, x, y, (w, h))
                     if code & 64:

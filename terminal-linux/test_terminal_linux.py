@@ -79,12 +79,12 @@ class Viewer(unittest.TestCase):
     def test_sixel(self):
         """Decode the encoder's output back to palette indices with an independent reader."""
         w, h = 9, 8
-        rgb = bytes(v for i in range(w * h) for v in ((i * 37) % 256, (i * 91) % 256, 255 if i % 5 else 0))
+        # palette colours exactly (multiples of 51): the dither leaves them alone, so the expected index is exact
+        rgb = bytes(51 * v for i in range(w * h) for v in (i % 6, i * 5 % 6, 5 if i % 5 else 0))
         cube = lambda r, g, b: round(r * 5 / 255) * 36 + round(g * 5 / 255) * 6 + round(b * 5 / 255)
-        for step in (1, 2):
-            s = tl.sixel(rgb, w, h, step).decode()
+        for W, H in ((9, 8), (5, 4), (7, 6), (14, 13)):  # same, half, uneven, larger
+            s = tl.sixel(tl.sixel_rows(rgb, w, h, W, H)).decode()
             self.assertTrue(s.startswith("\x1bPq") and s.endswith("\x1b\\"))
-            W, H = -(-w // step), -(-h // step)
             self.assertIn(f'"1;1;{W};{H}', s)
             self.assertIn("#215;2;100;100;100", s)
             got = [[None] * W for _ in range(H)]
@@ -100,8 +100,28 @@ class Viewer(unittest.TestCase):
                             if (ord(ch) - 63) >> k & 1:
                                 self.assertIsNone(got[band_no * 6 + k][x])  # one colour per pixel
                                 got[band_no * 6 + k][x] = int(c)
-            want = [[cube(*rgb[(y * w + x) * 3:(y * w + x) * 3 + 3]) for x in range(0, w, step)] for y in range(0, h, step)]
+            src = lambda X, Y: (Y * h // H * w + X * w // W) * 3   # nearest source pixel
+            want = [[cube(*rgb[src(X, Y):src(X, Y) + 3]) for X in range(W)] for Y in range(H)]
             self.assertEqual(got, want)
+
+    def test_dither(self):
+        """A grey between two levels comes out as a mix of both, in proportion; exact levels stay flat."""
+        grey = lambda v: tl.sixel_rows(bytes([v]) * (8 * 8 * 3), 8, 8, 8, 8)
+        mixed = b"".join(grey(128))                         # 128 = 2.51 levels of 51
+        self.assertEqual(set(mixed), {2 * 43, 3 * 43})      # grey index: level * (36 + 6 + 1)
+        self.assertAlmostEqual(mixed.count(3 * 43) / 64, 0.5, delta=0.07)
+        self.assertEqual(set(b"".join(grey(153))), {3 * 43})
+
+    def test_changed(self):
+        old = [bytes(12) for _ in range(5)]
+        self.assertEqual(tl.changed(old, list(old)), [])
+        new = list(old)
+        new[1] = bytes(3) + b"\x07" + bytes(8)            # one pixel at x=3
+        new[3] = bytes(9) + b"\x01\x00\x02"               # x=9 and x=11
+        self.assertEqual(tl.changed(old, new), [(3, 1, 12, 4)])                  # rows 1 and 3: one run
+        self.assertEqual(tl.changed(old, new, gap=1), [(3, 1, 4, 2), (9, 3, 12, 4)])  # apart: two boxes
+        new = [b"\x01" + bytes(11)] + old[1:]             # first byte only
+        self.assertEqual(tl.changed(old, new), [(0, 0, 1, 1)])
 
     def test_fit(self):
         self.assertEqual(tl.fit(1280, 800, 100, 41, 10, 20), (100, 31))   # width-bound
