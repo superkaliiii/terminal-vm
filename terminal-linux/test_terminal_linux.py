@@ -344,18 +344,51 @@ class WindowsGuests(unittest.TestCase):
         old = (tl.subprocess.run, tl.qemu_bin)
         tl.subprocess.run, tl.qemu_bin = (lambda *a, **k: calls.append(a)), (lambda t: t)
         iso = os.path.join(self.tmp, "w.iso"); open(iso, "w").close()
+        tools = os.path.join(self.tmp, "tools.exe")
+        with open(tools, "wb") as f: f.write(b"MZ fake")
+        old_tools, tl.guest_tools = tl.guest_tools, lambda: tools   # no download in tests
         try:
             with self.assertRaises(SystemExit):  # Windows 8 and XP need the user's key
                 tl.create("w8", iso, os_name="win8")
             tl.create("w11", iso, os_name="win11", layout="fr")
         finally:
             tl.subprocess.run, tl.qemu_bin = old
+            tl.guest_tools = old_tools
         with open(os.path.join(self.tmp, "w11", "machine.json")) as f:
             m = json.load(f)
         self.assertEqual((m["os"], m["memory_mb"], m["user"]), ("win11", 4096, "user"))
         self.assertTrue(m["password"].endswith("-Aa1") and len(m["password"]) == 12)
         self.assertIn("64G", calls[-1][0])
         self.assertTrue(os.path.isfile(os.path.join(self.tmp, "w11", "answers", "autounattend.xml")))
+        with open(os.path.join(self.tmp, "w11", "answers", "virtio-win-guest-tools.exe"), "rb") as f:
+            self.assertEqual(f.read(), b"MZ fake")   # the guest agent's installer rides on the answers drive
+        with open(os.path.join(self.tmp, "w11", "answers", "autounattend.xml"), encoding="utf-8") as f:
+            xml = f.read()
+        self.assertLess(xml.index("virtio-win-guest-tools.exe /install /quiet"), xml.index("shutdown /r"))
+
+    def test_download_checks(self):
+        """Downloads are kept only over HTTPS and with the pinned SHA-256."""
+        class Resp(io.BytesIO):
+            def __init__(self, body, url): super().__init__(body); self.url, self.headers = url, {}
+            def geturl(self): return self.url
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+        old = tl.urllib.request.urlopen
+        dest = os.path.join(self.tmp, "img", "f.bin")
+        good = __import__("hashlib").sha256(b"data").hexdigest()
+        try:
+            tl.urllib.request.urlopen = lambda url, timeout: Resp(b"data", "https://x/f.bin")
+            with self.assertRaises(SystemExit):
+                tl.download("https://x/f.bin", dest, "0" * 64)
+            self.assertFalse(os.path.exists(dest) or os.path.exists(dest + ".part"))
+            tl.urllib.request.urlopen = lambda url, timeout: Resp(b"data", "http://x/f.bin")
+            with self.assertRaises(SystemExit):
+                tl.download("https://x/f.bin", dest, good)
+            self.assertFalse(os.path.exists(dest) or os.path.exists(dest + ".part"))
+            tl.urllib.request.urlopen = lambda url, timeout: Resp(b"data", "https://x/f.bin")
+            self.assertEqual(tl.download("https://x/f.bin", dest, good), dest)
+        finally:
+            tl.urllib.request.urlopen = old
 
 
 class StoppedVm(unittest.TestCase):

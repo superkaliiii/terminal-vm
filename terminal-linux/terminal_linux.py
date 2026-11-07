@@ -488,6 +488,12 @@ WINDOWS_IMAGES = {  # official evaluation media that can be downloaded without a
 LOCALES = {"us": ("en-US", "0409:00000409"), "fr": ("fr-FR", "040c:0000040c")}
 
 
+# Guest agent for status users, push and pull: the answers drive's letter varies, so look for the installer.
+# Without it on the drive (older Windows, or offline host) the loop finds nothing and does nothing.
+GUEST_TOOLS_CMD = ('cmd /c for %d in (D E F G H I) do if exist %d:\\virtio-win-guest-tools.exe '
+                   'start /wait %d:\\virtio-win-guest-tools.exe /install /quiet /norestart')
+
+
 def autounattend(p, layout, user, password, key, ui="en-US"):
     """autounattend.xml for Windows 7 and later: wipe disk 0, install, local admin with auto-logon,
     skip OOBE, enable hex Unicode entry (Alt, numpad +, hex) for the type tool. `ui` must be a
@@ -527,6 +533,7 @@ def autounattend(p, layout, user, password, key, ui="en-US"):
     first = ("<FirstLogonCommands>" + "".join(
         f'<SynchronousCommand wcm:action="add"><Order>{i}</Order><CommandLine>{c}</CommandLine></SynchronousCommand>'
         for i, c in enumerate(('reg add "HKCU\\Control Panel\\Input Method" /v EnableHexNumpad /t REG_SZ /d 1 /f',
+                               GUEST_TOOLS_CMD,
                                'reg add HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System '
                                '/v DisableLockWorkstation /t REG_DWORD /d 1 /f',
                                'shutdown /r /t 5'), 1)) + "</FirstLogonCommands>")
@@ -645,6 +652,9 @@ def create(name, iso, os_name="linux", cpus=None, memory=None, disk=None, width=
             content, filename = autounattend(p, layout, m["user"], m["password"], key, ui_language), "autounattend.xml"
         with open(os.path.join(d, "answers", filename), "w", encoding="utf-8", newline="") as f:
             f.write(content)
+        tools = guest_tools() if os_name in GUEST_TOOLS_OS else None
+        if tools:  # installed at first logon from the answers drive (autounattend: GUEST_TOOLS_CMD)
+            shutil.copyfile(tools, os.path.join(d, "answers", "virtio-win-guest-tools.exe"))
     with open(os.path.join(d, "machine.json"), "w") as f:
         json.dump(m, f)
     out = {"created": name, "os": os_name, "path": d}
@@ -1321,6 +1331,12 @@ def view(name, fps=30, read_only=False):
 
 # ---------- guided setup, diagnostics, skills ----------
 
+# Fedora's virtio-win build, pinned: the "stable" link redirects over plain HTTP and only RPMs have checksums.
+GUEST_TOOLS = ("https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.302-1/"
+               "virtio-win-guest-tools.exe", "d8ae9ea1e943384ac195e012cd36f82c3161620e5fc9529be4e42e6f420e222d")
+GUEST_TOOLS_OS = ("win10", "win11", "win2016", "win2019", "win2022", "win2025")  # what virtio-win 0.1.302 supports
+
+
 def default_image(plan=False, os_name="linux"):
     """Latest Debian live XFCE ISO (cached, SHA-256 verified), or Microsoft's evaluation ISO."""
     if os_name != "linux":
@@ -1332,20 +1348,42 @@ def default_image(plan=False, os_name="linux"):
         return dest
     sums = urllib.request.urlopen(IMAGE_INDEX + "SHA256SUMS", timeout=30).read().decode()
     expected = re.search(r"([0-9a-f]{64})\s+" + re.escape(iso), sums)[1]
+    return download(IMAGE_INDEX + iso, dest, expected)
+
+
+def download(url, dest, sha256):
+    """HTTPS download to dest, kept only if its SHA-256 matches."""
     os.makedirs(os.path.dirname(dest), exist_ok=True)
-    digest, part = hashlib.sha256(), dest + ".part"
-    with urllib.request.urlopen(IMAGE_INDEX + iso, timeout=60) as r, open(part, "wb") as f:
-        total, done = int(r.headers.get("Content-Length", 0)), 0
-        while chunk := r.read(1 << 20):
-            f.write(chunk); digest.update(chunk); done += len(chunk)
-            if total:
-                print(f"\rdownloading {iso}: {done * 100 // total}%", end="", file=sys.stderr)
+    digest, part, label = hashlib.sha256(), dest + ".part", os.path.basename(dest)
+    with urllib.request.urlopen(url, timeout=60) as r:
+        if urllib.parse.urlsplit(r.geturl()).scheme != "https":  # checked before any file is written
+            raise SystemExit(f"{url} redirected off HTTPS ({r.geturl()}); aborting")
+        with open(part, "wb") as f:
+            total, done = int(r.headers.get("Content-Length", 0)), 0
+            while chunk := r.read(1 << 20):
+                f.write(chunk); digest.update(chunk); done += len(chunk)
+                if total:
+                    print(f"\rdownloading {label}: {done * 100 // total}%", end="", file=sys.stderr)
     print(file=sys.stderr)
-    if digest.hexdigest() != expected:
+    if digest.hexdigest() != sha256:
         os.unlink(part)
-        raise SystemExit(f"checksum mismatch for {iso}; download discarded")
+        raise SystemExit(f"checksum mismatch for {label}; download discarded")
     os.rename(part, dest)
     return dest
+
+
+def guest_tools():
+    """virtio-win guest tools (VirtIO serial driver + qemu-guest-agent) for Windows 10/Server 2016 and later,
+    cached; None when they cannot be fetched (the guest then works without its agent)."""
+    url, sha256 = GUEST_TOOLS
+    dest = os.path.join(STORE, "images", "virtio-win-guest-tools-0.1.302.exe")
+    if os.path.exists(dest):
+        return dest
+    try:
+        return download(url, dest, sha256)
+    except (OSError, SystemExit) as e:
+        print(f"guest tools not installed ({e}): status users, push and pull will be unavailable", file=sys.stderr)
+        return None
 
 
 def windows_image(os_name, plan=False):

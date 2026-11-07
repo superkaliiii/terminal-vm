@@ -70,7 +70,7 @@ terminal-linux create w11 --os win11 --iso Win11_24H2_French_x64.iso --ui-langua
 terminal-linux create xp --os winxp --iso xp-sp3.iso --product-key XXXXX-XXXXX-XXXXX-XXXXX-XXXXX
 ```
 
-Only Windows Server 2025 evaluation media is downloaded automatically (straight from Microsoft); other versions need your own ISO and licence. `--ui-language` must be the ISO's language (default `en-US`), `--layout` sets the keyboard. Characters outside the keyboard layout are typed with Windows' hex Unicode entry (Alt, numpad +, hex code), enabled by the answer file. Windows guests have no guest agent by default, so `status` reports users as unknown.
+Only Windows Server 2025 evaluation media is downloaded automatically (straight from Microsoft); other versions need your own ISO and licence. `--ui-language` must be the ISO's language (default `en-US`), `--layout` sets the keyboard. Characters outside the keyboard layout are typed with Windows' hex Unicode entry (Alt, numpad +, hex code), enabled by the answer file. Windows 10/11 and Server 2016+ guests get the VirtIO serial driver and qemu-guest-agent at first logon (Fedora's virtio-win guest tools 0.1.302, ~31 MB, downloaded once over HTTPS and SHA-256 pinned, served from the answers drive), so `status` reports the logged-in user and `push`/`pull` work as on Linux. Older Windows, or a host that cannot download them, works without the agent (users reported as unknown, no file copy).
 
 ## Windows hosts
 
