@@ -1,11 +1,11 @@
 ---
 name: terminal-vm
-description: Operate a separate virtual Linux desktop (QEMU/KVM) through the terminal-vm MCP tools or CLI - observe with screenshots, act with click/type/key, verify. Use when a task needs a GUI Linux desktop that is not the user's own machine.
+description: Operate a separate virtual desktop (Linux or Windows in QEMU; macOS on a Mac through terminal-mac) with the terminal-vm MCP tools or CLI - observe with screenshots, act with click/type/key, verify. Use when a task needs a GUI desktop that is not the user's own machine.
 ---
 
 # Using terminal-vm
 
-terminal-vm gives you computer use inside a separate virtual Linux machine. Your actions never touch the user's own desktop, files, clipboard or sessions.
+terminal-vm gives you computer use inside a separate virtual machine (Linux, Windows, or macOS on a Mac host). Your actions never touch the user's own desktop, files, clipboard or sessions.
 
 ## Tools (MCP server `terminal-vm mcp NAME`)
 

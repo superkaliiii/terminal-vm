@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""terminal-vm: a separate desktop VM (QEMU) for computer-use agents, viewed from a terminal.
+"""terminal-vm: a separate desktop VM for computer-use agents, viewed from a terminal.
 
-Port of terminal-mac. Nothing runs inside the guest: the host drives QEMU over QMP
-(`screendump` for the screen, `input-send-event` / `send-key` for input). The host desktop is
-never touched. Stdlib only. Guests: Linux, and Windows XP to Server 2025 (`--os`), installed
-unattended. Hosts: Linux (KVM) and Windows (WHPX).
+One command and one MCP server for every guest. Linux and Windows guests (XP to Server 2025,
+`--os`, installed unattended) run in QEMU on Linux (KVM) and Windows (WHPX) hosts: the host
+drives QEMU over QMP, nothing runs inside the guest, the host desktop is never touched, stdlib
+only. macOS guests run on a Mac only: there terminal-vm hands them to terminal-mac (Apple
+Virtualization), which is also the default for `up` and `create` without `--os`.
 
   up [NAME] [--os OS] [--iso PATH] [--no-view] [--plan]   guided: image, create, start, view
-  create NAME [--os linux|winxp|win7|win8|win10|win11|win2016|win2019|win2022|win2025]
+  create NAME [--os linux|winxp|win7|win8|win10|win11|win2016|win2019|win2022|win2025|macos]
               [--iso PATH] [--product-key KEY] [--cpus N] [--memory GiB] [--disk GiB]
               [--width 1280] [--height 800] [--layout us|fr] [--offline]
   ls | status NAME | doctor | help | version
@@ -733,6 +734,63 @@ def pause(name, resume=False):
     print(json.dumps({"name": name, "status": "running" if resume else "paused"}))
 
 
+# ---------- macOS guests: terminal-mac ----------
+# macOS runs only on Apple hardware (Apple's licence, and Apple Virtualization needs Apple silicon), so macOS guests
+# belong to terminal-mac, the Swift engine. terminal-vm is the single entry point: on a Mac it hands macOS VMs over
+# to terminal-mac with the arguments unchanged (same command names, same MCP tools).
+MAC = sys.platform == "darwin"
+MAC_HOME = os.environ.get("TERMINAL_MAC_HOME") or os.path.expanduser("~/Library/Application Support/terminal-mac")
+NAMED = ("start", "stop", "status", "show", "hide", "pause", "resume", "view", "display", "action", "mcp")
+
+
+def mac_bin():
+    return os.environ.get("TERMINAL_MAC_BIN") or shutil.which("terminal-mac")
+
+
+def macos_handoff(argv):
+    """The arguments to give terminal-mac when they concern a macOS guest, else None."""
+    if not argv:
+        return None
+    cmd, rest = argv[0], argv[1:]
+    if "--os" in rest and rest[rest.index("--os") + 1:][:1] == ["macos"]:
+        if not MAC:
+            raise SystemExit("macOS guests run only on a Mac with Apple silicon (Apple's licence and Apple "
+                             "Virtualization); on this host use --os linux or a Windows version")
+        i = rest.index("--os")
+        return [cmd] + rest[:i] + rest[i + 2:]  # terminal-mac makes macOS VMs only: no --os
+    if not MAC:
+        return None
+    if cmd in ("up", "create", "image") and "--os" not in rest:
+        return argv  # a Mac's own guest by default, as terminal-mac always did (x86 guests would be emulated)
+    if cmd not in NAMED:
+        return None
+    name = next((a for a in rest if not a.startswith("-")), "default")
+    mine = os.path.isfile(os.path.join(STORE, name, "machine.json"))
+    return argv if not mine and os.path.isdir(os.path.join(MAC_HOME, "machines", name)) else None
+
+
+def run_mac(args):
+    exe = mac_bin()
+    if not exe:
+        raise SystemExit("this is a macOS VM: install terminal-mac (https://github.com/govijr/terminal-mac) "
+                         "or set TERMINAL_MAC_BIN")
+    return subprocess.run([exe] + args).returncode  # stdio inherited: the viewer and the MCP server work through it
+
+
+def mac_machines():
+    """terminal-mac's VMs in ls's shape (empty off a Mac or without terminal-mac)."""
+    exe = mac_bin() if MAC else None
+    if not exe:
+        return []
+    r = subprocess.run([exe, "ls"], capture_output=True, text=True)
+    try:
+        machines = json.loads(r.stdout) if r.returncode == 0 else []
+    except ValueError:
+        return []
+    return [{"name": m["name"], "os": "macos", "engine": "terminal-mac", "cpus": m.get("cpu"),
+             "memory_gb": m.get("memoryGiB"), "display": f"{m.get('width')}x{m.get('height')}"} for m in machines]
+
+
 def ls():
     out = []
     if os.path.isdir(STORE):
@@ -742,7 +800,7 @@ def ls():
                 out.append({"name": n, "os": m.get("os", "linux"), "status": state(n), "cpus": m["cpus"], "memory_gb": m["memory_mb"] // 1024,
                             "display": f"{m.get('width', 1280)}x{m.get('height', 800)}", "layout": m.get("layout", "us"),
                             **({"base": m["base"]} if m.get("base") else {})})
-    print(json.dumps(out, indent=1))
+    print(json.dumps(out + mac_machines(), indent=1))
 
 
 def _stopped(name):
@@ -1484,6 +1542,8 @@ def doctor():
     viewer = next((e for e, _ in VIEWERS if shutil.which(e)), None)
     check("window viewer", viewer, viewer or ("optional: winget install TigerVNC.TigerVNC" if WINDOWS
                                               else "optional: apt install tigervnc-viewer"), required=False)
+    if MAC:
+        check("terminal-mac", mac_bin(), mac_bin() or "for macOS guests: install terminal-mac", required=False)
     check("terminal graphics", graphics(), f"{graphics()} images in this terminal" if graphics()
           else "optional: run view in Windows Terminal, Kitty, Ghostty, WezTerm or foot", required=False)
     print(json.dumps(checks, indent=1))
@@ -1513,7 +1573,7 @@ _LAYOUT = {"layout": {"type": "string", "enum": sorted(LAYOUTS),
                       "description": "Override the VM's keyboard layout for this call (us = QWERTY, fr = AZERTY)"}}
 _SHOT = {"screenshot":{"type": "boolean", "description": "Return a fresh screenshot with the result"}}
 TOOLS = [
-    ("screenshot", "Capture the guest Linux screen. Coordinates in other tools are pixels of this image.", _schema({})),
+    ("screenshot", "Capture the guest screen. Coordinates in other tools are pixels of this image.", _schema({})),
     ("click", "Click at a point.", _schema({"x": _N, "y": _N, "clicks": {"type": "integer", "enum": [1, 2, 3]},
                                              "button": {"type": "string", "enum": ["left", "right", "middle"]}, **_SHOT}, ["x", "y"])),
     ("move", "Move the pointer.", _schema({"x": _N, "y": _N, **_SHOT}, ["x", "y"])),
@@ -1584,6 +1644,9 @@ def mcp(name):
 # ---------- CLI ----------
 
 def main(argv=None):
+    mac_args = macos_handoff(sys.argv[1:] if argv is None else argv)
+    if mac_args is not None:
+        sys.exit(run_mac(mac_args))
     p = argparse.ArgumentParser(prog="terminal-vm", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--version", action="version", version=f"terminal-vm {VERSION}")
     sub = p.add_subparsers(dest="cmd", required=True)

@@ -1,8 +1,16 @@
 # terminal-vm
 
-A separate Linux or Windows desktop (QEMU, on Linux or Windows hosts) for computer-use agents, viewed and controlled from a terminal: the Linux and Windows port of terminal-mac, with the same MCP tools (`screenshot`, `click`, `move`, `drag`, `scroll`, `type`, `key`, `status`).
+One command and one MCP server for computer-use agents: a separate desktop VM, viewed and controlled from a terminal, with the same tools everywhere (`screenshot`, `click`, `move`, `drag`, `scroll`, `type`, `key`, `status`).
 
-Nothing is installed in the guest. The host drives QEMU over QMP: `screendump` captures the screen, `input-send-event` / `send-key` inject input through a virtual USB tablet and keyboard. The host desktop is never touched. One Python file, standard library only.
+| Host | Linux guests | Windows guests | macOS guests |
+|---|---|---|---|
+| Linux (QEMU + KVM) | yes | yes | no |
+| Windows (QEMU + WHPX) | yes | yes | no |
+| Mac, Apple silicon | planned (ARM) | planned (Windows 11 ARM) | yes, through terminal-mac |
+
+macOS runs only on Apple hardware (Apple's licence; Apple Virtualization needs Apple silicon). On a Mac, terminal-vm hands macOS VMs to [terminal-mac](https://github.com/govijr/terminal-mac) with the arguments unchanged: `up` and `create` without `--os` (or with `--os macos`), and any command naming one of terminal-mac's VMs, `mcp NAME` included. `ls` lists both. Set `TERMINAL_MAC_BIN` if terminal-mac is not on the PATH.
+
+For Linux and Windows guests, the host drives QEMU over QMP (only the optional guest agent runs inside): `screendump` captures the screen, `input-send-event` / `send-key` inject input through a virtual USB tablet and keyboard. The host desktop is never touched. One Python file, standard library only.
 
 ## Requirements
 

@@ -391,6 +391,49 @@ class WindowsGuests(unittest.TestCase):
             tl.urllib.request.urlopen = old
 
 
+class MacHandoff(unittest.TestCase):
+    """terminal-vm hands macOS guests to terminal-mac on a Mac, unchanged, and refuses them elsewhere."""
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old = (tl.MAC, tl.MAC_HOME, tl.STORE, tl.mac_bin, tl.subprocess.run)
+        tl.STORE, tl.MAC_HOME = os.path.join(self.tmp, "vm"), os.path.join(self.tmp, "mac")
+        os.makedirs(os.path.join(tl.MAC_HOME, "machines", "mymac"))
+        os.makedirs(os.path.join(tl.STORE, "lin"))
+        with open(os.path.join(tl.STORE, "lin", "machine.json"), "w") as f:
+            json.dump({"cpus": 2, "memory_mb": 2048}, f)
+
+    def tearDown(self):
+        tl.MAC, tl.MAC_HOME, tl.STORE, tl.mac_bin, tl.subprocess.run = self.old
+
+    def test_on_a_mac(self):
+        tl.MAC, H = True, tl.macos_handoff
+        self.assertEqual(H(["create", "m", "--os", "macos", "--ipsw", "x.ipsw"]), ["create", "m", "--ipsw", "x.ipsw"])
+        self.assertEqual(H(["up"]), ["up"])                                     # a Mac's own guest by default
+        self.assertIsNone(H(["up", "w", "--os", "win11"]))                     # QEMU guests stay here
+        self.assertEqual(H(["action", "mymac", "click", "10", "20"]), ["action", "mymac", "click", "10", "20"])
+        self.assertEqual(H(["mcp", "mymac"]), ["mcp", "mymac"])
+        self.assertIsNone(H(["start", "lin"]))                                 # one of ours
+        self.assertIsNone(H(["start", "nosuch"]))                              # unknown: our own error message
+        self.assertIsNone(H(["ls"]))
+
+    def test_elsewhere(self):
+        tl.MAC = False
+        with self.assertRaises(SystemExit) as e:
+            tl.macos_handoff(["create", "m", "--os", "macos"])
+        self.assertIn("Apple", str(e.exception))
+        self.assertIsNone(tl.macos_handoff(["start", "mymac"]))
+        self.assertIsNone(tl.macos_handoff(["up"]))
+
+    def test_ls_merges_terminal_mac(self):
+        tl.MAC, tl.mac_bin = True, lambda: "terminal-mac"
+        reply = json.dumps([{"name": "mymac", "cpu": 4, "memoryGiB": 8, "width": 1280, "height": 800}])
+        tl.subprocess.run = lambda args, **k: tl.subprocess.CompletedProcess(args, 0, reply, "")
+        self.assertEqual(tl.mac_machines(), [{"name": "mymac", "os": "macos", "engine": "terminal-mac", "cpus": 4,
+                                              "memory_gb": 8, "display": "1280x800"}])
+        tl.subprocess.run = lambda args, **k: tl.subprocess.CompletedProcess(args, 1, "", "boom")
+        self.assertEqual(tl.mac_machines(), [])
+
+
 class StoppedVm(unittest.TestCase):
     """rm, reset, display and offline snapshots: no QEMU running, qemu-img faked."""
     def setUp(self):
