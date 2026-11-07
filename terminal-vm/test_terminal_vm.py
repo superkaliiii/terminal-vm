@@ -573,6 +573,42 @@ class StoppedVm(unittest.TestCase):
                       first)   # one more, with every property QEMU listed for that slot
         self.assertEqual(out["guest_memory_gb"], 3.0)
 
+    def test_networks(self):
+        m = tl.load("v"); m.update(os="linux", iso="/x.iso"); tl.save("v", m)
+        os.makedirs(os.path.join(self.tmp, "w")); tl.save("w", dict(m))
+        lab = tl.net_create("lab")
+        self.assertEqual((lab["index"], tl.net_create("dmz")["index"]), (1, 2))
+        with self.assertRaises(SystemExit):
+            tl.net_create("lab")
+        with self.assertRaises(SystemExit):
+            tl.net_create("Bad Name")
+        a, b = tl.net_attach("v", "lab"), tl.net_attach("w", "lab")
+        self.assertNotEqual((a["mac"], a["ip"]), (b["mac"], b["ip"]))
+        self.assertEqual(tl.net_attach("v", "lab")["mac"], a["mac"])            # stable, idempotent
+        args = " ".join(tl.qemu_args("v", tl.load("v"), False))
+        self.assertIn("-netdev socket,id=n-lab,mcast=230.77.1.1:40001,localaddr=127.0.0.1", args)  # loopback only
+        self.assertIn(f"virtio-net-pci,netdev=n-lab,mac={a['mac']}", args)
+        self.assertEqual([x["vm"] for x in tl.net_ls()[1]["vms"]], ["v", "w"])  # ls is sorted: dmz, lab
+        with self.assertRaises(SystemExit):
+            tl.net_rm("lab")                                                    # still has VMs
+        old = tl.state
+        tl.state = lambda n: "running"
+        try:
+            with self.assertRaises(SystemExit):
+                tl.net_attach("v", "dmz")                                       # NICs change on a stopped VM
+        finally:
+            tl.state = old
+        tl.net_attach("v", "lab", attach=False); tl.net_attach("w", "lab", attach=False)
+        self.assertEqual(tl.net_rm("lab"), {"removed": "lab"})
+        # internet: off for a sandbox unless the user turned it on for it
+        self.quiet(tl.set_sandbox, "v", "on")
+        self.assertFalse(tl.set_internet("v")["internet"])
+        self.assertIn("-nic none", " ".join(tl.qemu_args("v", tl.load("v"), False)))
+        self.assertTrue(tl.set_internet("v", "on")["internet"])
+        self.assertIn("-nic user", " ".join(tl.qemu_args("v", tl.load("v"), False)))
+        self.quiet(tl.set_sandbox, "v", "off"); self.quiet(tl.set_sandbox, "v", "on")
+        self.assertFalse(tl.set_internet("v")["internet"])                     # approval does not carry over
+
     def test_top(self):
         cpu, rss = tl._proc_times(os.getpid())          # this test process, on Linux and Windows alike
         self.assertTrue(cpu >= 0 and rss > 1 << 20)

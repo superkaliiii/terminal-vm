@@ -17,6 +17,8 @@ Virtualization), which is also the default for `up` and `create` without `--os`.
   clone SRC NEW            instant copy-on-write copy of a stopped VM (SRC then stays read-only)
   snapshot NAME save|load|rm TAG | snapshot NAME ls
   display NAME --width W --height H    screen size at the next start
+  net create|rm NET | net ls | net attach|detach NAME NET   isolated VM-to-VM networks (stopped VMs)
+  internet NAME [on|off]   NAT internet access (for a sandboxed VM, on = the user's approval)
   top                      running VMs' real CPU and memory on the host, allotments, quota
   quota [--cpus N --memory GiB --disk GiB --vms N]   host-wide ceiling for all VMs (default from the host)
   resources NAME [--cpus N] [--memory GiB]   within the VM's ceiling (create --max-cpus/--max-memory); live where possible
@@ -652,7 +654,8 @@ def qemu_args(name, m, window, vnc_port=None):
             + (",snapshot=on" if sandbox and not setup else ""),
             "-cdrom", m["iso"], "-boot", "order=cd", "-device", vga,
             *(["-usb"] if p["usb"] == "uhci" else ["-device", p["usb"]]), "-device", "usb-tablet",
-            "-nic", "none" if m.get("offline") or sandbox else f"user,model={p['nic']}",
+            "-nic", "none" if m.get("offline") or (sandbox and not m.get("internet")) else f"user,model={p['nic']}",
+            *net_args(m, p["nic"]),
             *([] if sandbox else ["-device", "virtio-serial-pci",
                                   "-chardev", "socket,path=" + os.path.join(d, "qga.sock") + ",server=on,wait=off,id=qga0",
                                   "-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0"]),
@@ -687,7 +690,10 @@ def create(name, iso, os_name="linux", cpus=None, memory=None, disk=None, width=
         raise SystemExit(f"ISO not found: {iso}")
     if layout not in LAYOUTS:
         raise SystemExit(f"unknown layout {layout!r}; choose from {', '.join(LAYOUTS)}")
-    top = limits({"os": os_name, "max_cpus": max_cpus, "max_memory_mb": (max_memory or 0) * 1024})
+    # Default memory ceiling: twice the allocation, at least 2 GiB of headroom: with a balloon the ceiling is what
+    # the quota counts, so the template's maximum by default would leave room for a single VM.
+    top = limits({"os": os_name, "max_cpus": max_cpus,
+                  "max_memory_mb": (max_memory or max(2 * memory, memory + 2)) * 1024})
     if (max_cpus or 0) > os.cpu_count() or (max_memory or 0) > host_memory_gb():
         raise SystemExit(f"--max-cpus/--max-memory above this host ({os.cpu_count()} CPUs, {host_memory_gb()} GiB)")
     if cpus > top[0] or memory > top[1]:
@@ -877,6 +883,113 @@ def mac_machines():
         return []
     return [{"name": m["name"], "os": "macos", "engine": "terminal-mac", "cpus": m.get("cpu"),
              "memory_gb": m.get("memoryGiB"), "display": f"{m.get('width')}x{m.get('height')}"} for m in machines]
+
+
+# ---------- networks ----------
+# Isolated networks between VMs, no administrator rights: each network is a UDP multicast group bound to the
+# loopback interface, which QEMU uses as a virtual switch. Nothing reaches the LAN or the internet; a local process
+# that joins the same group could see the traffic. No DHCP: give guests static addresses (net ls suggests one per
+# VM), or run a DHCP server in one of them, as in a real network.
+NET_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,30}")
+
+
+def net_file(net):
+    if not NET_NAME.fullmatch(net or ""):
+        raise SystemExit("network names: lowercase letters, digits and -, up to 31 characters")
+    return os.path.join(STORE, "networks", net + ".json")
+
+
+def net_load(net):
+    try:
+        with open(net_file(net)) as f:
+            return json.load(f)
+    except OSError:
+        raise SystemExit(f"no network named {net!r}; create it with: terminal-vm net create {net}") from None
+
+
+def networks():
+    d = os.path.join(STORE, "networks")
+    return sorted(f[:-5] for f in os.listdir(d) if f.endswith(".json")) if os.path.isdir(d) else []
+
+
+def net_members(net):
+    return [(n, load(n)["networks"][net]) for n in machines() if net in load(n).get("networks", {})]
+
+
+def net_create(net):
+    path = net_file(net)
+    with quota_lock():  # the host-wide lock also makes the index allocation atomic
+        if os.path.exists(path):
+            raise SystemExit(f"network {net!r} already exists")
+        used = {net_load(n)["index"] for n in networks()}
+        idx = next((i for i in range(1, 251) if i not in used), None)
+        if idx is None:
+            raise SystemExit("250 networks at most")
+        cfg = {"name": net, "index": idx, "mcast": f"230.77.{idx}.1:{40000 + idx}", "subnet": f"10.77.{idx}.0/24"}
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(cfg, f)
+    return cfg
+
+
+def net_rm(net):
+    net_load(net)
+    if net_members(net):
+        raise SystemExit(f"network {net!r} still has VMs: " + ", ".join(n for n, _ in net_members(net))
+                         + f"; detach them first: terminal-vm net detach VM {net}")
+    os.unlink(net_file(net))
+    return {"removed": net}
+
+
+def net_ls():
+    return [dict(net_load(n), vms=[{"vm": v, **a} for v, a in net_members(n)]) for n in networks()]
+
+
+def net_attach(name, net, attach=True):
+    """Plug a stopped VM into a network (a NIC with a stable MAC and a suggested address), or unplug it."""
+    cfg, m = net_load(net), load(name)
+    if state(name) != "stopped":
+        raise SystemExit(f"{name} is running; network cards change on a stopped VM: terminal-vm stop {name}")
+    nets = m.setdefault("networks", {})
+    if not attach:
+        if nets.pop(net, None) is None:
+            raise SystemExit(f"{name} is not on {net}")
+        save(name, m)
+        return {"vm": name, "detached": net}
+    if net in nets:
+        return {"vm": name, "network": net, **nets[net]}
+    taken = {int(a["ip"].rsplit(".", 1)[1]) for _, a in net_members(net)}
+    host = next(i for i in range(10, 255) if i not in taken)
+    mac = "52:54:00:" + ":".join(f"{b:02x}" for b in hashlib.sha256(f"{name}/{net}".encode()).digest()[:3])
+    nets[net] = {"mac": mac, "ip": f"10.77.{cfg['index']}.{host}"}
+    save(name, m)
+    return {"vm": name, "network": net, **nets[net], "netmask": "255.255.255.0",
+            "note": "no DHCP on this network: set this address in the guest"}
+
+
+def set_internet(name, value=None):
+    """Show or change NAT internet access. For a sandboxed VM, turning it on is the user's approval."""
+    m = load(name)
+    if value:
+        if state(name) != "stopped":
+            raise SystemExit(f"{name} is running; stop it first: terminal-vm stop {name}")
+        on = value == "on"
+        m["offline"] = not on
+        m.pop("internet", None)
+        if on and m.get("sandbox"):
+            m["internet"] = True  # approved by the user for this sandboxed VM
+        save(name, m)
+    sandbox_blocks = m.get("sandbox") and not m.get("internet")
+    return {"vm": name, "internet": not m.get("offline") and not sandbox_blocks}
+
+
+def net_args(m, nic):
+    args = []
+    for net, a in sorted(m.get("networks", {}).items()):
+        cfg = net_load(net)
+        args += ["-netdev", f"socket,id=n-{net},mcast={cfg['mcast']},localaddr=127.0.0.1",
+                 "-device", f"{nic},netdev=n-{net},mac={a['mac']}"]
+    return args
 
 
 # ---------- monitoring ----------
@@ -1081,13 +1194,14 @@ def clone(src, new):
     subprocess.run([qemu_bin("qemu-img"), "create", "-f", "qcow2", "-F", "qcow2", "-b",
                     os.path.join(vm_dir(src), "disk.qcow2"), os.path.join(d, "disk.qcow2")], check=True, stdout=subprocess.DEVNULL)
     m.update(base=src, installed=True)  # no answers drive in the clone: it boots the installed disk
+    m.pop("networks", None)  # each NIC's MAC is per VM: attach the clone again
     save(new, m)
     print(json.dumps({"cloned": src, "to": new}))
 
 
 def rm(name):
     _stopped(name)
-    _no_clones(name, "remove")
+    _no_clones(name, "remove")  # its network memberships go with its machine.json
     shutil.rmtree(vm_dir(name))
     print(json.dumps({"removed": name}))
 
@@ -1187,8 +1301,28 @@ def _online_vcpus(name):
         return False
 
 
-def resources(name, cpus=None, memory=None):
+def set_ceiling(name, max_cpus=None, max_memory=None):
+    """Change a stopped VM's ceiling, within the host and the quota (it then counts at the next start)."""
+    m = load(name)
+    if state(name) != "stopped":
+        raise SystemExit(f"{name} is running; ceilings change on a stopped VM: terminal-vm stop {name}")
+    q = quota_limits()[0]
+    for what, v, host, lim in (("cpus", max_cpus, os.cpu_count(), q["cpus"]),
+                               ("memory", max_memory, host_memory_gb(), q["memory_gb"])):
+        if v is not None and not 1 <= v <= min(host, lim):
+            raise SystemExit(f"--max-{what} must be 1..{min(host, lim)} (host and quota)")
+    if max_cpus:
+        m["max_cpus"] = max_cpus; m["cpus"] = min(m["cpus"], max_cpus)
+    if max_memory:
+        m["max_memory_mb"] = max_memory * 1024; m["memory_mb"] = min(m["memory_mb"], max_memory * 1024)
+    save(name, m)
+    return _resources(name)
+
+
+def resources(name, cpus=None, memory=None, max_cpus=None, max_memory=None):
     """See _resources. More CPUs on a running VM go through the quota, under its lock until they are added."""
+    if max_cpus or max_memory:
+        set_ceiling(name, max_cpus, max_memory)
     if cpus is not None and state(name) != "stopped" and cpus > load(name)["cpus"]:
         with quota_lock():
             quota_check({"cpus": cpus - load(name)["cpus"]})  # memory moves under the ceiling, already counted
@@ -1204,7 +1338,8 @@ def _resources(name, cpus=None, memory=None):
     top_cpus, top_gb = limits(m)
     for what, v, top in (("cpus", cpus, top_cpus), ("memory", memory, top_gb)):
         if v is not None and not 1 <= v <= top:
-            raise SystemExit(f"{what} must be 1..{top} for {name} (its ceiling; set at create with --max-{what})")
+            raise SystemExit(f"{what} must be 1..{top} for {name}, its ceiling (resources {name} --max-{what} N "
+                             "on the stopped VM raises it, within the quota)")
     running, applied = state(name) != "stopped", {}
     q = qmp(name) if running and (cpus or memory) else None
     try:
@@ -1255,6 +1390,7 @@ def set_sandbox(name, value=None):
         if state(name) != "stopped":
             raise SystemExit(f"{name} is running; stop it first: terminal-vm stop {name}")
         m["sandbox"] = value == "on"
+        m.pop("internet", None)  # an earlier internet approval does not carry over
         if not m["sandbox"]:
             m.pop("sandbox")
         save(name, m)
@@ -2054,12 +2190,21 @@ def main(argv=None):
     lo = sub.add_parser("layout"); lo.add_argument("name"); lo.add_argument("layout", nargs="?", choices=sorted(LAYOUTS))
     sb = sub.add_parser("sandbox"); sb.add_argument("name"); sb.add_argument("value", nargs="?", choices=["on", "off"])
     sub.add_parser("top")
+    ne = sub.add_parser("net"); nsub = ne.add_subparsers(dest="net_cmd", required=True)
+    for c in ("create", "rm"):
+        nsub.add_parser(c).add_argument("net")
+    nsub.add_parser("ls")
+    for c in ("attach", "detach"):
+        x = nsub.add_parser(c); x.add_argument("name"); x.add_argument("net")
+    it = sub.add_parser("internet"); it.add_argument("name"); it.add_argument("value", nargs="?", choices=["on", "off"])
     qu = sub.add_parser("quota")
     for k, h in (("cpus", "running vCPUs"), ("memory", "GiB of running VMs' memory ceilings"),
                  ("disk", "GiB of virtual disks"), ("vms", "running VMs")):
         qu.add_argument(f"--{k}", type=int, help=h)
     rs = sub.add_parser("resources"); rs.add_argument("name"); rs.add_argument("--cpus", type=int)
     rs.add_argument("--memory", type=int, help="GiB")
+    rs.add_argument("--max-cpus", type=int, help="new ceiling (stopped VM)")
+    rs.add_argument("--max-memory", type=int, help="new ceiling in GiB (stopped VM)")
     o = p.parse_args(argv)
 
     opts = ({k: getattr(o, k) for k in ("os_name", "cpus", "memory", "disk", "width", "height", "layout", "offline", "product_key", "ui_language", "sandbox", "max_cpus", "max_memory")}
@@ -2081,11 +2226,16 @@ def main(argv=None):
         if o.cmd == "display": return display(o.name, o.width, o.height)
         if o.cmd == "layout": return set_layout(o.name, o.layout)
         if o.cmd == "sandbox": return set_sandbox(o.name, o.value)
-        if o.cmd == "resources": return print(json.dumps(resources(o.name, o.cpus, o.memory)))
+        if o.cmd == "resources": return print(json.dumps(resources(o.name, o.cpus, o.memory, o.max_cpus, o.max_memory)))
         if o.cmd == "quota":
             change = {"cpus": o.cpus, "memory_gb": o.memory, "disk_gb": o.disk, "vms": o.vms}
             return print(json.dumps(quota(change if any(v is not None for v in change.values()) else None), indent=1))
         if o.cmd == "top": return print(json.dumps(top(), indent=1))
+        if o.cmd == "internet": return print(json.dumps(set_internet(o.name, o.value)))
+        if o.cmd == "net":
+            return print(json.dumps(
+                net_create(o.net) if o.net_cmd == "create" else net_rm(o.net) if o.net_cmd == "rm" else
+                net_ls() if o.net_cmd == "ls" else net_attach(o.name, o.net, o.net_cmd == "attach"), indent=1))
         if o.cmd == "image": return print(json.dumps({"image": default_image(o.plan, o.os_name)}))
         if o.cmd in ("push", "pull"): return transfer(o.name, o.cmd, o.src, o.dest)
         if o.cmd == "view": return view(o.name, read_only=o.read_only)
