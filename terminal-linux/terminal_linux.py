@@ -1248,7 +1248,10 @@ def view(name, fps=30, read_only=False):
                 if e[0] == "cell":
                     cell = e[1:]
                 elif e[0] == "show":
-                    show(name, read_only)
+                    try:
+                        show(name, read_only)
+                    except SystemExit as err:  # no VNC viewer installed: say so on the status line, keep viewing
+                        out.write(f"\x1b[{rows};1H\x1b[2K\x1b[33m {err}\x1b[0m".encode()); out.flush()
                 elif read_only:
                     continue
                 elif e[0] == "text":
