@@ -1,4 +1,4 @@
-import contextlib, io, json, os, socket, struct, sys, tempfile, threading, unittest, zlib
+import contextlib, io, json, os, re, socket, struct, sys, tempfile, threading, unittest, zlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import terminal_linux as tl
 
@@ -74,6 +74,34 @@ class Viewer(unittest.TestCase):
         self.assertEqual(P("\x1bx\x1b"), [("key", "alt+x"), ("key", "esc")])
         self.assertEqual(P("\x1b[<0;120;45M\x1b[<0;120;45m\x1b[<65;3;4M"),
                          [("mouse", 0, 120, 45, True), ("mouse", 0, 120, 45, False), ("mouse", 65, 3, 4, True)])
+        self.assertEqual(P("\x1b[6;20;10ta"), [("cell", 20, 10), ("text", "a")])   # reply to CSI 16 t
+
+    def test_sixel(self):
+        """Decode the encoder's output back to palette indices with an independent reader."""
+        w, h = 9, 8
+        rgb = bytes(v for i in range(w * h) for v in ((i * 37) % 256, (i * 91) % 256, 255 if i % 5 else 0))
+        cube = lambda r, g, b: round(r * 5 / 255) * 36 + round(g * 5 / 255) * 6 + round(b * 5 / 255)
+        for step in (1, 2):
+            s = tl.sixel(rgb, w, h, step).decode()
+            self.assertTrue(s.startswith("\x1bPq") and s.endswith("\x1b\\"))
+            W, H = -(-w // step), -(-h // step)
+            self.assertIn(f'"1;1;{W};{H}', s)
+            self.assertIn("#215;2;100;100;100", s)
+            got = [[None] * W for _ in range(H)]
+            body = s[s.index("#0;2;"):-2]
+            body = re.sub(r"#\d+;2;\d+;\d+;\d+", "", body)
+            for band_no, band in enumerate(body.split("-")[:-1]):
+                for layer in band.split("$"):
+                    c, data = re.match(r"#(\d+)(.*)", layer).groups()
+                    data = re.sub(r"!(\d+)(.)", lambda m: m[2] * int(m[1]), data)
+                    self.assertEqual(len(data), W)
+                    for x, ch in enumerate(data):
+                        for k in range(6):
+                            if (ord(ch) - 63) >> k & 1:
+                                self.assertIsNone(got[band_no * 6 + k][x])  # one colour per pixel
+                                got[band_no * 6 + k][x] = int(c)
+            want = [[cube(*rgb[(y * w + x) * 3:(y * w + x) * 3 + 3]) for x in range(0, w, step)] for y in range(0, h, step)]
+            self.assertEqual(got, want)
 
     def test_fit(self):
         self.assertEqual(tl.fit(1280, 800, 100, 41, 10, 20), (100, 31))   # width-bound
@@ -258,8 +286,9 @@ class WindowsGuests(unittest.TestCase):
             self.assertIn("<AdministratorPassword><Value>p&lt;&amp;&gt;w-Aa1</Value>", xml)  # Server OOBE stops without it
             spec = root.find(f"{ns}settings[@pass='specialize']")  # default profile, so the first session has it
             spec_xml = ET.tostring(spec, encoding="unicode")
-            for needle in ("ShutdownWithoutLogon", "monitor-timeout-ac 0", "CONSOLELOCK 0"):
-                self.assertIn(needle, spec_xml)   # stoppable and never locked or blanked for the agent
+            for needle in ("monitor-timeout-ac 0", "CONSOLELOCK 0"):
+                self.assertIn(needle, spec_xml)   # never locked or blanked on idle
+            self.assertLess(xml.index("DisableLockWorkstation"), xml.index("shutdown /r"))  # no Win+L, so stop works
         self.assertIn("W269N-WFGWX-YVC9B-4J6C9-T83GX", tl.autounattend(tl.PROFILES["win10"], "us", "u", "p", tl.PROFILES["win10"]["key"]))
         self.assertNotIn("<ProductKey>", tl.autounattend(tl.PROFILES["win2025"], "us", "u", "p", None))
 

@@ -8,7 +8,7 @@ Nothing is installed in the guest. The host drives QEMU over QMP: `screendump` c
 
 - Linux host with KVM (`/dev/kvm` accessible: `sudo usermod -aG kvm $USER`), QEMU >= 7.1, Python >= 3.8.
   Debian/Ubuntu: `sudo apt install qemu-system-x86 qemu-utils python3`
-- Optional: `qemu-system-gui` (window at install time), `tigervnc-viewer` (`show`), Kitty / Ghostty / WezTerm (inline `view`).
+- Optional: `qemu-system-gui` (window at install time), `tigervnc-viewer` (`show`), a terminal with inline images for `view`: Kitty, Ghostty, WezTerm (Kitty graphics) or Windows Terminal >= 1.22, foot, mlterm (Sixel).
 - A guest with USB tablet support (any current distribution).
 
 ## Install and run
@@ -42,7 +42,7 @@ or install this folder as a Claude Code plugin (`.claude-plugin/`).
 | `layout NAME [us\|fr]` | show or change the keyboard layout used by `type`/`key` (us = QWERTY, fr = AZERTY), even while running; `action ... --layout` overrides it for one call |
 | `image [--os OS] [--plan]` | download the installation image only |
 | `push NAME LOCAL GUEST` / `pull NAME GUEST LOCAL` | copy files through qemu-guest-agent (must be installed in the guest) |
-| `view NAME [--read-only]` | interactive terminal viewer (keyboard, mouse, wheel); Ctrl+] exits, Ctrl+O opens the window |
+| `view NAME [--read-only]` | interactive terminal viewer (keyboard, mouse, wheel): Kitty graphics, else Sixel (216 colours), else the VNC window; Ctrl+] exits, Ctrl+O opens the window |
 | `show NAME [--read-only]` / `hide NAME` | native window through VNC (unix socket); `--read-only` needs TigerVNC |
 | `action NAME screenshot\|click\|move\|drag\|scroll\|type\|key\|wait ...` | one action, JSON reply |
 | `mcp [NAME]` | stdio MCP server (also exposes `wait`: until the screen stops changing) |
@@ -74,7 +74,7 @@ Only Windows Server 2025 evaluation media is downloaded automatically (straight 
 
 ## Windows hosts
 
-The same file runs on Windows 10/11 and Windows Server hosts with Python 3.8+ and QEMU (`winget install SoftwareFreedomConservancy.QEMU`). Enable the Windows Hypervisor Platform for speed (as administrator: `Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform`, then restart); without it QEMU falls back to slow emulation. `doctor` checks both. QMP and the guest agent use unix sockets in the VM's folder under your profile, as on Linux, so other users cannot reach them (Windows 10 1803+ and QEMU >= 7.2; Python reaches them through Winsock). VNC listens on a random localhost port behind a password generated at each start, which `show` prints for the viewer's prompt. Snapshots of a running VM are refused by QEMU on Windows hosts (no dirty-memory tracking): stop the VM first, then `snapshot NAME save TAG` (disk only). The inline viewer needs Kitty graphics, so `view` opens a VNC window (TigerVNC) or use `start NAME --window`. Use `terminal-linux.cmd` from this folder as the launcher.
+The same file runs on Windows 10/11 and Windows Server hosts with Python 3.8+ and QEMU (`winget install SoftwareFreedomConservancy.QEMU`). Enable the Windows Hypervisor Platform for speed (as administrator: `Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform`, then restart); without it QEMU falls back to slow emulation. `doctor` checks both. QMP and the guest agent use unix sockets in the VM's folder under your profile, as on Linux, so other users cannot reach them (Windows 10 1803+ and QEMU >= 7.2; Python reaches them through Winsock). VNC listens on a random localhost port behind a password generated at each start, which `show` prints for the viewer's prompt. Snapshots of a running VM are refused by QEMU on Windows hosts (no dirty-memory tracking): stop the VM first, then `snapshot NAME save TAG` (disk only). `view` draws the guest inside Windows Terminal (Sixel, keyboard and mouse through VT input); in other consoles it opens a VNC window (TigerVNC), or use `start NAME --window`. Use `terminal-linux.cmd` from this folder as the launcher.
 
 ## Keyboard layouts and text
 

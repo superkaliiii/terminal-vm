@@ -19,14 +19,14 @@ unattended. Hosts: Linux (KVM) and Windows (WHPX).
   layout NAME [us|fr]      keyboard layout for type/key (us = QWERTY, fr = AZERTY); action ... --layout: one call
   image [--os OS] [--plan]             download the installation image only
   push NAME LOCAL GUEST | pull NAME GUEST LOCAL   files, through qemu-guest-agent
-  view NAME [--read-only]  interactive terminal viewer (Kitty, Ghostty, WezTerm); Ctrl+] exits, Ctrl+O window
+  view NAME [--read-only]  terminal viewer (Kitty or Sixel: Windows Terminal, foot); Ctrl+] exits, Ctrl+O window
   show NAME [--read-only] | hide NAME   native window (VNC viewer)
   action NAME screenshot|click|move|drag|scroll|type|key|wait ...
   mcp [NAME]         stdio MCP server
   skills get | skills path | skills install [--dir DIR]
 """
-import argparse, base64, hashlib, json, os, re, secrets, select, shutil, signal, socket, struct, subprocess, sys, \
-    time, urllib.parse, urllib.request
+import argparse, base64, hashlib, json, os, queue, re, secrets, shutil, signal, socket, struct, subprocess, sys, \
+    threading, time, urllib.parse, urllib.request
 from xml.sax.saxutils import escape
 
 WINDOWS = os.name == "nt"
@@ -515,19 +515,20 @@ def autounattend(p, layout, user, password, key, ui="en-US"):
             + ("<SkipMachineOOBE>true</SkipMachineOOBE><SkipUserOOBE>true</SkipUserOOBE>" if p["oobe"] == "win7" else
                "<HideOEMRegistrationScreen>true</HideOEMRegistrationScreen><HideOnlineAccountScreens>true</HideOnlineAccountScreens>"
                "<HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>") + "</OOBE>")
-    # An agent's VM must stay visible and stoppable: no display-off, sleep or lock on idle (the screen went black,
-    # then locked), and honour the ACPI power button at the lock screen (Server ignores it there by default).
+    # An agent's VM must stay visible: no display-off, sleep or lock on idle (the screen went black, then locked).
     machine = "".join(f'<RunSynchronousCommand wcm:action="add"><Order>{i}</Order><Path>{c}</Path></RunSynchronousCommand>'
-                      for i, c in enumerate(('reg add HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System '
-                                            '/v ShutdownWithoutLogon /t REG_DWORD /d 1 /f',
-                                            'powercfg /change monitor-timeout-ac 0',
+                      for i, c in enumerate(('powercfg /change monitor-timeout-ac 0',
                                             'powercfg /change standby-timeout-ac 0',
                                             'powercfg /setacvalueindex SCHEME_CURRENT SUB_NONE CONSOLELOCK 0'), 1))
     # EnableHexNumpad is read at logon: set it in the first session, then reboot so the session the agent gets
     # (auto-logon again) has it. Writing it to the Default profile in specialize was tried and did not reach the user.
+    # DisableLockWorkstation: a locked session ignores the ACPI power button (stop would hang), so Win+L and the
+    # Lock entry are removed. The Policies key needs admin rights (denied in a non-elevated prompt).
     first = ("<FirstLogonCommands>" + "".join(
         f'<SynchronousCommand wcm:action="add"><Order>{i}</Order><CommandLine>{c}</CommandLine></SynchronousCommand>'
         for i, c in enumerate(('reg add "HKCU\\Control Panel\\Input Method" /v EnableHexNumpad /t REG_SZ /d 1 /f',
+                               'reg add HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System '
+                               '/v DisableLockWorkstation /t REG_DWORD /d 1 /f',
                                'shutdown /r /t 5'), 1)) + "</FirstLogonCommands>")
     shell = "Microsoft-Windows-Shell-Setup"
     return ('<?xml version="1.0" encoding="utf-8"?>\n<unattend xmlns="urn:schemas-microsoft-com:unattend" '
@@ -705,8 +706,10 @@ def stop(name, force=False, timeout=60):
                 m["installed"] = True; save(name, m)
             print(json.dumps({"stopped": name})); return
         time.sleep(0.5)
+    locked = (" A locked Windows session ignores it too: unlock (key ctrl+alt+delete, type the password from "
+              "machine.json, key enter), then stop again." if load(name).get("os", "linux") != "linux" else "")
     print(f"{name}: guest ignored the shutdown request for {timeout}s (no ACPI handling, or a confirmation "
-          f"dialog is open); take a screenshot, or use stop --force", file=sys.stderr)
+          f"dialog is open); take a screenshot, or use stop --force.{locked}", file=sys.stderr)
     sys.exit(1)
 
 
@@ -919,6 +922,7 @@ CSI_KEYS = {"A": "up", "B": "down", "C": "right", "D": "left", "H": "home", "F":
 TILDE_KEYS = {"2": "insert", "3": "delete", "5": "pgup", "6": "pgdn", "15": "f5", "17": "f6", "18": "f7",
               "19": "f8", "20": "f9", "21": "f10", "23": "f11", "24": "f12"}
 _MOUSE = re.compile(r"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
+_CELL = re.compile(r"\x1b\[6;(\d+);(\d+)t")  # reply to CSI 16 t: cell height, width in pixels
 _CSI = re.compile(r"\x1b[\[O](\d*)(?:;(\d+))?([A-Za-z~])")
 
 
@@ -931,6 +935,9 @@ def parse_input(data):
             m = _MOUSE.match(data, i)
             if m:
                 ev.append(("mouse", int(m[1]), int(m[2]), int(m[3]), m[4] == "M")); i = m.end(); continue
+            m = _CELL.match(data, i)
+            if m:
+                ev.append(("cell", int(m[1]), int(m[2]))); i = m.end(); continue
             m = _CSI.match(data, i)
             if m:
                 num, mod, final = m.groups()
@@ -963,17 +970,26 @@ def parse_input(data):
     return ev
 
 
-def kitty_supported():
+def graphics():
+    """Inline image protocol of this terminal, from its environment (no query round-trip): kitty, sixel or None.
+    WT_SESSION: Windows Terminal (Sixel since 1.22); WT also passes it into WSL."""
     e = os.environ
-    return "KITTY_WINDOW_ID" in e or e.get("TERM") == "xterm-kitty" or e.get("TERM_PROGRAM", "").lower() in ("ghostty", "wezterm")
+    if "KITTY_WINDOW_ID" in e or e.get("TERM") == "xterm-kitty" or e.get("TERM_PROGRAM", "").lower() in ("ghostty", "wezterm"):
+        return "kitty"
+    if "WT_SESSION" in e or e.get("TERM") in ("foot", "foot-extra", "mlterm") or e.get("TERM_PROGRAM") == "mintty":
+        return "sixel"
+    return None
 
 
-def term_geometry():
+def term_geometry(cell=(20, 10)):
+    """cols, rows, cell width and height in pixels. cell: (height, width) as the terminal answered CSI 16 t,
+    used when the tty gives no pixel size (Windows consoles, some terminals)."""
+    xp = yp = 0
     try:
         rows, cols, xp, yp = struct.unpack("HHHH", fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b"\0" * 8))
-    except OSError:
-        (cols, rows), xp, yp = shutil.get_terminal_size(), 0, 0
-    return cols, rows, (xp / cols if xp else 8.0), (yp / rows if yp else 16.0)
+    except (OSError, NameError):  # NameError: no fcntl on Windows
+        cols, rows = shutil.get_terminal_size()
+    return cols, rows, (xp / cols if xp else cell[1]), (yp / rows if yp else cell[0])
 
 
 def fit(w, h, cols, rows, cw, ch):
@@ -982,40 +998,117 @@ def fit(w, h, cols, rows, cw, ch):
     return max(1, int(w * scale / cw)), max(1, int(h * scale / ch))
 
 
+def screen_pixels(name, q):
+    """Raw RGB of the guest screen: screendump's default PPM, so nothing to decode."""
+    path = os.path.join(vm_dir(name), "view.ppm")
+    q.cmd("screendump", filename=path)
+    with open(path, "rb") as f:
+        data = f.read()
+    w, h = map(int, data.split(maxsplit=3)[1:3])  # "P6\n<w> <h>\n255\n" then the pixels
+    return data[-w * h * 3:], (w, h)
+
+
+_LEVEL = [round(v * 5 / 255) for v in range(256)]
+_CUBE = [bytes(_LEVEL[v] * f for v in range(256)) for f in (36, 6, 1)]  # channel byte -> its share of a 6x6x6 index
+_IS = [bytes(int(i == c) for i in range(256)) for c in range(216)]
+_RLE = re.compile(rb"(.)\1{3,}")
+
+
+def sixel(rgb, w, h, step=1):
+    """RGB bytes -> DEC Sixel image of every step-th pixel, in the 6x6x6 colour cube. No per-pixel Python loop:
+    bytes.translate maps whole rows, and big-integer sums combine them byte-wise (no sum exceeds 255: no carry)."""
+    rows = []
+    for y in range(0, h, step):
+        line = rgb[y * w * 3:(y + 1) * w * 3]
+        n = len(line[0::3 * step])
+        rows.append(sum(int.from_bytes(line[c::3 * step].translate(_CUBE[c]), "big") for c in range(3)).to_bytes(n, "big"))
+    n = len(rows[0])
+    out = [b'\x1bPq"1;1;%d;%d' % (n, len(rows))]
+    out += [b"#%d;2;%d;%d;%d" % (i, i // 36 * 20, i // 6 % 6 * 20, i % 6 * 20) for i in range(216)]
+    offset = int.from_bytes(b"?" * n, "big")  # sixel characters start at '?' (63)
+    for y in range(0, len(rows), 6):
+        band, layers = rows[y:y + 6], []
+        for c in set(b"".join(band)):  # colours present in this band
+            bits = sum(int.from_bytes(r.translate(_IS[c]), "big") << k for k, r in enumerate(band)) + offset
+            layers.append(b"#%d" % c + _RLE.sub(lambda m: b"!%d%c" % (len(m[0]), m[1][0]), bits.to_bytes(n, "big")))
+        out.append(b"$".join(layers) + b"-")
+    return b"".join(out) + b"\x1b\\"
+
+
+def raw_terminal():
+    """Raw keyboard and mouse input, VT output; returns the function that restores the terminal."""
+    if WINDOWS:
+        import ctypes
+        k = ctypes.windll.kernel32
+        handles, modes = (k.GetStdHandle(-10), k.GetStdHandle(-11)), []
+        for h in handles:
+            m = ctypes.c_uint32(); k.GetConsoleMode(h, ctypes.byref(m)); modes.append(m.value)
+        cp = k.GetConsoleCP()
+        k.SetConsoleCP(65001)
+        k.SetConsoleMode(handles[0], 0x280)  # VT input + extended flags: raw keys and mouse, no quick-edit selection
+        k.SetConsoleMode(handles[1], modes[1] | 0x4)  # VT output
+        return lambda: (k.SetConsoleCP(cp), [k.SetConsoleMode(h, m) for h, m in zip(handles, modes)])
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    tty.setraw(fd)
+    return lambda: termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
 def view(name, fps=8, read_only=False):
-    if WINDOWS or not kitty_supported():  # Windows consoles have no Kitty graphics
-        print("This terminal has no Kitty graphics; opening the native window instead.", file=sys.stderr)
+    proto = graphics()
+    if not proto:
+        print("This terminal shows no inline images (Kitty or Sixel); opening the native window instead.", file=sys.stderr)
         return show(name, read_only)
     m = load(name)
     layout, family = m.get("layout", "us"), PROFILES[m.get("os", "linux")]["family"]
     # own QMP monitor and capture file, so agents keep working while someone watches
-    q, out, fd = QMP(endpoint(name, "qmp-view")), sys.stdout, sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    tty.setraw(fd)
-    # alt screen, hide cursor, report all mouse motion as SGR pixels
-    out.write("\x1b[?1049h\x1b[?25l\x1b[?1003h\x1b[?1006h\x1b[?1016h")
-    last, geom, held = None, None, set()
+    q, out = QMP(endpoint(name, "qmp-view")), sys.stdout.buffer
+    restore = raw_terminal()
+    keys = queue.Queue()  # a reader thread: select() does not take console handles on Windows
+
+    def reader():
+        while True:
+            chunk = os.read(sys.stdin.fileno(), 65536)
+            keys.put(chunk)
+            if not chunk:
+                return
+    threading.Thread(target=reader, daemon=True).start()
+    # alt screen, hide cursor, all mouse motion as SGR (in pixels with Kitty), ask the cell size in pixels
+    out.write(b"\x1b[?1049h\x1b[?25l\x1b[?1003h\x1b[?1006h" + (b"\x1b[?1016h" if proto == "kitty" else b"") + b"\x1b[16t")
+    last, geom, held, cell = None, None, set(), (20, 10)
     try:
         while True:
-            data, (w, h) = screenshot(name, q, "view.png")
-            g = term_geometry()
+            data, (w, h) = screenshot(name, q, "view.png") if proto == "kitty" else screen_pixels(name, q)
+            g = term_geometry(cell)
             if data != last or g != geom:
-                last, geom = data, g
                 cols, rows, cw, ch = g
-                cu, ru = fit(w, h, cols, rows, cw, ch)
-                b64 = base64.standard_b64encode(data).decode()
-                out.write("\x1b[H")
-                for i in range(0, len(b64), 4096):
-                    head = f"a=T,f=100,i=1,c={cu},r={ru},C=1,q=2," if i == 0 else ""
-                    out.write(f"\x1b_G{head}m={1 if i + 4096 < len(b64) else 0};{b64[i:i + 4096]}\x1b\\")
-                out.write(f"\x1b[{rows};1H\x1b[2K\x1b[2m {name} · {w}x{h} · Ctrl+] exit · Ctrl+O window\x1b[0m")
+                out.write(b"\x1b[H" if g == geom else b"\x1b[2J\x1b[H")
+                last, geom = data, g
+                if proto == "kitty":
+                    cu, ru = fit(w, h, cols, rows, cw, ch)
+                    dw, dh = cu * cw, ru * ch  # displayed size in pixels
+                    b64 = base64.standard_b64encode(data)
+                    for i in range(0, len(b64), 4096):
+                        head = b"a=T,f=100,i=1,c=%d,r=%d,C=1,q=2," % (cu, ru) if i == 0 else b""
+                        out.write(b"\x1b_G%sm=%d;%s\x1b\\" % (head, i + 4096 < len(b64), b64[i:i + 4096]))
+                else:  # Sixel has no scaling: keep every step-th pixel so the image fits above the status line
+                    step = max(1, -(-w // int(cols * cw)), -(-h // int((rows - 1) * ch)))
+                    dw, dh = -(-w // step), -(-h // step)
+                    out.write(sixel(data, w, h, step))
+                out.write(f"\x1b[{rows};1H\x1b[2K\x1b[2m {name} · {w}x{h} · Ctrl+] exit · Ctrl+O window\x1b[0m".encode())
                 out.flush()
-            if not select.select([fd], [], [], 1 / fps)[0]:
+            try:
+                chunk = keys.get(timeout=1 / fps)
+            except queue.Empty:
                 continue
-            for e in parse_input(os.read(fd, 65536).decode("utf-8", "replace")):
+            if not chunk:
+                return
+            for e in parse_input(chunk.decode("utf-8", "replace")):
                 if e[0] == "quit":
                     return
-                if e[0] == "show":
+                if e[0] == "cell":
+                    cell = e[1:]
+                elif e[0] == "show":
                     show(name, read_only)
                 elif read_only:
                     continue
@@ -1025,7 +1118,9 @@ def view(name, fps=8, read_only=False):
                     send_keys(q, chord_keys(e[1], layout))
                 elif e[0] == "mouse":
                     code, px, py, pressed = e[1:]
-                    x, y = px * w / (cu * cw), py * h / (ru * ch)
+                    if proto == "sixel":  # 1-based cells: the middle of the cell, in pixels
+                        px, py = (px - 0.5) * cw, (py - 0.5) * ch
+                    x, y = px * w / dw, py * h / dh
                     if x >= w or y >= h:
                         continue  # outside the image (status line or margin)
                     move(q, x, y, (w, h))
@@ -1041,9 +1136,9 @@ def view(name, fps=8, read_only=False):
         for btn in held:
             button(q, btn, False)
         q.close()
-        out.write("\x1b_Ga=d,i=1\x1b\\\x1b[?1016l\x1b[?1006l\x1b[?1003l\x1b[?25h\x1b[?1049l")
+        out.write((b"\x1b_Ga=d,i=1\x1b\\" if proto == "kitty" else b"") + b"\x1b[?1016l\x1b[?1006l\x1b[?1003l\x1b[?25h\x1b[?1049l")
         out.flush()
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        restore()
 
 
 # ---------- guided setup, diagnostics, skills ----------
@@ -1170,8 +1265,8 @@ def doctor():
     viewer = next((e for e, _ in VIEWERS if shutil.which(e)), None)
     check("window viewer", viewer, viewer or ("optional: winget install TigerVNC.TigerVNC" if WINDOWS
                                               else "optional: apt install tigervnc-viewer"), required=False)
-    check("terminal graphics", kitty_supported(), "Kitty graphics available" if kitty_supported()
-          else "optional: run view in Kitty, Ghostty or WezTerm", required=False)
+    check("terminal graphics", graphics(), f"{graphics()} images in this terminal" if graphics()
+          else "optional: run view in Windows Terminal, Kitty, Ghostty, WezTerm or foot", required=False)
     print(json.dumps(checks, indent=1))
     if not all(c["ok"] for c in checks if c["required"]):
         sys.exit(1)

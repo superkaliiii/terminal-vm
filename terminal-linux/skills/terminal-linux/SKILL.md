@@ -34,6 +34,6 @@ terminal-linux gives you computer use inside a separate virtual Linux machine. Y
 
 ## Lifecycle (CLI)
 
-`terminal-linux ls`, `status NAME`, `pause NAME`, `resume NAME`, `stop NAME` (asks the guest; it may show a confirmation dialog you can click), `stop NAME --force` (power cut, can lose work: only when the user agrees). Do not delete VM data.
+`terminal-linux ls`, `status NAME`, `pause NAME`, `resume NAME`, `stop NAME` (asks the guest; it may show a confirmation dialog you can click; a locked Windows session ignores it: unlock with `key ctrl+alt+delete`, the password, `key enter`), `stop NAME --force` (power cut, can lose work: only when the user agrees). Do not delete VM data.
 
 Before a risky step, `terminal-linux snapshot NAME save TAG` (running VM: memory included); `snapshot NAME load TAG` returns to it, `snapshot NAME ls` lists them. Files: `terminal-linux push NAME LOCAL GUEST` / `pull NAME GUEST LOCAL` (needs qemu-guest-agent in the guest). `rm` and `reset` destroy data: only when the user asks.
