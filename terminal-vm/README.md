@@ -1,4 +1,4 @@
-# terminal-linux
+# terminal-vm
 
 A separate Linux or Windows desktop (QEMU, on Linux or Windows hosts) for computer-use agents, viewed and controlled from a terminal: the Linux and Windows port of terminal-mac, with the same MCP tools (`screenshot`, `click`, `move`, `drag`, `scroll`, `type`, `key`, `status`).
 
@@ -14,8 +14,8 @@ Nothing is installed in the guest. The host drives QEMU over QMP: `screendump` c
 ## Install and run
 
 ```sh
-sh install.sh            # ~/.local/bin/terminal-linux, no root; runs `doctor`
-terminal-linux up        # downloads Debian live XFCE (SHA-256 verified), creates, boots, opens the viewer
+sh install.sh            # ~/.local/bin/terminal-vm, no root; runs `doctor`
+terminal-vm up        # downloads Debian live XFCE (SHA-256 verified), creates, boots, opens the viewer
 ```
 
 `up --plan` previews the steps. `create NAME [--iso PATH] [--cpus 4 --memory 4 --disk 32 --width 1280 --height 800 --layout us|fr --offline]` customises a new VM.
@@ -23,8 +23,8 @@ terminal-linux up        # downloads Debian live XFCE (SHA-256 verified), create
 ## Use with agents
 
 ```sh
-claude mcp add terminal-linux -- terminal-linux mcp default
-terminal-linux skills install            # ~/.claude/skills/terminal-linux/SKILL.md
+claude mcp add terminal-vm -- terminal-vm mcp default
+terminal-vm skills install            # ~/.claude/skills/terminal-vm/SKILL.md
 ```
 
 or install this folder as a Claude Code plugin (`.claude-plugin/`).
@@ -65,16 +65,16 @@ Under WSL, the distribution can be stopped when no WSL terminal is open, which k
 | `win2016` … `win2025` | q35 | AHCI | e1000e | std VGA | xHCI | none (evaluation media) | image 2: Standard with Desktop Experience |
 
 ```sh
-terminal-linux up srv --os win2025            # downloads Microsoft's evaluation ISO, installs unattended
-terminal-linux create w11 --os win11 --iso Win11_24H2_French_x64.iso --ui-language fr-FR --layout fr
-terminal-linux create xp --os winxp --iso xp-sp3.iso --product-key XXXXX-XXXXX-XXXXX-XXXXX-XXXXX
+terminal-vm up srv --os win2025            # downloads Microsoft's evaluation ISO, installs unattended
+terminal-vm create w11 --os win11 --iso Win11_24H2_French_x64.iso --ui-language fr-FR --layout fr
+terminal-vm create xp --os winxp --iso xp-sp3.iso --product-key XXXXX-XXXXX-XXXXX-XXXXX-XXXXX
 ```
 
 Only Windows Server 2025 evaluation media is downloaded automatically (straight from Microsoft); other versions need your own ISO and licence. `--ui-language` must be the ISO's language (default `en-US`), `--layout` sets the keyboard. Characters outside the keyboard layout are typed with Windows' hex Unicode entry (Alt, numpad +, hex code), enabled by the answer file. Windows 10/11 and Server 2016+ guests get the VirtIO serial driver and qemu-guest-agent at first logon (Fedora's virtio-win guest tools 0.1.302, ~31 MB, downloaded once over HTTPS and SHA-256 pinned, served from the answers drive), so `status` reports the logged-in user and `push`/`pull` work as on Linux. Older Windows, or a host that cannot download them, works without the agent (users reported as unknown, no file copy).
 
 ## Windows hosts
 
-The same file runs on Windows 10/11 and Windows Server hosts with Python 3.8+ and QEMU (`winget install SoftwareFreedomConservancy.QEMU`). Enable the Windows Hypervisor Platform for speed (as administrator: `Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform`, then restart); without it QEMU falls back to slow emulation. `doctor` checks both. QMP and the guest agent use unix sockets in the VM's folder under your profile, as on Linux, so other users cannot reach them (Windows 10 1803+ and QEMU >= 7.2; Python reaches them through Winsock). VNC listens on a random localhost port behind a password generated at each start, which `show` prints for the viewer's prompt. Snapshots of a running VM are refused by QEMU on Windows hosts (no dirty-memory tracking): stop the VM first, then `snapshot NAME save TAG` (disk only). `view` draws the guest inside Windows Terminal (Sixel, keyboard and mouse through VT input), centred and scaled to the window, redrawing only what changed. Windows Terminal reports the mouse by cell only; on a Windows host the viewer refines it with the host cursor position, so the two pointers line up (the guest needs an absolute pointer: Windows and current Linux desktops have one, TinyCore's Xvesa does not). For the sharpest image, shrink the font (Ctrl+-) until the window holds the guest screen at 1:1 (about 103x39 cells for 1024x768). Other Windows terminals (WezTerm included) pass no images through ConPTY: `view` opens a VNC window there (TigerVNC), or use `start NAME --window`. Use `terminal-linux.cmd` from this folder as the launcher.
+The same file runs on Windows 10/11 and Windows Server hosts with Python 3.8+ and QEMU (`winget install SoftwareFreedomConservancy.QEMU`). Enable the Windows Hypervisor Platform for speed (as administrator: `Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform`, then restart); without it QEMU falls back to slow emulation. `doctor` checks both. QMP and the guest agent use unix sockets in the VM's folder under your profile, as on Linux, so other users cannot reach them (Windows 10 1803+ and QEMU >= 7.2; Python reaches them through Winsock). VNC listens on a random localhost port behind a password generated at each start, which `show` prints for the viewer's prompt. Snapshots of a running VM are refused by QEMU on Windows hosts (no dirty-memory tracking): stop the VM first, then `snapshot NAME save TAG` (disk only). `view` draws the guest inside Windows Terminal (Sixel, keyboard and mouse through VT input), centred and scaled to the window, redrawing only what changed. Windows Terminal reports the mouse by cell only; on a Windows host the viewer refines it with the host cursor position, so the two pointers line up (the guest needs an absolute pointer: Windows and current Linux desktops have one, TinyCore's Xvesa does not). For the sharpest image, shrink the font (Ctrl+-) until the window holds the guest screen at 1:1 (about 103x39 cells for 1024x768). Other Windows terminals (WezTerm included) pass no images through ConPTY: `view` opens a VNC window there (TigerVNC), or use `start NAME --window`. Use `terminal-vm.cmd` from this folder as the launcher.
 
 ## Keyboard layouts and text
 

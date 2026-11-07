@@ -1,9 +1,9 @@
 {
-  "name": "terminal-linux",
-  "owner": { "name": "terminal-linux" },
+  "name": "terminal-vm",
+  "owner": { "name": "terminal-vm" },
   "plugins": [
     {
-      "name": "terminal-linux",
+      "name": "terminal-vm",
       "description": "A separate Linux desktop (QEMU/KVM) for computer-use agents.",
       "source": "./"
     }

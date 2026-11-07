@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""terminal-linux: a separate desktop VM (QEMU) for computer-use agents, viewed from a terminal.
+"""terminal-vm: a separate desktop VM (QEMU) for computer-use agents, viewed from a terminal.
 
 Port of terminal-mac. Nothing runs inside the guest: the host drives QEMU over QMP
 (`screendump` for the screen, `input-send-event` / `send-key` for input). The host desktop is
@@ -34,11 +34,14 @@ if not WINDOWS:
     import fcntl, termios, tty  # terminal viewer only
 
 VERSION = "0.4.0"
-STORE = os.environ.get("TERMINAL_LINUX_HOME") or (
-    os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "terminal-linux") if WINDOWS else
-    os.path.join(os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")), "terminal-linux"))
+_DATA = os.environ.get("LOCALAPPDATA", os.path.expanduser("~")) if WINDOWS else \
+    os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
+# VMs made before the rename to terminal-vm stay where they are: the old folder is used until a new one exists
+STORE = os.environ.get("TERMINAL_VM_HOME") or os.environ.get("TERMINAL_LINUX_HOME") or next(
+    (p for p in (os.path.join(_DATA, n) for n in ("terminal-vm", "terminal-linux")) if os.path.isdir(p)),
+    os.path.join(_DATA, "terminal-vm"))
 HERE = os.path.dirname(os.path.abspath(__file__))
-SKILL = os.path.join(HERE, "skills", "terminal-linux", "SKILL.md")
+SKILL = os.path.join(HERE, "skills", "terminal-vm", "SKILL.md")
 ABS_MAX = 0x7FFF  # usb-tablet absolute axis range
 IMAGE_INDEX = "https://cdimage.debian.org/debian-cd/current-live/amd64/iso-hybrid/"
 IMAGE_PATTERN = r"debian-live-[\d.]+-amd64-xfce\.iso"
@@ -122,7 +125,7 @@ def load(name):
         with open(os.path.join(vm_dir(name), "machine.json")) as f:
             return json.load(f)
     except FileNotFoundError:
-        raise SystemExit(f"no VM named {name!r}; create it with: terminal-linux up {name}")
+        raise SystemExit(f"no VM named {name!r}; create it with: terminal-vm up {name}")
 
 
 # ---------- QMP ----------
@@ -416,7 +419,7 @@ def _act(name, tool, a, q):
         return {"status": q.cmd("query-status")["status"], "width": w, "height": h,
                 "users": users if users is not None else "unknown (guest agent not answering: not installed, or VM paused)"}
     if q.cmd("query-status")["status"] == "paused":
-        raise RuntimeError("VM is paused; run: terminal-linux resume " + name)
+        raise RuntimeError("VM is paused; run: terminal-vm resume " + name)
     if tool == "wait":  # until two screenshots `stable` seconds apart are identical, or timeout
         start, last, since = time.time(), None, time.time()
         while True:
@@ -669,7 +672,7 @@ def start(name, window=False):
     if state(name) != "stopped":
         raise SystemExit(f"{name} is already running")
     if len(os.path.join(d, "qmp-view.sock").encode()) >= 108:  # sun_path limit
-        raise SystemExit(f"VM folder path too long for its sockets: {d}; shorten the name or set TERMINAL_LINUX_HOME")
+        raise SystemExit(f"VM folder path too long for its sockets: {d}; shorten the name or set TERMINAL_VM_HOME")
     vnc_port = None
     if WINDOWS:
         vnc_port = free_ports(1)[0]
@@ -749,7 +752,7 @@ def _stopped(name):
     if not busy and os.path.exists(disk):  # QMP unreachable is not proof: a running QEMU also holds the image lock
         busy = subprocess.run([qemu_bin("qemu-img"), "info", disk], capture_output=True).returncode != 0
     if busy:
-        raise SystemExit(f"{name} is running; stop it first: terminal-linux stop {name}")
+        raise SystemExit(f"{name} is running; stop it first: terminal-vm stop {name}")
 
 
 def _no_clones(name, what):
@@ -893,7 +896,7 @@ VIEWERS = [  # endpoint: unix socket path, or (host, port) on Windows
 def show(name, read_only=False):
     d = vm_dir(name)
     if state(name) == "stopped":
-        raise SystemExit(f"{name} is not running; run: terminal-linux start {name}")
+        raise SystemExit(f"{name} is not running; run: terminal-vm start {name}")
     for exe, argv in VIEWERS[1:] if read_only else VIEWERS:  # only TigerVNC has a view-only mode
         if shutil.which(exe):
             detach = {"creationflags": subprocess.DETACHED_PROCESS} if WINDOWS else {"start_new_session": True}
@@ -910,7 +913,7 @@ def show(name, read_only=False):
     if read_only:
         raise SystemExit("--read-only needs TigerVNC (tigervnc-viewer)")
     raise SystemExit("no VNC viewer found: install TigerVNC (tigervnc-viewer) or virt-viewer, "
-                     f"or restart with a window: terminal-linux stop {name}; terminal-linux start {name} --window")
+                     f"or restart with a window: terminal-vm stop {name}; terminal-vm start {name} --window")
 
 
 def hide(name):
@@ -1441,7 +1444,7 @@ def up(name, iso=None, no_view=False, plan=False, **opts):
     if not no_view and sys.stdin.isatty():
         view(name)
     else:
-        print(json.dumps({"ready": name, "next": f"terminal-linux view {name}  (or: terminal-linux mcp {name})"}))
+        print(json.dumps({"ready": name, "next": f"terminal-vm view {name}  (or: terminal-vm mcp {name})"}))
 
 
 def doctor():
@@ -1494,7 +1497,7 @@ def skills(cmd, dest=None):
             print(f.read(), end=""); return
     if cmd == "path":
         print(SKILL); return
-    dest = os.path.join(dest or os.path.expanduser("~/.claude/skills"), "terminal-linux")
+    dest = os.path.join(dest or os.path.expanduser("~/.claude/skills"), "terminal-vm")
     os.makedirs(dest, exist_ok=True)
     shutil.copy(SKILL, os.path.join(dest, "SKILL.md"))
     print(json.dumps({"installed": os.path.join(dest, "SKILL.md")}))
@@ -1548,7 +1551,7 @@ def mcp(name):
         if method == "initialize":
             send({"jsonrpc": "2.0", "id": rid, "result": {
                 "protocolVersion": req.get("params", {}).get("protocolVersion", "2025-06-18"),
-                "capabilities": {"tools": {}}, "serverInfo": {"name": "terminal-linux", "version": VERSION}}})
+                "capabilities": {"tools": {}}, "serverInfo": {"name": "terminal-vm", "version": VERSION}}})
         elif method == "tools/list":
             send({"jsonrpc": "2.0", "id": rid, "result": {"tools": [
                 {"name": n, "description": d, "inputSchema": s} for n, d, s in TOOLS]}})
@@ -1561,7 +1564,7 @@ def mcp(name):
                     agent = users is not None
                     if users == []:
                         raise RuntimeError("The guest has no logged-in session (login screen). Ask the user to sign in: "
-                                           f"terminal-linux view {name}")
+                                           f"terminal-vm view {name}")
                 out = act(name, tool, a)
                 if tool == "screenshot":
                     content = [image(out[0])]
@@ -1581,8 +1584,8 @@ def mcp(name):
 # ---------- CLI ----------
 
 def main(argv=None):
-    p = argparse.ArgumentParser(prog="terminal-linux", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--version", action="version", version=f"terminal-linux {VERSION}")
+    p = argparse.ArgumentParser(prog="terminal-vm", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version=f"terminal-vm {VERSION}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def sizes(sp):
@@ -1633,7 +1636,7 @@ def main(argv=None):
         if o.cmd == "ls": return ls()
         if o.cmd == "doctor": return doctor()
         if o.cmd == "help": return p.print_help()
-        if o.cmd == "version": return print(f"terminal-linux {VERSION}")
+        if o.cmd == "version": return print(f"terminal-vm {VERSION}")
         if o.cmd == "rm": return rm(o.name)
         if o.cmd == "reset": return reset(o.name)
         if o.cmd == "clone": return clone(o.src, o.new)

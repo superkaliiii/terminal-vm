@@ -1,0 +1,39 @@
+---
+name: terminal-vm
+description: Operate a separate virtual Linux desktop (QEMU/KVM) through the terminal-vm MCP tools or CLI - observe with screenshots, act with click/type/key, verify. Use when a task needs a GUI Linux desktop that is not the user's own machine.
+---
+
+# Using terminal-vm
+
+terminal-vm gives you computer use inside a separate virtual Linux machine. Your actions never touch the user's own desktop, files, clipboard or sessions.
+
+## Tools (MCP server `terminal-vm mcp NAME`)
+
+`screenshot`, `click` (`clicks: 2|3`, `button: right|middle`), `move`, `drag`, `scroll` (`dy`, negative scrolls down, 100 per notch), `type`, `key`, `status`, `wait` (until the screen stops changing, then a screenshot; `stable` seconds, `timeout`; a blinking cursor can keep it from settling, so read `stable` in the reply). Coordinates are pixels of the latest `screenshot`. Action tools accept `screenshot: true` to return a fresh screenshot with the result.
+
+## Loop: observe -> act -> verify
+
+1. `status`. If it says the VM is not running, ask the user to run `terminal-vm up NAME` (or `start NAME`). If paused, `terminal-vm resume NAME`.
+2. `screenshot` and read it before every decision. Never guess coordinates.
+3. Do one meaningful action, then take a new screenshot to confirm the result.
+4. Prefer keyboard shortcuts when they are reliable (`ctrl+l` in a browser, `alt+f2` run dialog, `ctrl+alt+t` terminal on many desktops).
+
+## Text and keys
+
+- `type` sends text in the guest's keyboard layout (set per VM with `--layout us|fr`, changed with `terminal-vm layout NAME us|fr`). `type` and `key` accept `layout: us|fr` for one call, e.g. when the guest's active keyboard differs (wrong letters such as `q` for `a` are the symptom). Characters outside that layout go through Ctrl+Shift+U Unicode entry, which works in GTK/Qt apps but not in raw consoles.
+- `key` takes chords such as `ctrl+a`, `alt+tab`, `ctrl+alt+t`, `return`, `escape`, `super`, `f5`. Letters name the letter in the guest layout.
+
+## Windows guests
+
+`terminal-vm ls` shows each VM's `os`. Windows guests log on automatically after their unattended install; use Windows shortcuts (`super` opens Start, `super+r` Run, `ctrl+shift+escape` Task Manager). `status` reports users as unknown there: rely on the screenshot.
+
+## When to ask the user
+
+- A tool reports no logged-in session (login screen), a password, or credentials are needed.
+- The guest asks a confirmation you are not sure about (shutdown, install, delete).
+
+## Lifecycle (CLI)
+
+`terminal-vm ls`, `status NAME`, `pause NAME`, `resume NAME`, `stop NAME` (asks the guest; it may show a confirmation dialog you can click; a locked Windows session ignores it: unlock with `key ctrl+alt+delete`, the password, `key enter`), `stop NAME --force` (power cut, can lose work: only when the user agrees). Do not delete VM data.
+
+Before a risky step, `terminal-vm snapshot NAME save TAG` (running VM: memory included); `snapshot NAME load TAG` returns to it, `snapshot NAME ls` lists them. Files: `terminal-vm push NAME LOCAL GUEST` / `pull NAME GUEST LOCAL` (needs qemu-guest-agent in the guest). `rm` and `reset` destroy data: only when the user asks.

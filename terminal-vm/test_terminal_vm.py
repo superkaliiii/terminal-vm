@@ -1,6 +1,6 @@
 import contextlib, io, json, os, re, socket, struct, sys, tempfile, threading, unittest, zlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import terminal_linux as tl
+import terminal_vm as tl
 
 POSIX = os.name == "posix" and hasattr(socket, "AF_UNIX")
 
