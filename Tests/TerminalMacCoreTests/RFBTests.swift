@@ -44,7 +44,7 @@ final class RFBTests: XCTestCase {
         var length = socklen_t(MemoryLayout<sockaddr_in>.size)
         try withUnsafeMutablePointer(to: &address) { pointer in
             try pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                guard bind(listener, $0, length) == 0, listen(listener, 1) == 0, getsockname(listener, $0, &length) == 0 else { throw Failure("bind failed") }
+                guard Darwin.bind(listener, $0, length) == 0, listen(listener, 1) == 0, getsockname(listener, $0, &length) == 0 else { throw Failure("bind failed") }
             }
         }
         let port = UInt16(bigEndian: address.sin_port)
