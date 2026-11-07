@@ -84,6 +84,17 @@ Only Windows Server 2025 evaluation media is downloaded automatically (straight 
 
 The same file runs on Windows 10/11 and Windows Server hosts with Python 3.8+ and QEMU (`winget install SoftwareFreedomConservancy.QEMU`). Enable the Windows Hypervisor Platform for speed (as administrator: `Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform`, then restart); without it QEMU falls back to slow emulation. `doctor` checks both. QMP and the guest agent use unix sockets in the VM's folder under your profile, as on Linux, so other users cannot reach them (Windows 10 1803+ and QEMU >= 7.2; Python reaches them through Winsock). VNC listens on a random localhost port behind a password generated at each start, which `show` prints for the viewer's prompt. Snapshots of a running VM are refused by QEMU on Windows hosts (no dirty-memory tracking): stop the VM first, then `snapshot NAME save TAG` (disk only). `view` draws the guest inside Windows Terminal (Sixel, keyboard and mouse through VT input), centred and scaled to the window, redrawing only what changed. Windows Terminal reports the mouse by cell only; on a Windows host the viewer refines it with the host cursor position, so the two pointers line up (the guest needs an absolute pointer: Windows and current Linux desktops have one, TinyCore's Xvesa does not). For the sharpest image, shrink the font (Ctrl+-) until the window holds the guest screen at 1:1 (about 103x39 cells for 1024x768). Other Windows terminals (WezTerm included) pass no images through ConPTY: `view` opens a VNC window there (TigerVNC), or use `start NAME --window`. Use `terminal-vm.cmd` from this folder as the launcher.
 
+## Resources
+
+Each VM has a ceiling of CPUs and memory: its template's (`--os`: 8 CPUs and 16 GiB, Windows XP 2 and 3), never above the host, or `create --max-cpus N --max-memory GiB`. Within it, `resources NAME --cpus N --memory GiB` (MCP tool `resources`, so agents size their own VM) changes what the VM uses, live where QEMU and the guest allow it:
+
+| | Live | Otherwise |
+|---|---|---|
+| Memory | up and down, through a VirtIO balloon: the VM boots with its ceiling and gives back what is above its allocation. Linux guests, and Windows 10/11 and Server 2016+ with the guest tools | next start (Windows XP/7/8, or no balloon driver) |
+| CPUs | added on Linux guests (`-smp N,maxcpus=MAX`); qemu-guest-agent brings them online, else the reply says how | removal, and Windows guests (Standard editions cannot add CPUs live): next start |
+
+Verified: Server 2025 went 4 → 2 → 5 GiB without restarting (QEMU's balloon report followed); Debian 13 went from 4 to 6 CPUs live (online once brought up).
+
 ## Sandbox
 
 `create NAME --sandbox` (or `sandbox NAME on` for a stopped VM) isolates a VM for an untrusted agent. Only the screen and input reach the guest:

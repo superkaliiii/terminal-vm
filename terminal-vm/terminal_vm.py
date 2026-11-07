@@ -17,6 +17,7 @@ Virtualization), which is also the default for `up` and `create` without `--os`.
   clone SRC NEW            instant copy-on-write copy of a stopped VM (SRC then stays read-only)
   snapshot NAME save|load|rm TAG | snapshot NAME ls
   display NAME --width W --height H    screen size at the next start
+  resources NAME [--cpus N] [--memory GiB]   within the VM's ceiling (create --max-cpus/--max-memory); live where possible
   sandbox NAME [on|off]   no network, no guest agent or file copy, disk reset at each stop, actions logged
   layout NAME [us|fr]      keyboard layout for type/key (us = QWERTY, fr = AZERTY); action ... --layout: one call
   image [--os OS] [--plan]             download the installation image only
@@ -478,7 +479,8 @@ PROFILES = {
     "linux": dict(family="linux", machine="q35", disk_bus="virtio", nic="virtio-net-pci", vga="virtio-vga",
                   usb="qemu-xhci", cpus=4, memory=4, disk=32, unattend=None),
     "winxp": dict(_WIN, machine="pc", nic="rtl8139", vga="cirrus-vga", usb="uhci", cpus=1, memory=1, disk=16,
-                  unattend="sif", key="required", cpu="qemu64"),  # XP dislikes host CPU passthrough
+                  unattend="sif", key="required", cpu="qemu64",  # XP dislikes host CPU passthrough
+                  max_cpus=2, max_memory=3),  # 32-bit XP: two sockets, ~3.5 GB of addressable RAM
     "win7": dict(_WIN, nic="e1000", usb="usb-ehci", memory=2, disk=32, oobe="win7"),
     "win8": dict(_WIN, nic="e1000", memory=2, disk=32, key="required"),
     # Microsoft's public KMS client setup keys: they select the Pro edition, they do not activate it.
@@ -487,6 +489,34 @@ PROFILES = {
     # Evaluation media need no key; image 2 is Standard with the Desktop Experience.
     **{f"win{v}": dict(_WIN, memory=4, disk=64, index=2) for v in ("2016", "2019", "2022", "2025")},
 }
+TEMPLATE_MAX = (8, 16)  # default ceiling per VM (CPUs, GiB) when a template sets none; the host caps it further
+
+
+def host_memory_gb():
+    if WINDOWS:
+        import ctypes
+
+        class Status(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong)] + \
+                       [(n, ctypes.c_ulonglong) for n in ("total", "avail", "pt", "pa", "vt", "va", "ve")]
+        st = Status(); st.dwLength = ctypes.sizeof(st)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))
+        return st.total // 2 ** 30
+    return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") // 2 ** 30
+
+
+def limits(m):
+    """(max CPUs, max GiB) a VM may use: chosen at create, else its template's, never above the host."""
+    p = PROFILES[m.get("os", "linux")]
+    cpus = m.get("max_cpus") or p.get("max_cpus", TEMPLATE_MAX[0])
+    mem = m.get("max_memory_mb", 0) // 1024 or p.get("max_memory", TEMPLATE_MAX[1])
+    return min(cpus, os.cpu_count()), max(1, min(mem, host_memory_gb()))
+
+
+def hot_cpus(m):
+    return PROFILES[m.get("os", "linux")]["family"] == "linux"  # Windows Standard and older cannot add CPUs live
+
+
 WINDOWS_IMAGES = {  # official evaluation media that can be downloaded without a sign-in
     "win2025": "https://go.microsoft.com/fwlink/?linkid=2293312&clcid=0x409&culture=en-us&country=us",
 }
@@ -597,7 +627,13 @@ def qemu_args(name, m, window, vnc_port=None):
     # by seccomp where it has it (Linux hosts). Only the screen and input reach the guest.
     sandbox, setup = m.get("sandbox"), installing(d, m)
     vga = p["vga"] if p["vga"] == "cirrus-vga" else f"{p['vga']},xres={w},yres={h}"  # cirrus has no preferred mode
-    args = ["-name", name, *accel, "-cpu", cpu, "-machine", p["machine"], "-m", str(m["memory_mb"]), "-smp", str(m["cpus"]),
+    max_cpus, max_gb = limits(m)
+    # Balloon: the guest gets its ceiling of RAM and gives back what is above memory_mb, so memory can change
+    # live. Only where the guest has the driver (Linux; Windows with the virtio-win tools), or it would keep it all.
+    ram = max(max_gb * 1024, m["memory_mb"]) if m.get("balloon") else m["memory_mb"]
+    smp = f"{m['cpus']},maxcpus={max(max_cpus, m['cpus'])}" if hot_cpus(m) else str(m["cpus"])
+    args = ["-name", name, *accel, "-cpu", cpu, "-machine", p["machine"], "-m", str(ram), "-smp", smp,
+            *(["-device", "virtio-balloon-pci,free-page-reporting=on"] if m.get("balloon") else []),
             # QEMU locks the image: one VM per disk. During an unattended install, ignore guest flushes (much faster):
             # a host crash then loses the install, never a finished VM.
             "-drive", f"file={os.path.join(d, 'disk.qcow2')},if={p['disk_bus']}" + (",cache=unsafe" if setup else "")
@@ -627,7 +663,7 @@ def qemu_args(name, m, window, vnc_port=None):
 
 
 def create(name, iso, os_name="linux", cpus=None, memory=None, disk=None, width=1280, height=800, layout="us",
-           offline=False, product_key=None, ui_language="en-US", sandbox=False):
+           offline=False, product_key=None, ui_language="en-US", sandbox=False, max_cpus=None, max_memory=None):
     d = vm_dir(name)
     p = PROFILES.get(os_name)
     if p is None:
@@ -639,6 +675,12 @@ def create(name, iso, os_name="linux", cpus=None, memory=None, disk=None, width=
         raise SystemExit(f"ISO not found: {iso}")
     if layout not in LAYOUTS:
         raise SystemExit(f"unknown layout {layout!r}; choose from {', '.join(LAYOUTS)}")
+    top = limits({"os": os_name, "max_cpus": max_cpus, "max_memory_mb": (max_memory or 0) * 1024})
+    if (max_cpus or 0) > os.cpu_count() or (max_memory or 0) > host_memory_gb():
+        raise SystemExit(f"--max-cpus/--max-memory above this host ({os.cpu_count()} CPUs, {host_memory_gb()} GiB)")
+    if cpus > top[0] or memory > top[1]:
+        raise SystemExit(f"--cpus/--memory above the VM's ceiling of {top[0]} CPUs and {top[1]} GiB "
+                         "(raise it with --max-cpus/--max-memory)")
     if not (1 <= cpus <= os.cpu_count() and 1 <= memory <= 512 and 4 <= disk and 640 <= width <= 7680 and 480 <= height <= 4320):
         raise SystemExit("invalid size: check --cpus (<= host CPUs), --memory GiB, --disk GiB (>= 4), --width/--height")
     key = product_key or (p.get("key") if p.get("key") != "required" else None)
@@ -650,7 +692,8 @@ def create(name, iso, os_name="linux", cpus=None, memory=None, disk=None, width=
     subprocess.run([qemu_bin("qemu-img"), "create", "-f", "qcow2", os.path.join(d, "disk.qcow2"), f"{disk}G"],
                    check=True, stdout=subprocess.DEVNULL)
     m = {"os": os_name, "iso": os.path.abspath(iso), "memory_mb": memory * 1024, "cpus": cpus, "width": width,
-         "height": height, "layout": layout, "offline": offline or sandbox, **({"sandbox": True} if sandbox else {})}
+         "height": height, "layout": layout, "offline": offline or sandbox, **({"sandbox": True} if sandbox else {}),
+         "max_cpus": top[0], "max_memory_mb": top[1] * 1024, **({"balloon": True} if p["family"] == "linux" else {})}
     if p["family"] == "windows":
         # 12 characters: within XP's 14-character limit, and the suffix meets Server's complexity policy
         # (an unmet policy would stop the unattended install at a password prompt).
@@ -668,6 +711,7 @@ def create(name, iso, os_name="linux", cpus=None, memory=None, disk=None, width=
         tools = guest_tools() if os_name in GUEST_TOOLS_OS else None
         if tools:  # installed at first logon from the answers drive (autounattend: GUEST_TOOLS_CMD)
             shutil.copyfile(tools, os.path.join(d, "answers", "virtio-win-guest-tools.exe"))
+            m["balloon"] = True  # the tools include the balloon driver
     with open(os.path.join(d, "machine.json"), "w") as f:
         json.dump(m, f)
     out = {"created": name, "os": os_name, "path": d}
@@ -697,6 +741,12 @@ def start(name, window=False):
     subprocess.Popen([qemu_bin("qemu-system-x86_64")] + qemu_args(name, m, window, vnc_port), stdout=log, stderr=log, **detach)
     for _ in range(100):
         if state(name) != "stopped":
+            if m.get("balloon"):  # the driver reads the target when it loads
+                q = qmp(name)
+                try:
+                    q.cmd("balloon", value=m["memory_mb"] * 2 ** 20)
+                finally:
+                    q.close()
             if WINDOWS:  # VNC password: 8 characters is the protocol's maximum
                 pw = secrets.token_urlsafe(6)
                 q = qmp(name)
@@ -931,6 +981,73 @@ def set_layout(name, layout=None):
         m["layout"] = layout
         save(name, m)
     print(json.dumps({"name": name, "layout": m.get("layout", "us")}))
+
+
+def _online_vcpus(name):
+    """Bring every guest CPU online through qemu-guest-agent; False when no agent answers."""
+    try:
+        g = QGA(name, timeout=3)
+        try:
+            off = [{"logical-id": c["logical-id"], "online": True} for c in g.call("guest-get-vcpus") if not c["online"]]
+            if off:
+                g.call("guest-set-vcpus", vcpus=off)
+            return True
+        finally:
+            g.sock.close()
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def resources(name, cpus=None, memory=None):
+    """Show or change CPUs and memory (GiB) within the VM's ceiling. Running VM: memory changes now through the
+    balloon; CPUs are added now on Linux guests. Anything else (fewer CPUs, Windows CPUs, no balloon) is saved for
+    the next start, and the reply says which."""
+    m = load(name)
+    top_cpus, top_gb = limits(m)
+    for what, v, top in (("cpus", cpus, top_cpus), ("memory", memory, top_gb)):
+        if v is not None and not 1 <= v <= top:
+            raise SystemExit(f"{what} must be 1..{top} for {name} (its ceiling; set at create with --max-{what})")
+    running, applied = state(name) != "stopped", {}
+    q = qmp(name) if running and (cpus or memory) else None
+    try:
+        if memory is not None:
+            if q and m.get("balloon") and memory * 1024 <= max(top_gb * 1024, m["memory_mb"]):
+                q.cmd("balloon", value=memory * 2 ** 30); applied["memory"] = "now"
+            else:
+                applied["memory"] = "next start" if running else "saved"
+            m["memory_mb"] = memory * 1024
+        if cpus is not None:
+            if q and hot_cpus(m):
+                slots = q.cmd("query-hotpluggable-cpus")
+                online = [c for c in slots if c.get("qom-path")]
+                free = [c for c in slots if not c.get("qom-path")]
+                for c in free[:max(0, cpus - len(online))]:
+                    props = {k: v for k, v in c["props"].items() if k.endswith("-id")}
+                    q.cmd("device_add", driver=c["type"], id="cpu" + "-".join(str(v) for v in props.values()), **props)
+                applied["cpus"] = "now" if cpus >= len(online) else "next start"  # removal needs a restart
+                if applied["cpus"] == "now" and not _online_vcpus(name):  # most distributions leave new CPUs offline
+                    applied["cpus"] = ("added, offline until the guest brings them up (qemu-guest-agent does it; "
+                                       "or as root: echo 1 > /sys/devices/system/cpu/cpuN/online)")
+            else:
+                applied["cpus"] = "next start" if running else "saved"
+            m["cpus"] = cpus
+        out = {"name": name, "cpus": m["cpus"], "memory_gb": m["memory_mb"] // 1024,
+               "max_cpus": top_cpus, "max_memory_gb": top_gb, "live_memory": bool(m.get("balloon")),
+               "live_cpus": hot_cpus(m)}
+        if running and m.get("balloon"):
+            q2 = q or qmp(name)
+            try:
+                out["guest_memory_gb"] = round(q2.cmd("query-balloon")["actual"] / 2 ** 30, 1)
+            finally:
+                if q2 is not q:
+                    q2.close()
+    finally:
+        if q:
+            q.close()
+    if cpus is not None or memory is not None:
+        save(name, m)
+        out["applied"] = applied
+    return out
 
 
 def set_sandbox(name, value=None):
@@ -1612,6 +1729,10 @@ TOOLS = [
      _schema({"text": {"type": "string"}, **_LAYOUT, **_SHOT}, ["text"])),
     ("key", "Press a key chord, e.g. ctrl+a, alt+tab, return, super.", _schema({"key": {"type": "string"}, **_LAYOUT, **_SHOT}, ["key"])),
     ("status", "VM run state, screen size and logged-in guest users.", _schema({})),
+    ("resources", "Show the VM's CPUs and memory and their ceiling, or change them within it: give cpus and/or "
+                  "memory_gb. Memory changes live where the guest has a balloon driver; CPUs are added live on Linux "
+                  "guests; otherwise the change applies at the next start (the reply says which).",
+     _schema({"cpus": {"type": "integer", "minimum": 1}, "memory_gb": {"type": "integer", "minimum": 1}})),
     ("wait", "Wait until the screen stops changing (loading, installing, animations), then return a screenshot. "
              "stable: seconds without change (default 1); timeout: default 30. A blinking cursor can keep it from settling.",
      _schema({"stable": _N, "timeout": _N})),
@@ -1661,7 +1782,8 @@ def mcp(name):
                     if users == []:
                         raise RuntimeError("The guest has no logged-in session (login screen). Ask the user to sign in: "
                                            f"terminal-vm view {name}")
-                out = act(name, tool, a)
+                # resources opens its own QMP session (QEMU takes one client at a time), so not through act()
+                out = resources(name, a.get("cpus"), a.get("memory_gb")) if tool == "resources" else act(name, tool, a)
                 record(tool, a)
                 if tool == "screenshot":
                     content = [image(out[0])]
@@ -1697,6 +1819,8 @@ def main(argv=None):
         sp.add_argument("--width", type=int, default=1280); sp.add_argument("--height", type=int, default=800)
         sp.add_argument("--layout", default="us", choices=sorted(LAYOUTS)); sp.add_argument("--offline", action="store_true")
         sp.add_argument("--sandbox", action="store_true", help="no network or file sharing, disposable disk, actions logged")
+        sp.add_argument("--max-cpus", type=int, help="ceiling agents may raise CPUs to (default: per --os, host-capped)")
+        sp.add_argument("--max-memory", type=int, help="ceiling in GiB agents may raise memory to (default: per --os)")
     u = sub.add_parser("up"); u.add_argument("name", nargs="?", default="default"); u.add_argument("--iso")
     u.add_argument("--no-view", action="store_true"); u.add_argument("--plan", action="store_true"); sizes(u)
     c = sub.add_parser("create"); c.add_argument("name"); c.add_argument("--iso"); sizes(c)
@@ -1726,9 +1850,11 @@ def main(argv=None):
     a.add_argument("--layout", choices=sorted(LAYOUTS), help="this call only: us (QWERTY) or fr (AZERTY)")
     lo = sub.add_parser("layout"); lo.add_argument("name"); lo.add_argument("layout", nargs="?", choices=sorted(LAYOUTS))
     sb = sub.add_parser("sandbox"); sb.add_argument("name"); sb.add_argument("value", nargs="?", choices=["on", "off"])
+    rs = sub.add_parser("resources"); rs.add_argument("name"); rs.add_argument("--cpus", type=int)
+    rs.add_argument("--memory", type=int, help="GiB")
     o = p.parse_args(argv)
 
-    opts = ({k: getattr(o, k) for k in ("os_name", "cpus", "memory", "disk", "width", "height", "layout", "offline", "product_key", "ui_language", "sandbox")}
+    opts = ({k: getattr(o, k) for k in ("os_name", "cpus", "memory", "disk", "width", "height", "layout", "offline", "product_key", "ui_language", "sandbox", "max_cpus", "max_memory")}
             if o.cmd in ("up", "create") else {})
     try:
         if o.cmd == "up": return up(o.name, o.iso, o.no_view, o.plan, **opts)
@@ -1747,6 +1873,7 @@ def main(argv=None):
         if o.cmd == "display": return display(o.name, o.width, o.height)
         if o.cmd == "layout": return set_layout(o.name, o.layout)
         if o.cmd == "sandbox": return set_sandbox(o.name, o.value)
+        if o.cmd == "resources": return print(json.dumps(resources(o.name, o.cpus, o.memory)))
         if o.cmd == "image": return print(json.dumps({"image": default_image(o.plan, o.os_name)}))
         if o.cmd in ("push", "pull"): return transfer(o.name, o.cmd, o.src, o.dest)
         if o.cmd == "view": return view(o.name, read_only=o.read_only)

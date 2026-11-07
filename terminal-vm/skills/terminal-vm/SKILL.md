@@ -39,3 +39,5 @@ terminal-vm gives you computer use inside a separate virtual machine (Linux, Win
 Before a risky step, `terminal-vm snapshot NAME save TAG` (running VM: memory included); `snapshot NAME load TAG` returns to it, `snapshot NAME ls` lists them. Files: `terminal-vm push NAME LOCAL GUEST` / `pull NAME GUEST LOCAL` (needs qemu-guest-agent in the guest). `rm` and `reset` destroy data: only when the user asks.
 
 A sandboxed VM (`ls` shows `"sandbox": true`) has no network and forgets its disk changes when it stops; your actions are logged. Do not count on downloads, file copies or saved work there.
+
+If the VM is too slow or short of memory, `resources` shows its CPUs and memory and its ceiling; ask for what the task needs within the ceiling, and give it back when done.

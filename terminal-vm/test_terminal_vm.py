@@ -525,6 +525,50 @@ class StoppedVm(unittest.TestCase):
         self.assertFalse(self.quiet(tl.set_sandbox, "v", "off")["sandbox"])
         self.assertNotIn("sandbox", tl.load("v"))
 
+    def test_resources(self):
+        """Ceilings from the template (host-capped), live memory through the balloon, live CPUs on Linux only."""
+        m = {"os": "linux", "iso": "/x.iso", "memory_mb": 2048, "cpus": 2, "balloon": True,
+             "max_cpus": 4, "max_memory_mb": 6 * 1024}
+        tl.save("v", m)
+        args = " ".join(tl.qemu_args("v", m, False))
+        self.assertIn(f"-m {min(6, tl.host_memory_gb()) * 1024}", args)          # RAM up to the ceiling...
+        self.assertIn("virtio-balloon-pci", args)                               # ...given back by the balloon
+        self.assertIn(f"-smp 2,maxcpus={min(4, os.cpu_count())}", args)
+        win = " ".join(tl.qemu_args("v", dict(m, os="win2025", balloon=False), False))
+        self.assertIn("-m 2048 ", win)                                          # no driver: exactly memory_mb
+        self.assertIn("-smp 2 ", win)                                           # no live CPUs on Windows
+        self.assertEqual(tl.limits({"os": "winxp"})[0], min(2, os.cpu_count()))  # template ceiling
+        with self.assertRaises(SystemExit):
+            tl.resources("v", cpus=99)
+        out = tl.resources("v", cpus=1, memory=1)                               # stopped: saved for the next start
+        self.assertEqual(out["applied"], {"memory": "saved", "cpus": "saved"})
+        self.assertEqual((tl.load("v")["cpus"], tl.load("v")["memory_mb"]), (1, 1024))
+
+        calls = []
+        class FakeQMP:
+            def cmd(self, c, **a):
+                calls.append((c, a))
+                if c == "query-hotpluggable-cpus":
+                    return [{"type": "max-x86_64-cpu", "qom-path": "/machine/cpu0", "props": {"socket-id": 0}},
+                            {"type": "max-x86_64-cpu", "props": {"socket-id": 1, "node-id": 0}},
+                            {"type": "max-x86_64-cpu", "props": {"socket-id": 2}}]
+                return {"actual": 3 * 2 ** 30} if c == "query-balloon" else {}
+            def close(self): pass
+        old = (tl.state, tl.qmp, tl._online_vcpus)
+        tl.state, tl.qmp, tl._online_vcpus = (lambda n: "running"), (lambda n: FakeQMP()), (lambda n: True)
+        try:
+            out = tl.resources("v", cpus=2, memory=3)
+            first = list(calls)
+            tl._online_vcpus = lambda n: False   # no guest agent: added but offline, and the reply says so
+            self.assertIn("offline", tl.resources("v", cpus=2)["applied"]["cpus"])
+        finally:
+            tl.state, tl.qmp, tl._online_vcpus = old
+        self.assertEqual(out["applied"], {"memory": "now", "cpus": "now"})
+        self.assertIn(("balloon", {"value": 3 * 2 ** 30}), first)
+        self.assertIn(("device_add", {"driver": "max-x86_64-cpu", "id": "cpu1-0", "socket-id": 1, "node-id": 0}),
+                      first)   # one more, with every property QEMU listed for that slot
+        self.assertEqual(out["guest_memory_gb"], 3.0)
+
     def test_sandbox_journal(self):
         """Every MCP action on a sandboxed VM lands in actions.log, failures included."""
         m = tl.load("v"); m["sandbox"] = True; tl.save("v", m)
