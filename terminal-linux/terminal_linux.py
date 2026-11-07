@@ -1208,6 +1208,8 @@ def view(name, fps=30, read_only=False):
     # alt screen, hide cursor, all mouse motion as SGR (in pixels where the terminal can), ask the cell size in pixels
     out.write(b"\x1b[?1049h\x1b[?25l\x1b[?1003h\x1b[?1006h" + (b"\x1b[?1016h" if proto == "kitty" else b"") + b"\x1b[16t")
     last, geom, held, cell, shown, prev_rgb, refine = None, None, set(), (20, 10), None, b"", cell_refiner()
+    stale, mapped0 = False, 0
+    active = time.monotonic()  # last screen change or input: capture at fps for 2 s after it, at 5 Hz when idle
     try:
         while True:
             try:
@@ -1221,6 +1223,7 @@ def view(name, fps=30, read_only=False):
                 continue
             g = term_geometry(cell)
             if data != last or g != geom:
+                active = time.monotonic()
                 cols, rows, cw, ch = g
                 if g != geom:  # a fresh alternate screen: ED 2 leaves Sixel images behind in Windows Terminal
                     out.write(b"\x1b[?1049l\x1b[?1049h\x1b[2J")
@@ -1241,12 +1244,16 @@ def view(name, fps=30, read_only=False):
                     dw, dh = max(1, int(w * scale)), max(1, int(h * scale))
                     ox, oy = int((cols * cw - dw) / 2 // cw), int(((rows - 1) * ch - dh) / 2 // ch)
                     same = shown is not None and len(prev_rgb) == len(data)
-                    if same and sum(data[i:i + w * 3] != prev_rgb[i:i + w * 3] for i in range(0, len(data), w * 3)) > h // 3:
-                        same, shown = False, None  # a new screen: new palette, full redraw
-                    if not same:
-                        palette = make_palette(data, w, h)
+                    if not same:  # the palette is built at start and on resize only: rebuilding it on every new
+                        palette = make_palette(data, w, h)  # screen cost ~0.3 s, new colours take their nearest
                     frame = sixel_rows(data, w, h, dw, dh, palette, prev_rgb, shown) if same else sixel_rows(data, w, h, dw, dh, palette)
                     prev_rgb = data
+                    # many colours approximated since the palette was made (the screen changed a lot): a new one
+                    # once things are calm. Counted from the first frame, whose smoothed shades are expected.
+                    mapped = len(palette[1]) - palette[1].count(255)
+                    if not same:
+                        mapped0 = mapped
+                    stale = mapped - mapped0 > 1500
                     boxes = [(0, 0, dw, dh)] if shown is None or cw % 1 or ch % 1 else changed(shown, frame, int(ch))
                     for box in boxes:  # redraw only the cells that changed: a moving pointer costs a few cells
                         cw_, ch_ = int(cw), int(ch)
@@ -1258,10 +1265,14 @@ def view(name, fps=30, read_only=False):
                 out.write(f"\x1b[{rows};1H\x1b[2K\x1b[2m {name} · {w}x{h} · Ctrl+] exit · Ctrl+O window\x1b[0m".encode())
                 out.flush()
             try:
-                chunk = keys.get(timeout=1 / fps)
+                chunk = keys.get(timeout=1 / fps if time.monotonic() - active < 2 else 0.2)
+                active = time.monotonic()
                 while not keys.empty() and chunk:  # take everything typed meanwhile
                     chunk += keys.get_nowait()
             except queue.Empty:
+                if stale and time.monotonic() - active > 1:
+                    last = shown = None  # full redraw with a palette made for this screen
+                    stale = False
                 continue
             if not chunk:
                 return
