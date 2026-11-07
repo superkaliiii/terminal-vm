@@ -1041,17 +1041,14 @@ def make_palette(rgb, w, h, size=255):
 
 
 def _nearest(palette, k):
-    """Nearest register to colour key k, searched once per 4-bit cell and cached: smoothing small text brings
-    thousands of in-between shades, and one search per shade froze the viewer for a second on each new screen."""
+    """Nearest register to colour key k. Smoothing small text brings thousands of in-between shades per new
+    screen: the palette's components are unpacked once (cells[None]) and the search is a flat min over tuples
+    (~45 us), which a per-shade lambda made 20 times slower."""
     keys, _, cells = palette
-    c = k & 0x7BDE  # each channel's lowest bit dropped
-    if c not in cells:
-        if None not in cells:
-            cells[None] = [(i, q >> 10, q >> 5 & 31, q & 31) for i, q in enumerate(keys)]
-        c2 = c | 0x421  # middle of the cell
-        r, g, b = c2 >> 10, c2 >> 5 & 31, c2 & 31
-        cells[c] = min(((r - pr) ** 2 + (g - pg) ** 2 + (b - pb) ** 2, i) for i, pr, pg, pb in cells[None])[1]
-    return cells[c]
+    if None not in cells:
+        cells[None] = [(i, q >> 10, q >> 5 & 31, q & 31) for i, q in enumerate(keys)]
+    r, g, b = k >> 10, k >> 5 & 31, k & 31
+    return min(((r - pr) ** 2 + (g - pg) ** 2 + (b - pb) ** 2, i) for i, pr, pg, pb in cells[None])[1]
 
 
 _HALF = bytes(v >> 1 for v in range(256))
@@ -1249,11 +1246,11 @@ def view(name, fps=30, read_only=False):
                     frame = sixel_rows(data, w, h, dw, dh, palette, prev_rgb, shown) if same else sixel_rows(data, w, h, dw, dh, palette)
                     prev_rgb = data
                     # many colours approximated since the palette was made (the screen changed a lot): a new one
-                    # once things are calm. Counted from the first frame, whose smoothed shades are expected.
+                    # once nothing has moved for 2 s. Counted from the first frame, whose smoothed shades are expected.
                     mapped = len(palette[1]) - palette[1].count(255)
                     if not same:
                         mapped0 = mapped
-                    stale = mapped - mapped0 > 1500
+                    stale = mapped - mapped0 > 400
                     boxes = [(0, 0, dw, dh)] if shown is None or cw % 1 or ch % 1 else changed(shown, frame, int(ch))
                     for box in boxes:  # redraw only the cells that changed: a moving pointer costs a few cells
                         cw_, ch_ = int(cw), int(ch)
@@ -1270,7 +1267,7 @@ def view(name, fps=30, read_only=False):
                 while not keys.empty() and chunk:  # take everything typed meanwhile
                     chunk += keys.get_nowait()
             except queue.Empty:
-                if stale and time.monotonic() - active > 1:
+                if stale and time.monotonic() - active > 2:  # never while someone is moving or typing
                     last = shown = None  # full redraw with a palette made for this screen
                     stale = False
                 continue
