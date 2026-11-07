@@ -34,11 +34,14 @@ enum VirtualMachines {
             network.attachment = VZNATNetworkDeviceAttachment()
             config.networkDevices = [network]
         }
-        var shares: [String: VZSharedDirectory] = ["control": VZSharedDirectory(url: directory.appendingPathComponent("exchange"), readOnly: false)]
-        if let tools { shares["tools"] = VZSharedDirectory(url: tools, readOnly: true) }
-        let filesystem = VZVirtioFileSystemDeviceConfiguration(tag: VZVirtioFileSystemDeviceConfiguration.macOSGuestAutomountTag)
-        filesystem.share = VZMultipleDirectoryShare(directories: shares)
-        config.directorySharingDevices = [filesystem]
+        // Host control answers the mailbox itself, so the guest gets no shares and an installed helper stays idle.
+        if !machine.usesHostControl {
+            var shares: [String: VZSharedDirectory] = ["control": VZSharedDirectory(url: directory.appendingPathComponent("exchange"), readOnly: false)]
+            if let tools { shares["tools"] = VZSharedDirectory(url: tools, readOnly: true) }
+            let filesystem = VZVirtioFileSystemDeviceConfiguration(tag: VZVirtioFileSystemDeviceConfiguration.macOSGuestAutomountTag)
+            filesystem.share = VZMultipleDirectoryShare(directories: shares)
+            config.directorySharingDevices = [filesystem]
+        }
         try config.validate()
         return config
     }
@@ -68,7 +71,7 @@ enum VirtualMachines {
         let width = try args.integer("width", default: 1280, range: 800...3840)
         let height = try args.integer("height", default: 800, range: 600...2160)
         let machine = Machine(name: name, cpu: cpu, memoryGiB: memory, diskGiB: disk, width: width, height: height, network: !args.flags.contains("offline"),
-                              scale: args.flags.contains("standard") ? 1 : 2)
+                              scale: args.flags.contains("standard") ? 1 : 2, control: args.flags.contains("host-control") ? "host" : nil)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         _ = try Mailbox(directory.appendingPathComponent("exchange"), create: true)
         try requirements.hardwareModel.dataRepresentation.write(to: directory.appendingPathComponent("hardware.bin"))
@@ -102,15 +105,19 @@ enum VirtualMachines {
 final class MachineRuntime: NSObject, VZVirtualMachineDelegate, NSWindowDelegate {
     let vm: VZVirtualMachine
     let machine: Machine
+    let directory: URL
     let mailbox: Mailbox
     let lock: Int32
     var window: NSWindow?
     var loop: Task<Void, Never>?
     var stopping = false
     var stopDeadline: Date?
+    var hostControl: HostControl?
+    var controlState = "guest"
 
     init(machine: Machine, directory: URL, tools: URL) throws {
         self.machine = machine
+        self.directory = directory
         lock = open(directory.appendingPathComponent("runtime.lock").path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard lock >= 0 else { throw Failure("Cannot open VM lock") }
         guard flock(lock, LOCK_EX | LOCK_NB) == 0 else { close(lock); throw Failure("VM is already running") }
@@ -124,6 +131,18 @@ final class MachineRuntime: NSObject, VZVirtualMachineDelegate, NSWindowDelegate
         if show { showWindow() }
         try await vm.start()
         stderr("VM '\(machine.name)' is running (PID \(getpid())).")
+        if machine.usesHostControl {
+            // A failure leaves the VM running (the native window still works) and is reported by status.
+            do {
+                let control = try await HostControl(vm: vm, exchange: directory.appendingPathComponent("exchange"), scale: machine.displayScale)
+                control.start()
+                hostControl = control
+                controlState = "host"
+            } catch {
+                controlState = "host-unavailable"
+                stderr("Host control is unavailable: \(error.localizedDescription)")
+            }
+        }
         loop = Task { @MainActor [weak self] in
             while let self, !Task.isCancelled {
                 do { for request in try mailbox.requests() { await handle(request) } }
@@ -156,7 +175,7 @@ final class MachineRuntime: NSObject, VZVirtualMachineDelegate, NSWindowDelegate
         do {
             var values: [String: String] = [:]
             switch request.action {
-            case "status": values = ["name": machine.name, "state": stateName, "pid": String(getpid())]
+            case "status": values = ["name": machine.name, "state": stateName, "pid": String(getpid()), "control": controlState]
             case "show": showWindow()
             case "hide":
                 // Hiding the app hands focus back to whatever was in front before, usually the terminal.

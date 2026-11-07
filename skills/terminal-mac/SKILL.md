@@ -39,6 +39,7 @@ Text is sent as Unicode keyboard events, not through the clipboard. No shell-exe
 ## When to stop and ask the user
 
 - The guest is at its login screen, or the helper is not running (tools report "no logged-in session"): ask the user to sign in, for example `terminal-mac view NAME` then Ctrl+O. Automatic login in the guest avoids this on later boots.
+- With host control (`status` shows `control: host`), there is no helper: tools also work at the login window, but still ask the user for passwords instead of typing them yourself.
 - A macOS permission prompt, password, two-factor code or payment appears in the guest.
 - The VM does not exist: `terminal-mac up NAME` downloads macOS from Apple (several GB) and needs the user for first-time setup.
 

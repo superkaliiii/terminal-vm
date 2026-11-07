@@ -59,9 +59,13 @@ public struct Machine: Codable {
     /// 2 renders the guest at Retina density: twice the pixels for the same point size. Older VMs have none.
     public var scale: Int?
     public var displayScale: Int { scale == 2 ? 2 : 1 }
-    public init(name: String, cpu: Int, memoryGiB: Int, diskGiB: Int, width: Int = 1280, height: Int = 800, network: Bool = true, installed: Bool = false, scale: Int? = nil) {
+    /// "host" drives the guest from the VM process (no guest helper); nil or "guest" uses TerminalMacGuest.
+    public var control: String?
+    public var usesHostControl: Bool { control == "host" }
+    public init(name: String, cpu: Int, memoryGiB: Int, diskGiB: Int, width: Int = 1280, height: Int = 800, network: Bool = true, installed: Bool = false, scale: Int? = nil, control: String? = nil) {
         self.name = name; self.cpu = cpu; self.memoryGiB = memoryGiB; self.diskGiB = diskGiB
         self.width = width; self.height = height; self.network = network; self.installed = installed; self.scale = scale
+        self.control = control
     }
 }
 
