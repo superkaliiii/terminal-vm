@@ -430,7 +430,7 @@ def _act(name, tool, a, q):
     if tool == "wait":  # until two screenshots `stable` seconds apart are identical, or timeout
         start, last, since = time.time(), None, time.time()
         while True:
-            data, _ = screenshot(name, q)
+            data, _ = screen_pixels(name, q)  # raw PPM: no PNG compression on every poll
             if data != last:
                 last, since = data, time.time()
             elif time.time() - since >= float(a.get("stable", 1)):
@@ -443,7 +443,7 @@ def _act(name, tool, a, q):
     if layout not in LAYOUTS:
         raise ValueError(f"unknown layout {layout!r}; choose from {', '.join(LAYOUTS)}")
     if tool in ("click", "move", "drag", "scroll"):
-        _, size = screenshot(name, q)  # current resolution, to scale into the tablet range
+        _, size = screen_pixels(name, q)  # current resolution, to scale into the tablet range (raw: no PNG to encode)
     if tool == "click":
         move(q, a["x"], a["y"], size)
         btn = a.get("button", "left")
@@ -1138,6 +1138,23 @@ def quota_usage():
     return use
 
 
+def in_wsl():
+    try:
+        with open("/proc/version") as f:
+            return "microsoft" in f.read().lower()
+    except OSError:
+        return False
+
+
+def host_free_bytes(path):
+    """Free space VM disks can grow into. Under WSL the store sits in a virtual disk that df reports at its
+    maximum size while it really grows inside a Windows drive: count that drive too (C: unless it is missing)."""
+    free = shutil.disk_usage(path).free
+    if in_wsl() and os.path.isdir("/mnt/c"):  # shortcut: assumes the distribution's disk is on C:, the default
+        free = min(free, shutil.disk_usage("/mnt/c").free)
+    return free
+
+
 def quota_limits(use=None):
     """The user's quota, defaults from the host for what was never set: cores - 1, 75% of RAM, half of the disk
     space VMs can have (free now plus what their disk files already take), 8 running VMs. Disks count at their
@@ -1146,7 +1163,7 @@ def quota_limits(use=None):
     top = STORE if os.path.isdir(STORE) else os.path.dirname(STORE)
     held = sum(os.path.getsize(f) for f in (os.path.join(STORE, n, "disk.qcow2") for n in machines()) if os.path.isfile(f))
     default = {"cpus": max(1, os.cpu_count() - 1), "memory_gb": max(1, host_memory_gb() * 3 // 4),
-               "disk_gb": (shutil.disk_usage(top).free + held) // 2 ** 31, "vms": 8}
+               "disk_gb": (host_free_bytes(top) + held) // 2 ** 31, "vms": 8}
     return {k: set_.get(k, default[k]) for k in QUOTA_KEYS}, {k: k in set_ for k in QUOTA_KEYS}
 
 
@@ -2055,12 +2072,7 @@ def doctor():
     else:
         check("kvm", os.access("/dev/kvm", os.R_OK | os.W_OK),
               "ok" if os.access("/dev/kvm", os.R_OK | os.W_OK) else "no access to /dev/kvm: sudo usermod -aG kvm $USER, then log in again")
-        try:
-            with open("/proc/version") as f:
-                wsl = "microsoft" in f.read().lower()
-        except OSError:
-            wsl = False
-        if wsl:
+        if in_wsl():
             check("wsl", False, "WSL can stop this distribution when no WSL terminal is open, killing its VMs "
                   "mid-install: keep one open (wsl -d <distro> -- sleep infinity)", required=False)
     check("python", sys.version_info >= (3, 8), sys.version.split()[0])
@@ -2275,6 +2287,7 @@ def image(data):
 
 def mcp(name):
     agents = {}  # per VM: whether qemu-guest-agent answered once; unknown until asked
+    seen = {}  # per VM: when a logged-in session was last confirmed
     can_ask, pending, asks = False, collections.deque(), iter(range(1, 1 << 30))
 
     def record(tool, a, vm, error=None):  # sandbox screen actions, and every infrastructure action, for review
@@ -2343,9 +2356,11 @@ def mcp(name):
             try:
                 if vm != name:  # screen tools on another VM: only one this agent manages
                     managed(vm)
-                if tool in INPUT_TOOLS and agents.get(vm) is not False:
+                # one guest-agent round trip per burst of input, not per click: a session seen < 5 s ago still holds
+                if tool in INPUT_TOOLS and agents.get(vm) is not False and time.time() - seen.get(vm, 0) > 5:
                     users = guest_users(vm)
                     agents[vm] = users is not None
+                    seen[vm] = time.time() if users else 0
                     if users == []:
                         raise RuntimeError("The guest has no logged-in session (login screen). Ask the user to sign in: "
                                            f"terminal-vm view {vm}")

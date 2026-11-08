@@ -157,8 +157,9 @@ class Qmp(unittest.TestCase):
         self.status, self.hmp = "running", ""
         def reply(m):
             if m["execute"] == "screendump":
-                with open(m["arguments"]["filename"], "wb") as f:
-                    f.write(tiny_png(640, 480))
+                with open(m["arguments"]["filename"], "wb") as f:  # QEMU: PNG if asked, else raw PPM
+                    f.write(tiny_png(640, 480) if m["arguments"].get("format") == "png"
+                            else b"P6\n640 480\n255\n" + bytes(640 * 480 * 3))
             if m["execute"] == "human-monitor-command":
                 return json.dumps({"return": self.hmp}).encode() + b"\n"
             return b'{"event": "X"}\n' + json.dumps({"return": {"status": self.status}}).encode() + b"\n"
@@ -762,6 +763,17 @@ class StoppedVm(unittest.TestCase):
         self.assertIn("cache=unsafe", " ".join(tl.qemu_args("v", m, False)))
         m["installed"] = True
         self.assertNotIn("cache=unsafe", " ".join(tl.qemu_args("v", m, False)))
+
+
+class HostDisk(unittest.TestCase):
+    def test_wsl_counts_the_windows_drive(self):
+        from unittest import mock
+        usage = lambda p: mock.Mock(free=10 if p == "/mnt/c" else 500)
+        with mock.patch.object(tl.shutil, "disk_usage", usage), mock.patch.object(tl, "in_wsl", lambda: True), \
+                mock.patch.object(tl.os.path, "isdir", lambda p: True):
+            self.assertEqual(tl.host_free_bytes("/store"), 10)
+        with mock.patch.object(tl.shutil, "disk_usage", usage), mock.patch.object(tl, "in_wsl", lambda: False):
+            self.assertEqual(tl.host_free_bytes("/store"), 500)
 
 
 @unittest.skipUnless(os.name == "nt", "Winsock AF_UNIX: Windows hosts only")

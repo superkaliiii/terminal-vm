@@ -99,7 +99,7 @@ One quota covers everything the host runs, so neither people nor agents can over
 | virtual disk sizes (what guests can fill) | `create`, `clone` |
 | running VMs | `start` |
 
-Every check runs under a host-wide lock, so two commands cannot both pass and then both start. A VM's default ceiling never exceeds the quota. VMs already above the disk quota still start; new disks wait for room. Under WSL, `df` reports the virtual disk of the distribution, not the Windows drive: set `--disk` to what the drive can really hold.
+Every check runs under a host-wide lock, so two commands cannot both pass and then both start. A VM's default ceiling never exceeds the quota. VMs already above the disk quota still start; new disks wait for room. Under WSL, `df` reports the virtual disk of the distribution, not the Windows drive: the default counts the free space of `C:` too (where WSL keeps it unless moved); if the distribution lives on another drive, set `--disk`.
 
 `top` (also an MCP tool) lists every running VM's real use of the host, QEMU's CPU % of one core and resident memory, read from `/proc` or the Windows process API, next to its allotment and ceiling, followed by the quota.
 
