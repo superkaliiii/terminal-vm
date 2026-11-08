@@ -41,3 +41,7 @@ Before a risky step, `terminal-vm snapshot NAME save TAG` (running VM: memory in
 A sandboxed VM (`ls` shows `"sandbox": true`) has no network and forgets its disk changes when it stops; your actions are logged. Do not count on downloads, file copies or saved work there.
 
 If the VM is too slow or short of memory, `resources` shows its CPUs and memory and its ceiling; ask for what the task needs within the ceiling, and give it back when done.
+
+## Building VMs and networks yourself
+
+`vm_list` marks with `managed: true` the VMs you may run: sandboxed VMs and the ones you created. Never try to run the user's other VMs. `vm_create` (sandboxed by default; `iso` names an image in the store) then `vm_start`; `vm_clone` a prepared VM instead of reinstalling; `net_create` + `net_attach` (stopped VMs) for a private network, then set the suggested static address in each guest (no DHCP). The screen tools take `vm` to act on another managed VM. Stay within `quota`: set `max_memory_gb` = `memory_gb` to fit more small VMs. Internet, a higher ceiling, an image download or the user's network need the user's approval: the client may ask them, otherwise the error names the command to ask them to run. Remove what you created when the task is done (`vm_stop`, `vm_remove`, `net_remove`).

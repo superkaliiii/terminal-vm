@@ -129,6 +129,20 @@ Verified: Server 2025 went 4 → 2 → 5 GiB without restarting (QEMU's balloon 
 
 Not covered: running QEMU under a dedicated system user (needs administrator setup) and host-side CPU or I/O quotas. Verified on Windows Server 2025 in WSL: no network adapter in the guest, a folder created during a run gone after restart, actions logged.
 
+## Agent authority
+
+Through MCP an agent can build a small infrastructure on its own, within the quota: `vm_list`, `vm_create`, `vm_clone`, `vm_start`, `vm_stop`, `vm_remove`, `vm_snapshot`, `vm_resources`, `vm_internet`, `net_list`, `net_create`, `net_remove`, `net_attach`, `net_detach`. The screen tools take an optional `vm` to drive another VM it manages. It manages **sandboxed VMs and the VMs it created** (`created_by: agent` in `machine.json`, set by `vm_create`/`vm_clone`; only the CLI changes it). The user's other VMs and networks stay out of reach.
+
+| Needs the user's approval | CLI the agent is told to ask for otherwise |
+|---|---|
+| internet for a VM | `internet NAME on` |
+| raising a ceiling, or `vm_create` with `max_memory_gb` above the default | `resources NAME --max-cpus N --max-memory GiB` |
+| downloading an installation image | `image --os OS` |
+| plugging a VM into a network the user created | `net attach VM NET` |
+| `vm_remove`, `snapshot load\|rm` on a sandboxed VM the user created | `rm NAME`, `snapshot NAME load\|rm TAG` |
+
+The server asks through MCP elicitation when the client supports it (a yes/no form); otherwise, or on refusal, the tool fails and names the command. `vm_create` takes only images already in `images/` of the store (never a host path), creates a sandbox by default, and leaves a non-sandboxed VM offline. Every infrastructure call, failures included, is appended to `agent.log` in the store. Verified under WSL: an agent with MCP alone created two sandboxed Tiny Core VMs and a network, configured them, pinged one from the other (0% loss), then removed everything.
+
 ## Keyboard layouts and text
 
 `type` sends key presses in the guest's layout (`--layout us|fr` at creation, stored per VM, changed with `layout NAME us|fr`; the MCP `type` and `key` tools also take an optional `layout`). It must match the layout active in the guest. Characters outside the layout use Ctrl+Shift+U Unicode entry (GTK/Qt apps). Key chords name letters as the guest layout prints them (`ctrl+a` on an AZERTY guest presses the physical Q key).

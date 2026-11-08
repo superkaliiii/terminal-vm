@@ -32,7 +32,7 @@ Virtualization), which is also the default for `up` and `create` without `--os`.
   mcp [NAME]         stdio MCP server
   skills get | skills path | skills install [--dir DIR]
 """
-import argparse, base64, collections, hashlib, json, os, queue, re, secrets, shutil, signal, socket, struct, subprocess, sys, \
+import argparse, base64, collections, contextlib, hashlib, io, json, os, queue, re, secrets, shutil, signal, socket, struct, subprocess, sys, \
     threading, time, urllib.parse, urllib.request
 from xml.sax.saxutils import escape
 
@@ -2088,6 +2088,113 @@ def skills(cmd, dest=None):
     print(json.dumps({"installed": os.path.join(dest, "SKILL.md")}))
 
 
+# ---------- agent authority ----------
+# Through MCP, agents run the lifecycle of sandboxed VMs and of the VMs they created themselves (marked
+# created_by=agent at creation; only the CLI can change that). The user's own VMs stay off-limits. Risky steps need
+# the user's approval: approve(message, cli) asks (MCP elicitation) or raises, naming the CLI command to ask for.
+AGENT_LOG = "agent.log"
+
+
+def agent_owned(name):
+    return load(name).get("created_by") == "agent"
+
+
+def managed(name):
+    m = load(name)
+    if not (m.get("sandbox") or m.get("created_by") == "agent"):
+        raise SystemExit(f"{name} belongs to the user: agents manage only sandboxed VMs and the VMs they created")
+    return m
+
+
+def quiet(f, *a, **k):
+    """Call a CLI function that prints its JSON result (stdout is the MCP channel) and return that result."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        r = f(*a, **k)
+    if r is not None:
+        return r
+    out = buf.getvalue().strip()
+    try:
+        return json.loads(out) if out else {}
+    except ValueError:
+        return json.loads(out.splitlines()[-1])
+
+
+def _net_owned(net):
+    return net_load(net).get("created_by") == "agent"
+
+
+def agent_call(tool, a, approve):
+    vm, net = a.get("vm"), a.get("net")
+    if tool == "vm_list":
+        return [dict(v, managed=v.get("engine") is None and bool(load(v["name"]).get("sandbox") or agent_owned(v["name"])))
+                for v in quiet(ls)]
+    if tool == "vm_create":
+        os_name, sandbox = a.get("os", "linux"), a.get("sandbox", True)
+        if a.get("iso"):  # only images already in the store: never an arbitrary host file as the guest's CD
+            iso = os.path.join(STORE, "images", os.path.basename(a["iso"]))
+            if not os.path.isfile(iso):
+                raise SystemExit(f"no image {os.path.basename(a['iso'])!r} in {os.path.join(STORE, 'images')}")
+        else:
+            iso = default_image(True, os_name)
+            if not os.path.exists(iso):
+                approve(f"Download the {os_name} installation image ({os.path.basename(iso)}, several GB)?",
+                        f"terminal-vm image --os {os_name}")
+                iso = default_image(False, os_name)
+        mem, mm = a.get("memory_gb") or PROFILES.get(os_name, {}).get("memory", 1), a.get("max_memory_gb")
+        if mm and mm > max(2 * mem, mem + 2):  # above create's default ceiling
+            approve(f"Create {vm} with a {mm} GiB memory ceiling?", f"terminal-vm resources {vm} --max-memory {mm}")
+        # A non-sandboxed agent VM starts offline too: internet is the user's call (vm_internet)
+        out = quiet(create, vm, iso, os_name, a.get("cpus"), a.get("memory_gb"), a.get("disk_gb"),
+                    offline=not sandbox, sandbox=sandbox, max_cpus=a.get("max_cpus"), max_memory=mm)
+        m = load(vm); m["created_by"] = "agent"; save(vm, m)
+        return out
+    if tool == "vm_clone":
+        managed(vm)
+        out = quiet(clone, vm, a["new"])
+        m = load(a["new"]); m["created_by"] = "agent"; save(a["new"], m)
+        return out
+    if tool == "net_list":
+        return net_ls()
+    if tool == "net_create":
+        cfg = net_create(net)
+        with open(net_file(net), "w") as f:
+            json.dump(dict(cfg, created_by="agent"), f)
+        return cfg
+    if tool == "net_remove":
+        if not _net_owned(net):
+            raise SystemExit(f"network {net!r} belongs to the user")
+        return net_rm(net)
+    managed(vm)
+    destructive = tool == "vm_remove" or (tool == "vm_snapshot" and a.get("action") in ("load", "rm"))
+    if destructive and not agent_owned(vm):
+        approve(f"{tool} {a.get('action', '')} on {vm}, your own sandboxed VM?",
+                f"terminal-vm rm {vm}" if tool == "vm_remove" else f"terminal-vm snapshot {vm} {a['action']} {a.get('tag')}")
+    if tool == "vm_start":
+        return quiet(start, vm)
+    if tool == "vm_stop":
+        return quiet(stop, vm, bool(a.get("force")), int(a.get("timeout", 60)))
+    if tool == "vm_remove":
+        return quiet(rm, vm)
+    if tool == "vm_snapshot":
+        return quiet(snapshot, vm, a.get("action", "ls"), a.get("tag"))
+    if tool == "vm_resources":
+        mc, mm = a.get("max_cpus"), a.get("max_memory_gb")
+        if mc or mm:
+            approve(f"Raise {vm}'s ceiling to {mc or '-'} CPUs / {mm or '-'} GiB?",
+                    f"terminal-vm resources {vm}" + (f" --max-cpus {mc}" if mc else "") + (f" --max-memory {mm}" if mm else ""))
+        return resources(vm, a.get("cpus"), a.get("memory_gb"), mc, mm)
+    if tool == "vm_internet":
+        if a.get("on"):
+            approve(f"Give {vm} internet access?", f"terminal-vm internet {vm} on")
+        return set_internet(vm, None if a.get("on") is None else "on" if a["on"] else "off")
+    if tool in ("net_attach", "net_detach"):
+        if tool == "net_attach" and not _net_owned(net):
+            approve(f"Plug {vm} into your network {net!r} (it would reach your VMs on it)?", f"terminal-vm net attach {vm} {net}")
+        return net_attach(vm, net, tool == "net_attach")
+    raise SystemExit(f"unknown tool {tool}")
+
+
 # ---------- MCP ----------
 
 def _schema(props, required=()):
@@ -2121,6 +2228,45 @@ TOOLS = [
      _schema({"stable": _N, "timeout": _N})),
 ]
 INPUT_TOOLS = {"click", "move", "drag", "scroll", "type", "key"}
+_VM, _NET = {"vm": {"type": "string"}}, {"net": {"type": "string"}}
+_MANAGED = " Agents manage sandboxed VMs and the VMs they created; the user's other VMs are off-limits."
+AGENT_TOOLS = [
+    ("vm_list", "Every VM with its state; managed=true marks the ones this agent may run." + _MANAGED, _schema({})),
+    ("vm_create", "Create a VM, sandboxed by default (no network, disk reset at each stop). It installs at first "
+                  "start. iso: an image already in the store; without it, the default image for os (a download "
+                  "needs the user's approval). Non-sandboxed VMs start offline (vm_internet). The quota counts a "
+                  "running VM's memory ceiling (default: twice memory_gb, at least +2): set max_memory_gb = "
+                  "memory_gb to fit more small VMs.",
+     _schema({**_VM, "os": {"type": "string", "enum": sorted(PROFILES)}, "cpus": {"type": "integer", "minimum": 1},
+              "max_cpus": {"type": "integer", "minimum": 1}, "max_memory_gb": {"type": "integer", "minimum": 1},
+              "memory_gb": {"type": "integer", "minimum": 1}, "disk_gb": {"type": "integer", "minimum": 4},
+              "sandbox": {"type": "boolean"}, "iso": {"type": "string"}}, ["vm"])),
+    ("vm_clone", "Copy-on-write clone of a stopped managed VM (the source then stays read-only while clones exist).",
+     _schema({**_VM, "new": {"type": "string"}}, ["vm", "new"])),
+    ("vm_start", "Start a managed VM, within the host quota." + _MANAGED, _schema(_VM, ["vm"])),
+    ("vm_stop", "Shut a managed VM down (force: power off at once).",
+     _schema({**_VM, "force": {"type": "boolean"}, "timeout": {"type": "integer"}}, ["vm"])),
+    ("vm_remove", "Delete a stopped managed VM and its disk.", _schema(_VM, ["vm"])),
+    ("vm_snapshot", "Snapshots of a managed VM: save, load, rm or ls (tag needed except for ls).",
+     _schema({**_VM, "action": {"type": "string", "enum": ["save", "load", "rm", "ls"]}, "tag": {"type": "string"}},
+             ["vm", "action"])),
+    ("vm_resources", "Show or change a managed VM's CPUs and memory within its ceiling; raising the ceiling "
+                     "(max_cpus, max_memory_gb, stopped VM) needs the user's approval.",
+     _schema({**_VM, "cpus": {"type": "integer", "minimum": 1}, "memory_gb": {"type": "integer", "minimum": 1},
+              "max_cpus": {"type": "integer"}, "max_memory_gb": {"type": "integer"}}, ["vm"])),
+    ("vm_internet", "Show (without on) or change a stopped managed VM's internet access; turning it on needs the "
+                    "user's approval.", _schema({**_VM, "on": {"type": "boolean"}}, ["vm"])),
+    ("net_list", "Isolated networks and their VMs (MAC, suggested static address).", _schema({})),
+    ("net_create", "Create an isolated VM-to-VM network (no LAN, no internet, no DHCP).", _schema(_NET, ["net"])),
+    ("net_remove", "Remove an empty network this agent created.", _schema(_NET, ["net"])),
+    ("net_attach", "Plug a stopped managed VM into a network; set the suggested address in the guest. A network "
+                   "the user created needs their approval.", _schema({**_VM, **_NET}, ["vm", "net"])),
+    ("net_detach", "Unplug a stopped managed VM from a network.", _schema({**_VM, **_NET}, ["vm", "net"])),
+]
+AGENT_NAMES = {n for n, _, _ in AGENT_TOOLS}
+_OTHER = {"vm": {"type": "string", "description": "Another VM this agent manages (default: this server's VM)"}}
+SCREEN_TOOLS = [(n, d, s if n in ("top", "quota") else dict(s, properties={**s["properties"], **_OTHER}))
+                for n, d, s in TOOLS]
 
 
 def image(data):
@@ -2128,56 +2274,95 @@ def image(data):
 
 
 def mcp(name):
-    agent = None  # whether qemu-guest-agent answered once; unknown until asked
-    journal = os.path.join(vm_dir(name), "actions.log") if load(name).get("sandbox") else None
+    agents = {}  # per VM: whether qemu-guest-agent answered once; unknown until asked
+    can_ask, pending, asks = False, collections.deque(), iter(range(1, 1 << 30))
 
-    def record(tool, a, error=None):  # sandbox: every agent action, for review
-        if journal:
-            with open(journal, "a", encoding="utf-8") as f:
+    def record(tool, a, vm, error=None):  # sandbox screen actions, and every infrastructure action, for review
+        try:
+            journal = os.path.join(vm_dir(vm), "actions.log") if load(vm).get("sandbox") else None
+        except SystemExit:  # no such VM
+            journal = None
+        path = os.path.join(STORE, AGENT_LOG) if tool in AGENT_NAMES else journal
+        if path:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps({"time": time.strftime("%Y-%m-%dT%H:%M:%S"), "tool": tool, "arguments": a,
                                     **({"error": error} if error else {})}) + "\n")
 
     def send(msg):
         sys.stdout.write(json.dumps(msg) + "\n"); sys.stdout.flush()
 
-    for line in sys.stdin:
+    def approve(message, cli):
+        """Ask the user through the client (MCP elicitation); raise unless they accept."""
+        if not can_ask:
+            raise RuntimeError("This needs the user's approval and this client cannot ask them. "
+                               f"Ask the user to run: {cli}")
+        aid = f"ask-{next(asks)}"
+        send({"jsonrpc": "2.0", "id": aid, "method": "elicitation/create", "params": {
+            "message": message, "requestedSchema": {"type": "object", "properties": {
+                "approve": {"type": "boolean", "title": "Approve", "description": message}}, "required": ["approve"]}}})
+        while True:
+            line = sys.stdin.readline()
+            if not line:
+                raise RuntimeError("the client closed the connection before the user answered")
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if msg.get("id") != aid or "method" in msg:
+                pending.append(line)  # other messages wait until the user has answered
+                continue
+            r = msg.get("result") or {}
+            if r.get("action") == "accept" and (r.get("content") or {}).get("approve"):
+                return
+            raise RuntimeError(f"The user did not approve. They can still run: {cli}")
+
+    while True:
+        line = pending.popleft() if pending else sys.stdin.readline()
+        if not line:
+            break
         try:
             req = json.loads(line)
         except ValueError:
             continue
         rid, method = req.get("id"), req.get("method")
-        if rid is None:
-            continue  # notification
+        if rid is None or method is None:
+            continue  # notification, or a stray response
         if method == "initialize":
+            can_ask = "elicitation" in (req.get("params", {}).get("capabilities") or {})
             send({"jsonrpc": "2.0", "id": rid, "result": {
                 "protocolVersion": req.get("params", {}).get("protocolVersion", "2025-06-18"),
                 "capabilities": {"tools": {}}, "serverInfo": {"name": "terminal-vm", "version": VERSION}}})
         elif method == "tools/list":
             send({"jsonrpc": "2.0", "id": rid, "result": {"tools": [
-                {"name": n, "description": d, "inputSchema": s} for n, d, s in TOOLS]}})
+                {"name": n, "description": d, "inputSchema": s} for n, d, s in SCREEN_TOOLS + AGENT_TOOLS]}})
         elif method == "tools/call":
             p = req.get("params", {})
-            tool, a = p.get("name"), p.get("arguments") or {}
+            tool, a = p.get("name"), dict(p.get("arguments") or {})
+            vm = name if tool in AGENT_NAMES else a.pop("vm", None) or name
             try:
-                if tool in INPUT_TOOLS and agent is not False:
-                    users = guest_users(name)
-                    agent = users is not None
+                if vm != name:  # screen tools on another VM: only one this agent manages
+                    managed(vm)
+                if tool in INPUT_TOOLS and agents.get(vm) is not False:
+                    users = guest_users(vm)
+                    agents[vm] = users is not None
                     if users == []:
                         raise RuntimeError("The guest has no logged-in session (login screen). Ask the user to sign in: "
-                                           f"terminal-vm view {name}")
+                                           f"terminal-vm view {vm}")
                 # resources opens its own QMP session (QEMU takes one client at a time), so not through act()
-                out = (resources(name, a.get("cpus"), a.get("memory_gb")) if tool == "resources" else
-                       quota() if tool == "quota" else top() if tool == "top" else act(name, tool, a))
-                record(tool, a)
+                out = (agent_call(tool, a, approve) if tool in AGENT_NAMES else
+                       resources(vm, a.get("cpus"), a.get("memory_gb")) if tool == "resources" else
+                       quota() if tool == "quota" else top() if tool == "top" else act(vm, tool, a))
+                record(tool, a, vm)
                 if tool == "screenshot":
                     content = [image(out[0])]
                 else:
                     content = [{"type": "text", "text": json.dumps(out)}]
                     if a.get("screenshot") or tool == "wait":
-                        time.sleep(0.3); content.append(image(screenshot(name)[0]))
+                        time.sleep(0.3); content.append(image(screenshot(vm)[0]))
                 send({"jsonrpc": "2.0", "id": rid, "result": {"content": content}})
-            except Exception as e:  # report tool failures to the agent instead of dying
-                record(tool, a, str(e))
+            except (Exception, SystemExit) as e:  # report tool failures to the agent instead of dying
+                record(tool, a, vm, str(e))
                 send({"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": str(e)}], "isError": True}})
         elif method == "ping":
             send({"jsonrpc": "2.0", "id": rid, "result": {}})

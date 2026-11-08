@@ -684,6 +684,78 @@ class StoppedVm(unittest.TestCase):
         self.assertEqual((entry["tool"], entry["arguments"]), ("click", {"x": 5, "y": 6}))
         self.assertIn("error", entry)
 
+    def test_agent_authority(self):
+        """Agents run sandboxed VMs and their own; the user's VMs are off-limits; risky steps ask the user."""
+        asked = []
+        def yes(msg, cli): asked.append(cli)
+        def no(msg, cli): raise RuntimeError("declined: " + cli)
+        with self.assertRaises(SystemExit):
+            tl.agent_call("vm_start", {"vm": "v"}, yes)                       # the user's VM
+        with self.assertRaises(SystemExit):
+            tl.agent_call("vm_create", {"vm": "x", "iso": "../../etc/passwd"}, yes)   # store images only
+        m = tl.load("v"); m["sandbox"] = True; tl.save("v", m)               # a sandbox the user made
+        self.assertTrue(tl.agent_call("vm_list", {}, yes)[0]["managed"])
+        with self.assertRaises(RuntimeError):
+            tl.agent_call("vm_internet", {"vm": "v", "on": True}, no)
+        self.assertFalse(tl.load("v").get("internet"))
+        self.assertTrue(tl.agent_call("vm_internet", {"vm": "v", "on": True}, yes)["internet"])
+        self.assertEqual(asked, ["terminal-vm internet v on"])
+        tl.net_create("mine")
+        tl.agent_call("net_create", {"net": "lab"}, yes)
+        tl.agent_call("net_attach", {"vm": "v", "net": "lab"}, no)            # the agent's network: no question
+        with self.assertRaises(RuntimeError):
+            tl.agent_call("net_attach", {"vm": "v", "net": "mine"}, no)       # the user's network
+        with self.assertRaises(SystemExit):
+            tl.agent_call("net_remove", {"net": "mine"}, yes)
+        tl.agent_call("net_detach", {"vm": "v", "net": "lab"}, no)
+        tl.agent_call("net_remove", {"net": "lab"}, no)
+        with self.assertRaises(RuntimeError):
+            tl.agent_call("vm_remove", {"vm": "v"}, no)                       # the user's sandbox: ask first
+        self.assertTrue(os.path.exists(self.d))
+        m = tl.load("v"); m.pop("sandbox"); m["created_by"] = "agent"; tl.save("v", m)
+        tl.agent_call("vm_remove", {"vm": "v"}, no)                           # its own VM: no question
+        self.assertFalse(os.path.exists(self.d))
+
+    def test_mcp_elicitation(self):
+        """A risky tool asks the user through the client and runs only once they accept."""
+        m = tl.load("v"); m["created_by"] = "agent"; tl.save("v", m)
+        lines = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {"elicitation": {}}}},
+                 {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                  "params": {"name": "vm_internet", "arguments": {"vm": "v", "on": True}}},
+                 {"jsonrpc": "2.0", "id": 3, "method": "ping"},                # arrives while the user decides
+                 {"jsonrpc": "2.0", "id": "ask-1", "result": {"action": "accept", "content": {"approve": True}}}]
+        old = sys.stdin
+        sys.stdin = io.StringIO("".join(json.dumps(x) + "\n" for x in lines))
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                tl.mcp("v")
+        finally:
+            sys.stdin = old
+        msgs = [json.loads(x) for x in out.getvalue().splitlines()]
+        self.assertEqual(msgs[1]["method"], "elicitation/create")
+        self.assertEqual(json.loads(msgs[2]["result"]["content"][0]["text"]), {"vm": "v", "internet": True})
+        self.assertEqual(msgs[3]["id"], 3)                                   # the queued ping is answered after
+        with open(os.path.join(self.tmp, "agent.log"), encoding="utf-8") as f:
+            self.assertEqual(json.loads(f.readline())["tool"], "vm_internet")
+        os.makedirs(os.path.join(self.tmp, "u")); tl.save("u", {"cpus": 1})  # the user's VM
+        sys.stdin = io.StringIO(json.dumps({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {
+            "name": "screenshot", "arguments": {"vm": "u"}}}) + "\n")
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                tl.mcp("v")
+        finally:
+            sys.stdin = old
+        self.assertIn("belongs to the user", out.getvalue())                 # screen tools too
+        sys.stdin = io.StringIO(json.dumps(lines[1]) + "\n")                # a client that cannot ask: refused
+        m = tl.load("v"); m["offline"] = True; tl.save("v", m)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                tl.mcp("v")
+        finally:
+            sys.stdin = old
+        self.assertIn("terminal-vm internet v on", out.getvalue())
+        self.assertTrue(tl.load("v")["offline"])
+
     def test_install_cache_until_installed(self):
         m = {"os": "win2025", "iso": "/x.iso", "memory_mb": 2048, "cpus": 2}
         os.makedirs(os.path.join(self.d, "answers"))
