@@ -624,6 +624,9 @@ def accelerators():
     return (["-accel", "kvm"], "host") if os.access("/dev/kvm", os.R_OK | os.W_OK) else (["-accel", "tcg"], "max")
 
 
+HV_FLAGS = ",hv_relaxed,hv_vapic,hv_spinlocks=0x1fff,hv_vpindex,hv_runtime,hv_time,hv_synic,hv_stimer,hv_frequencies"
+
+
 def installing(d, m):
     """Windows answers present and no clean shutdown yet (the first one marks the VM installed)."""
     return os.path.isdir(os.path.join(d, "answers")) and not m.get("installed")
@@ -634,6 +637,8 @@ def qemu_args(name, m, window, vnc_port=None):
     vnc_port: Windows hosts, VNC on localhost TCP with a password (set over QMP after start)."""
     d, p = vm_dir(name), PROFILES[m.get("os", "linux")]
     accel, cpu = accelerators()
+    if p["family"] == "windows" and cpu == "host":  # KVM: Hyper-V enlightenments (timers, APIC, spinlocks) for Windows
+        cpu += HV_FLAGS
     cpu = p.get("cpu", cpu)
     ep = lambda k: f"unix:{os.path.join(d, k + '.sock')}"
     w, h = m.get("width", 1280), m.get("height", 800)
@@ -776,6 +781,9 @@ def _start(name, window=False):
     for k in ("qmp", "qmp-view", "qga", "vnc"):  # stale sockets from a crashed VM
         if os.path.exists(os.path.join(d, k + ".sock")):
             os.unlink(os.path.join(d, k + ".sock"))
+    for f in os.listdir(d):  # raw frames left by viewers that were killed (2-10 MB each)
+        if f.startswith("view") and f.endswith(".ppm"):
+            os.remove(os.path.join(d, f))
     log = open(os.path.join(d, "qemu.log"), "ab")
     detach = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS} if WINDOWS
               else {"start_new_session": True})

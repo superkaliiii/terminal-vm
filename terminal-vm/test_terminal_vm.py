@@ -290,6 +290,18 @@ class WindowsGuests(unittest.TestCase):
         lin = self.args("linux")
         self.assertIn("if=virtio", lin); self.assertNotIn("answers", lin)
 
+    def test_hyperv_enlightenments_on_kvm_only(self):
+        old = tl.accelerators
+        try:
+            tl.accelerators = lambda: (["-accel", "kvm"], "host")
+            self.assertIn("-cpu host,hv_relaxed,", self.args("win2025"))
+            self.assertNotIn("hv_", self.args("linux"))
+            self.assertIn("-cpu qemu64 ", self.args("winxp"))   # XP keeps its generic CPU
+            tl.accelerators = lambda: (["-accel", "whpx"], "max")
+            self.assertNotIn("hv_", self.args("win2025"))       # KVM-only flags
+        finally:
+            tl.accelerators = old
+
     def test_free_ports_distinct(self):
         self.assertEqual(len(set(tl.free_ports(4))), 4)
 
