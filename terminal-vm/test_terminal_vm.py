@@ -369,6 +369,38 @@ class WindowsGuests(unittest.TestCase):
             xml = f.read()
         self.assertLess(xml.index("virtio-win-guest-tools.exe /install /quiet"), xml.index("shutdown /r"))
 
+    def test_reset_rewrites_stale_answers(self):
+        """A VM made by an older version reinstalls with today's answers, same account, language and key."""
+        def run(cmd, *a, **k):
+            if "create" in cmd:
+                open(cmd[-2], "w").close()
+            return type("R", (), {"stdout": '{"virtual-size": 1}', "returncode": 0})()
+        old = (tl.subprocess.run, tl.qemu_bin, tl.guest_tools, tl.state)
+        tools = os.path.join(self.tmp, "tools.exe")
+        with open(tools, "wb") as f: f.write(b"MZ fake")
+        tl.subprocess.run, tl.qemu_bin, tl.guest_tools, tl.state = run, (lambda t: t), (lambda: tools), (lambda n: "stopped")
+        iso = os.path.join(self.tmp, "w.iso"); open(iso, "w").close()
+        with open(os.path.join(self.tmp, "quota.json"), "w") as f:
+            json.dump({"disk_gb": 1000, "memory_gb": 64, "cpus": 64}, f)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                tl.create("w", iso, os_name="win11", layout="fr", ui_language="fr-FR", product_key="AAAAA-BBBBB-CCCCC-DDDDD-EEEEE")
+                ans = os.path.join(self.tmp, "w", "answers")
+                os.remove(os.path.join(ans, "virtio-win-guest-tools.exe"))
+                with open(os.path.join(ans, "autounattend.xml"), "w") as f:  # as written before the guest tools existed
+                    f.write("<UILanguage>fr-FR</UILanguage><ProductKey><Key>AAAAA-BBBBB-CCCCC-DDDDD-EEEEE</Key>")
+                pw = tl.load("w")["password"]
+                tl.reset("w")
+        finally:
+            tl.subprocess.run, tl.qemu_bin, tl.guest_tools, tl.state = old
+        with open(os.path.join(ans, "autounattend.xml"), encoding="utf-8") as f:
+            xml = f.read()
+        self.assertIn("virtio-win-guest-tools.exe /install", xml)
+        self.assertIn("<UILanguage>fr-FR</UILanguage>", xml)
+        self.assertIn("AAAAA-BBBBB-CCCCC-DDDDD-EEEEE", xml)
+        self.assertIn(pw, xml)
+        self.assertTrue(os.path.isfile(os.path.join(ans, "virtio-win-guest-tools.exe")))
+
     def test_download_checks(self):
         """Downloads are kept only over HTTPS and with the pinned SHA-256."""
         class Resp(io.BytesIO):

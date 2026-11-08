@@ -726,25 +726,31 @@ def create(name, iso, os_name="linux", cpus=None, memory=None, disk=None, width=
         # (an unmet policy would stop the unattended install at a password prompt).
         m.update(user="Administrator" if p["unattend"] == "sif" else "user",
                  password=secrets.token_urlsafe(6) + "-Aa1")
-        os.makedirs(os.path.join(d, "answers"), exist_ok=True)
-        if p["unattend"] == "sif":
-            content, filename = winnt_sif(layout, m["password"], key), "winnt.sif"
-        else:
-            if not re.fullmatch(r"[a-z]{2,3}-[A-Z]{2}", ui_language or ""):
-                raise SystemExit("--ui-language must look like en-US or fr-FR (the language of the ISO)")
-            content, filename = autounattend(p, layout, m["user"], m["password"], key, ui_language), "autounattend.xml"
-        with open(os.path.join(d, "answers", filename), "w", encoding="utf-8", newline="") as f:
-            f.write(content)
-        tools = guest_tools() if os_name in GUEST_TOOLS_OS else None
-        if tools:  # installed at first logon from the answers drive (autounattend: GUEST_TOOLS_CMD)
-            shutil.copyfile(tools, os.path.join(d, "answers", "virtio-win-guest-tools.exe"))
-            m["balloon"] = True  # the tools include the balloon driver
+        write_answers(d, m, key, ui_language)
     with open(os.path.join(d, "machine.json"), "w") as f:
         json.dump(m, f)
     out = {"created": name, "os": os_name, "path": d}
     if p["family"] == "windows":
         out.update(user=m["user"], password=m["password"], note="Windows installs unattended on first start (10-40 min)")
     print(json.dumps(out))
+
+
+def write_answers(d, m, key, ui_language):
+    """The answers drive of a Windows VM (answer file, guest tools), from machine.json's os, layout, user, password."""
+    p = PROFILES[m["os"]]
+    os.makedirs(os.path.join(d, "answers"), exist_ok=True)
+    if p["unattend"] == "sif":
+        content, filename = winnt_sif(m["layout"], m["password"], key), "winnt.sif"
+    else:
+        if not re.fullmatch(r"[a-z]{2,3}-[A-Z]{2}", ui_language or ""):
+            raise SystemExit("--ui-language must look like en-US or fr-FR (the language of the ISO)")
+        content, filename = autounattend(p, m["layout"], m["user"], m["password"], key, ui_language), "autounattend.xml"
+    with open(os.path.join(d, "answers", filename), "w", encoding="utf-8", newline="") as f:
+        f.write(content)
+    tools = guest_tools() if m["os"] in GUEST_TOOLS_OS else None
+    if tools:  # installed at first logon from the answers drive (autounattend: GUEST_TOOLS_CMD)
+        shutil.copyfile(tools, os.path.join(d, "answers", "virtio-win-guest-tools.exe"))
+        m["balloon"] = True  # the tools include the balloon driver
 
 
 def start(name, window=False):
@@ -1269,7 +1275,7 @@ def rm(name):
 
 
 def reset(name):
-    """Blank disk of the same size, so the next start installs again (Windows answers and password kept).
+    """Blank disk of the same size, so the next start installs again (Windows answers rewritten, account kept).
     Deletes the disk's snapshots too."""
     _stopped(name)
     _no_clones(name, "reset")
@@ -1279,8 +1285,17 @@ def reset(name):
                    check=True, stdout=subprocess.DEVNULL)
     os.replace(disk + ".new", disk)  # the old disk survives a failed create
     m = load(name)
-    if m.pop("installed", None):
-        save(name, m)
+    m.pop("installed", None)
+    answers = os.path.join(vm_dir(name), "answers")
+    if PROFILES[m.get("os", "linux")]["family"] == "windows" and os.path.isdir(answers):
+        # rewrite the answers with this version (fixes and guest tools added since creation), same
+        # account, ISO language and key: those two are read back from the previous answer file
+        old = "".join(open(os.path.join(answers, f), encoding="utf-8").read() for f in os.listdir(answers)
+                      if f in ("autounattend.xml", "winnt.sif"))
+        ui = re.search(r"<UILanguage>([^<]+)</UILanguage>", old)
+        key = re.search(r"<ProductKey><Key>([^<]+)</Key>|^ProductKey=(\S+)", old, re.M)
+        write_answers(vm_dir(name), m, key and (key.group(1) or key.group(2)), ui.group(1) if ui else "en-US")
+    save(name, m)
     print(json.dumps({"reset": name}))
 
 
