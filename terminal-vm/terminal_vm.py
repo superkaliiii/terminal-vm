@@ -248,6 +248,58 @@ def _kv(text):
     return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
 
 
+def guest_ps(name, script, timeout=120):
+    """Run a PowerShell script in a Windows guest through qemu-guest-agent (as SYSTEM): (exit code, output)."""
+    g = QGA(name, timeout=5)
+    try:
+        enc = base64.b64encode(script.encode("utf-16-le")).decode()
+        pid = g.call("guest-exec", path="powershell.exe", arg=["-NoProfile", "-NonInteractive", "-EncodedCommand", enc],
+                     **{"capture-output": True})["pid"]
+        end = time.time() + timeout
+        while time.time() < end:
+            st = g.call("guest-exec-status", pid=pid)
+            if st.get("exited"):
+                return st.get("exitcode", 1), base64.b64decode(st.get("out-data", "")).decode("utf-8", "replace")
+            time.sleep(0.5)
+        raise OSError("guest command timed out")
+    finally:
+        g.sock.close()
+
+
+# Rename a Windows clone without rebooting it (tested on Server 2025): the registry names (hostname, DNS, .NET read
+# them live), WMI restarted (it caches the name), NetBIOS turned off (its driver keeps the boot-time name, which
+# would clash with the source's on a shared network; names still resolve through DNS/LLMNR), then the user's session
+# logged off: auto-logon brings it back (~20 s) with the new %COMPUTERNAME%.
+RENAME_PS = r"""$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; $n='{name}'
+$k='HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName'; $t='HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'
+Set-ItemProperty "$k\ComputerName" ComputerName $n; Set-ItemProperty "$k\ActiveComputerName" ComputerName $n
+Set-ItemProperty $t Hostname $n; Set-ItemProperty $t 'NV Hostname' $n
+Restart-Service winmgmt -Force
+Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=true' |
+  % {{ Invoke-CimMethod -InputObject $_ -MethodName SetTcpipNetbios -Arguments @{{TcpipNetbiosOptions=[uint32]2}} | Out-Null }}
+Get-Process explorer -ErrorAction SilentlyContinue | Select-Object -First 1 | % {{ logoff $_.SessionId }}
+"""
+
+
+def computer_name(vm):
+    """A valid Windows computer name from a VM name: 15 characters, letters, digits and hyphens, not all digits."""
+    n = re.sub(r"[^A-Za-z0-9-]", "-", vm)[:15].strip("-").upper()
+    return n if n and not n.isdigit() else ("VM-" + n)[:15].strip("-")
+
+
+def rename_guest(name, wait=600):
+    """Started by start for a Windows clone: once the guest agent answers, give the guest its own name."""
+    end = time.time() + wait
+    while time.time() < end and state(name) != "stopped":
+        try:
+            code, out = guest_ps(name, RENAME_PS.format(name=load(name)["rename"]))
+        except OSError:  # agent not up yet
+            time.sleep(3); continue
+        if code == 0:
+            m = load(name); m.pop("rename", None); save(name, m)
+        return
+
+
 def guest_users(name):
     """Users of the active graphical session: [user], [] at a login screen, None when unknown.
     Reads systemd-logind's seat/session state through qemu-guest-agent (read-only, nothing executed).
@@ -406,6 +458,28 @@ def wheel(q, up, notches=1):
     for _ in range(notches):  # press+release in one batch: split batches are dropped by the guest
         q.cmd("input-send-event", events=[{"type": "btn", "data": {"down": d, "button": "wheel-up" if up else "wheel-down"}}
                                           for d in (True, False)])
+
+
+def shot_pixels(name):
+    q = qmp(name)
+    try:
+        return screen_pixels(name, q)[0]
+    finally:
+        q.close()
+
+
+def settled_screenshot(name, before=None, timeout=1.5):
+    """PNG after an action: once the screen differs from `before` (a loaded guest shows keystrokes late),
+    at most `timeout` s, then 0.3 s for the redraw to finish."""
+    q = qmp(name)
+    try:
+        end = time.time() + timeout
+        while before is not None and time.time() < end and screen_pixels(name, q)[0] == before:
+            time.sleep(0.1)
+        time.sleep(0.3)
+        return screenshot(name, q)[0]
+    finally:
+        q.close()
 
 
 def act(name, tool, a):
@@ -574,7 +648,10 @@ def autounattend(p, layout, user, password, key, ui="en-US"):
     machine = "".join(f'<RunSynchronousCommand wcm:action="add"><Order>{i}</Order><Path>{c}</Path></RunSynchronousCommand>'
                       for i, c in enumerate(('powercfg /change monitor-timeout-ac 0',
                                             'powercfg /change standby-timeout-ac 0',
-                                            'powercfg /setacvalueindex SCHEME_CURRENT SUB_NONE CONSOLELOCK 0'), 1))
+                                            'powercfg /setacvalueindex SCHEME_CURRENT SUB_NONE CONSOLELOCK 0',
+                                            # Server Manager opened full screen at every logon, over the desktop
+                                            'reg add HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\Server\\ServerManager '
+                                            '/v DoNotOpenAtLogon /t REG_DWORD /d 1 /f'), 1))
     # EnableHexNumpad is read at logon: set it in the first session, then log off so the session the agent gets
     # (auto-logon again, forced) has it. A reboot did the same but cost 8 min of servicing ("Updates are underway"). Writing it to the Default profile in specialize was tried and did not reach the user.
     # DisableLockWorkstation: a locked session ignores the ACPI power button (stop would hang), so Win+L and the
@@ -595,7 +672,7 @@ def autounattend(p, layout, user, password, key, ui="en-US"):
             '<settings pass="windowsPE">' + comp("Microsoft-Windows-International-Core-WinPE",
                                                  f"<SetupUILanguage><UILanguage>{escape(ui)}</UILanguage></SetupUILanguage>" + intl())
             + comp("Microsoft-Windows-Setup", setup) + '</settings>'
-            '<settings pass="specialize">' + comp(shell, "<ComputerName>*</ComputerName>")
+            '<settings pass="specialize">' + comp(shell, f"<ComputerName>*</ComputerName><TimeZone>{escape(host_timezone())}</TimeZone>")
             + comp("Microsoft-Windows-Deployment", f"<RunSynchronous>{machine}</RunSynchronous>") + '</settings>'
             '<settings pass="oobeSystem">' + comp("Microsoft-Windows-International-Core", intl())
             # AdministratorPassword: Server OOBE otherwise stops on the built-in Administrator's password page
@@ -604,6 +681,17 @@ def autounattend(p, layout, user, password, key, ui="en-US"):
                           f'<Group>Administrators</Group></LocalAccount></LocalAccounts></UserAccounts>'
                           f'<AutoLogon>{pw}<Enabled>true</Enabled><LogonCount>9999</LogonCount><Username>{escape(user)}</Username></AutoLogon>'
                           + oobe + first) + '</settings></unattend>\n')
+
+
+def host_timezone():
+    """The host's Windows time zone ID (tzutil, also reachable from WSL), so the guest's clock matches.
+    shortcut: other Linux hosts get UTC (no IANA to Windows table); with -rtc base=localtime the clock still shows host time."""
+    try:
+        tz = subprocess.run(["tzutil" if WINDOWS else "/mnt/c/Windows/System32/tzutil.exe", "/g"],
+                            capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:  # best effort: any failure means UTC
+        tz = ""
+    return tz if re.fullmatch(r"[\w .+()-]{1,64}", tz or "") else "UTC"
 
 
 def winnt_sif(layout, password, key):
@@ -661,6 +749,7 @@ def qemu_args(name, m, window, vnc_port=None):
     smp = f"{m['cpus']},maxcpus={max(max_cpus, m['cpus'])}" if hot_cpus(m) else str(run_cpus(name, m))
     args = ["-name", name, *accel, "-cpu", cpu, "-machine", p["machine"], "-m", str(ram), "-smp", smp,
             *(["-device", "virtio-balloon-pci,free-page-reporting=on"] if m.get("balloon") else []),
+            *(["-rtc", "base=localtime"] if m.get("rtc_local") else []),  # Windows reads the RTC as local time
             # QEMU locks the image: one VM per disk. During an unattended install, ignore guest flushes (much faster):
             # a host crash then loses the install, never a finished VM.
             "-drive", f"file={os.path.join(d, 'disk.qcow2')},if={p['disk_bus']}" + (",cache=unsafe" if setup else "")
@@ -760,6 +849,9 @@ def write_answers(d, m, key, ui_language):
         content, filename = autounattend(p, m["layout"], m["user"], m["password"], key, ui_language), "autounattend.xml"
     with open(os.path.join(d, "answers", filename), "w", encoding="utf-8", newline="") as f:
         f.write(content)
+    # host time zone in the answers, local-time RTC: only for installs from these answers (an older VM's clock
+    # was set for a UTC RTC)
+    m["rtc_local"] = True
     tools = guest_tools() if m["os"] in GUEST_TOOLS_OS else None
     if tools:  # installed at first logon from the answers drive (autounattend: GUEST_TOOLS_CMD)
         shutil.copyfile(tools, os.path.join(d, "answers", "virtio-win-guest-tools.exe"))
@@ -802,6 +894,9 @@ def _start(name, window=False):
     log = open(os.path.join(d, "qemu.log"), "ab")
     detach = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS} if WINDOWS
               else {"start_new_session": True})
+    if m.get("rename"):  # a Windows clone's first run: its own computer name (it was the source's)
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "_rename", name], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=log, **detach)
     for net in m.get("networks", {}):  # a second switch for the same network exits at once
         subprocess.Popen([sys.executable, os.path.abspath(__file__), "_switch", net], stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=log, **detach)
@@ -1335,7 +1430,11 @@ def clone(src, new):
         raise
     os.chmod(base, 0o444)  # QEMU only reads it; nothing should write it while overlays exist
     m.update(base=src, installed=True)  # no answers drive in the clone: it boots the installed disk
+    if os.path.isdir(os.path.join(vm_dir(src), "answers")):  # but reset reinstalls unattended, as for SRC
+        shutil.copytree(os.path.join(vm_dir(src), "answers"), os.path.join(d, "answers"))
     m.pop("networks", None)  # each NIC's MAC is per VM: attach the clone again
+    if m.get("os") in GUEST_TOOLS_OS and not m.get("sandbox"):  # renamed at its first start (sandbox: no agent)
+        m["rename"] = computer_name(new)
     save(new, m)
     print(json.dumps({"cloned": src, "to": new}))
 
@@ -2458,6 +2557,8 @@ def mcp(name):
                     if users == []:
                         raise RuntimeError("The guest has no logged-in session (login screen). Ask the user to sign in: "
                                            f"terminal-vm view {vm}")
+                # the screen before input, to return the screen after its effect rather than a fixed delay later
+                before = shot_pixels(vm) if a.get("screenshot") and tool in INPUT_TOOLS else None
                 # resources opens its own QMP session (QEMU takes one client at a time), so not through act()
                 out = (agent_call(tool, a, approve) if tool in AGENT_NAMES else
                        resources(vm, a.get("cpus"), a.get("memory_gb")) if tool == "resources" else
@@ -2468,7 +2569,7 @@ def mcp(name):
                 else:
                     content = [{"type": "text", "text": json.dumps(out)}]
                     if a.get("screenshot") or tool == "wait":
-                        time.sleep(0.3); content.append(image(screenshot(vm)[0]))
+                        content.append(image(settled_screenshot(vm, before)))
                 send({"jsonrpc": "2.0", "id": rid, "result": {"content": content}})
             except (Exception, SystemExit) as e:  # report tool failures to the agent instead of dying
                 record(tool, a, vm, str(e))
@@ -2484,6 +2585,8 @@ def mcp(name):
 def main(argv=None):
     if (sys.argv[1:] if argv is None else argv)[:1] == ["_switch"]:  # internal: started by start for its networks
         return net_switch((sys.argv[2:] if argv is None else argv[1:])[0])
+    if (sys.argv[1:] if argv is None else argv)[:1] == ["_rename"]:  # internal: started by start for a Windows clone
+        return rename_guest((sys.argv[2:] if argv is None else argv[1:])[0])
     mac_args = macos_handoff(sys.argv[1:] if argv is None else argv)
     if mac_args is not None:
         sys.exit(run_mac(mac_args))

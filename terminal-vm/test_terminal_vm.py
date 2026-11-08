@@ -1,4 +1,4 @@
-import contextlib, io, json, os, re, socket, struct, sys, tempfile, threading, unittest, zlib
+import contextlib, io, json, os, re, socket, struct, sys, tempfile, threading, time, unittest, zlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import terminal_vm as tl
 
@@ -381,13 +381,18 @@ class WindowsGuests(unittest.TestCase):
             m = json.load(f)
         self.assertEqual((m["os"], m["memory_mb"], m["user"]), ("win11", 4096, "user"))
         self.assertTrue(m["password"].endswith("-Aa1") and len(m["password"]) == 12)
-        self.assertIn("64G", calls[-1][0])
+        self.assertIn("64G", next(c[0] for c in calls if "create" in c[0]))
         self.assertTrue(os.path.isfile(os.path.join(self.tmp, "w11", "answers", "autounattend.xml")))
         with open(os.path.join(self.tmp, "w11", "answers", "virtio-win-guest-tools.exe"), "rb") as f:
             self.assertEqual(f.read(), b"MZ fake")   # the guest agent's installer rides on the answers drive
         with open(os.path.join(self.tmp, "w11", "answers", "autounattend.xml"), encoding="utf-8") as f:
             xml = f.read()
         self.assertLess(xml.index("virtio-win-guest-tools.exe /install /quiet"), xml.index("shutdown /l"))
+        self.assertIn("<TimeZone>UTC</TimeZone>", xml)  # tzutil faked: no answer, so UTC
+        self.assertTrue(m["rtc_local"])  # installs from these answers: local-time RTC
+        self.assertIn("-rtc base=localtime", " ".join(tl.qemu_args("w11", m, False)))
+        self.assertNotIn("-rtc", " ".join(tl.qemu_args("w11", dict(m, rtc_local=False), False)))  # older VMs keep UTC
+        self.assertIn("ServerManager /v DoNotOpenAtLogon", xml)
 
     def test_reset_rewrites_stale_answers(self):
         """A VM made by an older version reinstalls with today's answers, same account, language and key."""
@@ -550,7 +555,9 @@ class StoppedVm(unittest.TestCase):
         with self.assertRaises(SystemExit):  # snapshots would be stranded in the base
             tl.clone("v", "c")
         self.snaps = []
+        os.makedirs(os.path.join(self.d, "answers"))
         self.quiet(tl.clone, "v", "c")
+        self.assertTrue(os.path.isdir(os.path.join(self.tmp, "c", "answers")))  # so reset reinstalls unattended
         bases = os.path.join(self.tmp, ".bases")
         base = os.path.join(bases, os.listdir(bases)[0])
         for vm in ("v", "c"):  # both are overlays on the read-only base, so both stay usable
@@ -559,6 +566,7 @@ class StoppedVm(unittest.TestCase):
         self.assertFalse(os.access(base, os.W_OK))
         self.assertEqual(tl.load("c")["base"], "v")
         self.assertTrue(tl.load("c")["installed"])
+        self.assertNotIn("rename", tl.load("c"))  # not a Windows VM with the guest agent
         self.quiet(tl.clone, "v", "c2")  # v wrote nothing since: same base, no deeper chain
         self.assertEqual(os.listdir(bases), [os.path.basename(base)])
         with open(os.path.join(self.tmp, "c2", "disk.qcow2")) as f:
@@ -842,6 +850,34 @@ class StoppedVm(unittest.TestCase):
         self.assertIn("cache=unsafe", " ".join(tl.qemu_args("v", m, False)))
         m["installed"] = True
         self.assertNotIn("cache=unsafe", " ".join(tl.qemu_args("v", m, False)))
+
+
+class SettledScreenshot(unittest.TestCase):
+    def test_waits_for_the_input_to_show(self):
+        frames = iter([b"old", b"old", b"new"])  # a loaded guest draws the keystroke late
+        class Q:
+            def close(self): pass
+        old = (tl.qmp, tl.screen_pixels, tl.screenshot)
+        tl.qmp, tl.screen_pixels = (lambda n: Q()), (lambda n, q: (next(frames, b"new"), (1, 1)))
+        tl.screenshot = lambda n, q=None: (b"png", (1, 1))
+        try:
+            t = time.time()
+            self.assertEqual(tl.settled_screenshot("v", b"old"), b"png")
+            self.assertEqual(next(frames, None), None)        # polled until the change
+            self.assertLess(time.time() - t, 1.0)             # not the whole timeout
+            t = time.time(); tl.settled_screenshot("v", b"new", timeout=0.3)  # no visible effect: bounded
+            self.assertLess(time.time() - t, 1.0)
+        finally:
+            tl.qmp, tl.screen_pixels, tl.screenshot = old
+
+
+class Rename(unittest.TestCase):
+    def test_computer_name(self):
+        self.assertEqual(tl.computer_name("web_server.lab-01"), "WEB-SERVER-LAB")
+        self.assertEqual(tl.computer_name("w26c"), "W26C")
+        self.assertEqual(len(tl.computer_name("a" * 40)), 15)
+        self.assertEqual(tl.computer_name("1234"), "VM-1234")      # all digits is invalid
+        self.assertNotIn("{{", tl.RENAME_PS.format(name="X"))     # the template formats cleanly
 
 
 class HostDisk(unittest.TestCase):

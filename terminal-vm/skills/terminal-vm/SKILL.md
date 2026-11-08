@@ -9,7 +9,7 @@ terminal-vm gives you computer use inside a separate virtual machine (Linux, Win
 
 ## Tools (MCP server `terminal-vm mcp NAME`)
 
-`screenshot`, `click` (`clicks: 2|3`, `button: right|middle`), `move`, `drag`, `scroll` (`dy`, negative scrolls down, 100 per notch), `type`, `key`, `status`, `wait` (until the screen stops changing, then a screenshot; `stable` seconds, `timeout`; a blinking cursor can keep it from settling, so read `stable` in the reply). Coordinates are pixels of the latest `screenshot`. Action tools accept `screenshot: true` to return a fresh screenshot with the result.
+`screenshot`, `click` (`clicks: 2|3`, `button: right|middle`), `move`, `drag`, `scroll` (`dy`, negative scrolls down, 100 per notch), `type`, `key`, `status`, `wait` (until the screen stops changing, then a screenshot; `stable` seconds, `timeout`; a blinking cursor can keep it from settling, so read `stable` in the reply). Coordinates are pixels of the latest `screenshot`. Action tools accept `screenshot: true` to return a screenshot with the result, taken once the screen has changed (up to 1.5 s: a busy guest shows keystrokes late); if the effect is still missing, `wait` then `screenshot`.
 
 ## Loop: observe -> act -> verify
 
