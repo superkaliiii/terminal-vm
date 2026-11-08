@@ -575,8 +575,8 @@ def autounattend(p, layout, user, password, key, ui="en-US"):
                       for i, c in enumerate(('powercfg /change monitor-timeout-ac 0',
                                             'powercfg /change standby-timeout-ac 0',
                                             'powercfg /setacvalueindex SCHEME_CURRENT SUB_NONE CONSOLELOCK 0'), 1))
-    # EnableHexNumpad is read at logon: set it in the first session, then reboot so the session the agent gets
-    # (auto-logon again) has it. Writing it to the Default profile in specialize was tried and did not reach the user.
+    # EnableHexNumpad is read at logon: set it in the first session, then log off so the session the agent gets
+    # (auto-logon again, forced) has it. A reboot did the same but cost 8 min of servicing ("Updates are underway"). Writing it to the Default profile in specialize was tried and did not reach the user.
     # DisableLockWorkstation: a locked session ignores the ACPI power button (stop would hang), so Win+L and the
     # Lock entry are removed. The Policies key needs admin rights (denied in a non-elevated prompt).
     first = ("<FirstLogonCommands>" + "".join(
@@ -585,7 +585,10 @@ def autounattend(p, layout, user, password, key, ui="en-US"):
                                GUEST_TOOLS_CMD,
                                'reg add HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System '
                                '/v DisableLockWorkstation /t REG_DWORD /d 1 /f',
-                               'shutdown /r /t 5'), 1)) + "</FirstLogonCommands>")
+                               # without it Winlogon leaves a logged-off session at the Ctrl+Alt+Delete screen
+                               'reg add "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon" '
+                               '/v ForceAutoLogon /t REG_SZ /d 1 /f',
+                               'shutdown /l'), 1)) + "</FirstLogonCommands>")
     shell = "Microsoft-Windows-Shell-Setup"
     return ('<?xml version="1.0" encoding="utf-8"?>\n<unattend xmlns="urn:schemas-microsoft-com:unattend" '
             'xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">'
@@ -632,6 +635,11 @@ def installing(d, m):
     return os.path.isdir(os.path.join(d, "answers")) and not m.get("installed")
 
 
+def run_cpus(name, m):
+    """vCPUs the VM boots with: its ceiling while Windows installs (when the quota had room at start)."""
+    return m.get("install_cpus", m["cpus"]) if installing(vm_dir(name), m) else m["cpus"]
+
+
 def qemu_args(name, m, window, vnc_port=None):
     """Full QEMU command line for a VM (pure: no I/O), so every OS profile is testable.
     vnc_port: Windows hosts, VNC on localhost TCP with a password (set over QMP after start)."""
@@ -650,7 +658,7 @@ def qemu_args(name, m, window, vnc_port=None):
     # Balloon: the guest gets its ceiling of RAM and gives back what is above memory_mb, so memory can change
     # live. Only where the guest has the driver (Linux; Windows with the virtio-win tools), or it would keep it all.
     ram = vm_ram_mb(m)
-    smp = f"{m['cpus']},maxcpus={max(max_cpus, m['cpus'])}" if hot_cpus(m) else str(m["cpus"])
+    smp = f"{m['cpus']},maxcpus={max(max_cpus, m['cpus'])}" if hot_cpus(m) else str(run_cpus(name, m))
     args = ["-name", name, *accel, "-cpu", cpu, "-machine", p["machine"], "-m", str(ram), "-smp", smp,
             *(["-device", "virtio-balloon-pci,free-page-reporting=on"] if m.get("balloon") else []),
             # QEMU locks the image: one VM per disk. During an unattended install, ignore guest flushes (much faster):
@@ -762,7 +770,14 @@ def start(name, window=False):
     with quota_lock():
         m = load(name)
         if state(name) == "stopped":
-            quota_check({"cpus": m["cpus"], "memory_gb": vm_ram_mb(m) / 1024, "vms": 1})
+            if installing(vm_dir(name), m):  # Setup is CPU-bound: use the VM's ceiling until the first clean stop
+                m["install_cpus"] = max(m["cpus"], limits(m)[0])
+                try:
+                    quota_check({"cpus": m["install_cpus"], "memory_gb": vm_ram_mb(m) / 1024, "vms": 1})
+                except SystemExit:
+                    del m["install_cpus"]
+                save(name, m)
+            quota_check({"cpus": run_cpus(name, m), "memory_gb": vm_ram_mb(m) / 1024, "vms": 1})
         _start(name, window)
 
 
@@ -828,7 +843,7 @@ def stop(name, force=False, timeout=60):
         if state(name) == "stopped":
             m = load(name)
             if installing(vm_dir(name), m):
-                m["installed"] = True; save(name, m)
+                m["installed"] = True; m.pop("install_cpus", None); save(name, m)
             print(json.dumps({"stopped": name})); return
         time.sleep(0.5)
     locked = (" A locked Windows session ignores it too: unlock (key ctrl+alt+delete, type the password from "
@@ -1148,7 +1163,7 @@ def quota_usage():
         m = load(n)
         use["disk_gb"] += vm_disk_gb(n, m)
         if state(n) != "stopped":
-            use["cpus"] += m["cpus"]; use["memory_gb"] += vm_ram_mb(m) / 1024; use["vms"] += 1
+            use["cpus"] += run_cpus(n, m); use["memory_gb"] += vm_ram_mb(m) / 1024; use["vms"] += 1
     return use
 
 

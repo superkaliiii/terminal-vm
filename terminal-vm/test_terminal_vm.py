@@ -302,6 +302,13 @@ class WindowsGuests(unittest.TestCase):
         finally:
             tl.accelerators = old
 
+    def test_install_cpus_until_installed(self):
+        m = {"os": "win2025", "iso": "/x.iso", "memory_mb": 2048, "cpus": 2, "install_cpus": 6}
+        os.makedirs(os.path.join(self.tmp, "v", "answers"), exist_ok=True)
+        self.assertIn("-smp 6 ", " ".join(tl.qemu_args("v", m, False)))
+        m["installed"] = True
+        self.assertIn("-smp 2 ", " ".join(tl.qemu_args("v", m, False)))
+
     def test_free_ports_distinct(self):
         self.assertEqual(len(set(tl.free_ports(4))), 4)
 
@@ -327,15 +334,16 @@ class WindowsGuests(unittest.TestCase):
             self.assertEqual("/IMAGE/INDEX" in xml, os_name == "win2025")
             self.assertEqual("HideOnlineAccountScreens" in xml, os_name != "win7")
             self.assertIn("EnableHexNumpad", xml)
-            # set in the first session, then a reboot so the agent's session (auto-logon again) has it
-            self.assertLess(xml.index("EnableHexNumpad"), xml.index("shutdown /r"))
+            # set in the first session, then a logoff so the agent's session (forced auto-logon again) has it
+            self.assertLess(xml.index("EnableHexNumpad"), xml.index("shutdown /l"))
+            self.assertLess(xml.index("ForceAutoLogon"), xml.index("shutdown /l"))  # else stuck at Ctrl+Alt+Delete
             self.assertIn("<FirstLogonCommands>", xml)
             self.assertIn("<AdministratorPassword><Value>p&lt;&amp;&gt;w-Aa1</Value>", xml)  # Server OOBE stops without it
             spec = root.find(f"{ns}settings[@pass='specialize']")  # default profile, so the first session has it
             spec_xml = ET.tostring(spec, encoding="unicode")
             for needle in ("monitor-timeout-ac 0", "CONSOLELOCK 0"):
                 self.assertIn(needle, spec_xml)   # never locked or blanked on idle
-            self.assertLess(xml.index("DisableLockWorkstation"), xml.index("shutdown /r"))  # no Win+L, so stop works
+            self.assertLess(xml.index("DisableLockWorkstation"), xml.index("shutdown /l"))  # no Win+L, so stop works
         self.assertIn("W269N-WFGWX-YVC9B-4J6C9-T83GX", tl.autounattend(tl.PROFILES["win10"], "us", "u", "p", tl.PROFILES["win10"]["key"]))
         self.assertNotIn("<ProductKey>", tl.autounattend(tl.PROFILES["win2025"], "us", "u", "p", None))
 
@@ -379,7 +387,7 @@ class WindowsGuests(unittest.TestCase):
             self.assertEqual(f.read(), b"MZ fake")   # the guest agent's installer rides on the answers drive
         with open(os.path.join(self.tmp, "w11", "answers", "autounattend.xml"), encoding="utf-8") as f:
             xml = f.read()
-        self.assertLess(xml.index("virtio-win-guest-tools.exe /install /quiet"), xml.index("shutdown /r"))
+        self.assertLess(xml.index("virtio-win-guest-tools.exe /install /quiet"), xml.index("shutdown /l"))
 
     def test_reset_rewrites_stale_answers(self):
         """A VM made by an older version reinstalls with today's answers, same account, language and key."""
