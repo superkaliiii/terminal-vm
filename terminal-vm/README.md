@@ -45,6 +45,7 @@ or install this folder as a Claude Code plugin (`.claude-plugin/`).
 | `start NAME [--window]`, `pause`, `resume` | lifecycle |
 | `stop NAME [--timeout 60]` / `--force` | asks the guest and waits; reports a guest showing a confirmation dialog |
 | `rm NAME` / `reset NAME` | delete a stopped VM / give it a blank disk of the same size (reinstalls on the next start, Windows answers kept) |
+| `clone SRC NEW` | copy-on-write copy of a stopped VM in under a second: install once, clone many (Windows Server 2025 clone ready in 0.3 s + 28 s boot instead of a 37-min install). SRC's disk moves to a read-only base in `.bases/` of the store and SRC becomes an overlay on it too, so both keep running and changing independently; clones of an unchanged SRC share one base, and a base is deleted with its last VM (`rm`/`reset`). SRC must have no snapshots (they would stay in the base). Clones keep SRC's account and Windows computer name: rename one before putting two on the same network |
 | `snapshot NAME save\|load\|rm TAG`, `snapshot NAME ls` | qcow2 snapshots: whole machine with memory while running, disk only while stopped |
 | `display NAME --width W --height H` | screen size at the next start |
 | `layout NAME [us\|fr]` | show or change the keyboard layout used by `type`/`key` (us = QWERTY, fr = AZERTY), even while running; `action ... --layout` overrides it for one call |
@@ -139,6 +140,7 @@ Through MCP an agent can build a small infrastructure on its own, within the quo
 | raising a ceiling, or `vm_create` with `max_memory_gb` above the default | `resources NAME --max-cpus N --max-memory GiB` |
 | downloading an installation image | `image --os OS` |
 | plugging a VM into a network the user created | `net attach VM NET` |
+| `vm_clone` of one of the user's VMs (the clone starts offline) | `clone SRC NEW` |
 | `vm_remove`, `snapshot load\|rm` on a sandboxed VM the user created | `rm NAME`, `snapshot NAME load\|rm TAG` |
 
 The server asks through MCP elicitation when the client supports it (a yes/no form); otherwise, or on refusal, the tool fails and names the command. `vm_create` takes only images already in `images/` of the store (never a host path), creates a sandbox by default, and leaves a non-sandboxed VM offline. Every infrastructure call, failures included, is appended to `agent.log` in the store. Verified under WSL: an agent with MCP alone created two sandboxed Tiny Core VMs and a network, configured them, pinged one from the other (0% loss), then removed everything.

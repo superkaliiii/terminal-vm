@@ -500,12 +500,19 @@ class StoppedVm(unittest.TestCase):
         with open(os.path.join(self.tmp, "quota.json"), "w") as f:
             json.dump({"disk_gb": 1000, "memory_gb": 64, "cpus": 64}, f)   # independent of this host
         self.calls, self.old = [], (tl.subprocess.run, tl.qemu_bin)
+        self.snaps = ["clean"]
         def run(argv, **k):
             self.calls.append(argv)
-            if argv[1] == "create":
-                open([a for a in argv if a.endswith((".qcow2", ".new"))][-1], "w").close()  # the image created
-            out = '{"virtual-size": 68719476736}' if argv[1] == "info" else \
-                "ID TAG VM SIZE DATE\n1 clean 0 B 2026-11-06 10:00:00\n" if argv[1:3] == ["snapshot", "-l"] else ""
+            if argv[1] == "create":  # the image created, holding its backing file's path
+                with open([a for a in argv if a.endswith((".qcow2", ".new"))][-1], "w") as f:
+                    f.write(argv[argv.index("-b") + 1] if "-b" in argv else "")
+            if argv[1] == "info":
+                with open(argv[-1]) as f:
+                    b = f.read()
+                out = json.dumps({"virtual-size": 68719476736, **({"backing-filename": b} if b.endswith(".qcow2") else {})})
+            else:
+                out = "ID TAG VM SIZE DATE\n" + "".join(f"1 {t} 0 B 2026-11-06 10:00:00\n" for t in self.snaps) \
+                    if argv[1:3] == ["snapshot", "-l"] else "[]" if argv[1] == "map" else ""  # map: no own data
             return tl.subprocess.CompletedProcess(argv, 0, out, "")
         tl.subprocess.run, tl.qemu_bin = run, (lambda t: t)
 
@@ -539,17 +546,29 @@ class StoppedVm(unittest.TestCase):
         self.quiet(tl.rm, "v")
         self.assertFalse(os.path.exists(self.d))
 
-    def test_clone_protects_its_base(self):
+    def test_clone_shares_a_base(self):
+        with self.assertRaises(SystemExit):  # snapshots would be stranded in the base
+            tl.clone("v", "c")
+        self.snaps = []
         self.quiet(tl.clone, "v", "c")
-        create = next(c for c in self.calls if c[1] == "create")
-        self.assertEqual(create[2:7], ["-f", "qcow2", "-F", "qcow2", "-b"])
-        self.assertEqual(create[7], os.path.join(self.d, "disk.qcow2"))
+        bases = os.path.join(self.tmp, ".bases")
+        base = os.path.join(bases, os.listdir(bases)[0])
+        for vm in ("v", "c"):  # both are overlays on the read-only base, so both stay usable
+            with open(os.path.join(self.tmp, vm, "disk.qcow2")) as f:
+                self.assertEqual(f.read(), base)
+        self.assertFalse(os.access(base, os.W_OK))
         self.assertEqual(tl.load("c")["base"], "v")
-        for f, *a in ((tl.rm, "v"), (tl.reset, "v"), (tl.snapshot, "v", "save", "x"), (tl.start, "v")):
-            with self.assertRaises(SystemExit):  # writing the base would corrupt the clone
-                f(*a)
+        self.assertTrue(tl.load("c")["installed"])
+        self.quiet(tl.clone, "v", "c2")  # v wrote nothing since: same base, no deeper chain
+        self.assertEqual(os.listdir(bases), [os.path.basename(base)])
+        with open(os.path.join(self.tmp, "c2", "disk.qcow2")) as f:
+            self.assertEqual(f.read(), base)
+        self.quiet(tl.rm, "c2")
+        self.quiet(tl.snapshot, "v", "save", "x")  # in v's own overlay
         self.quiet(tl.rm, "c")
-        self.quiet(tl.rm, "v")
+        self.assertTrue(os.path.isfile(base))  # v still needs it
+        self.quiet(tl.reset, "v")
+        self.assertEqual(os.listdir(bases), [])  # last user gone
 
     def test_sandbox(self):
         m = {"os": "win2025", "iso": "/x.iso", "memory_mb": 2048, "cpus": 2, "sandbox": True}
@@ -746,6 +765,14 @@ class StoppedVm(unittest.TestCase):
             tl.agent_call("vm_start", {"vm": "v"}, yes)                       # the user's VM
         with self.assertRaises(SystemExit):
             tl.agent_call("vm_create", {"vm": "x", "iso": "../../etc/passwd"}, yes)   # store images only
+        self.snaps = []
+        with self.assertRaises(RuntimeError):
+            tl.agent_call("vm_clone", {"vm": "v", "new": "x"}, no)            # a copy of the user's VM: ask
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "x")))
+        tl.agent_call("vm_clone", {"vm": "v", "new": "x"}, yes)
+        self.assertEqual((tl.load("x")["created_by"], tl.load("x")["offline"]), ("agent", True))
+        tl.agent_call("vm_remove", {"vm": "x"}, no)
+        asked.clear()
         m = tl.load("v"); m["sandbox"] = True; tl.save("v", m)               # a sandbox the user made
         self.assertTrue(tl.agent_call("vm_list", {}, yes)[0]["managed"])
         with self.assertRaises(RuntimeError):

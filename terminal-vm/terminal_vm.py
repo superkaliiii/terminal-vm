@@ -783,14 +783,14 @@ def start(name, window=False):
 
 def _start(name, window=False):
     d, m = vm_dir(name), load(name)
-    _no_clones(name, "start")
     if state(name) != "stopped":
         raise SystemExit(f"{name} is already running")
     if len(os.path.join(d, "qmp-view.sock").encode()) >= 108:  # sun_path limit
         raise SystemExit(f"VM folder path too long for its sockets: {d}; shorten the name or set TERMINAL_VM_HOME")
     vnc_port = None
     if WINDOWS:
-        vnc_port = free_ports(1)[0]
+        # QEMU takes a display number (port - 5900); Windows' ephemeral range can start at 1024
+        vnc_port = next(p for p in iter(lambda: free_ports(1)[0], None) if p >= 5900)
         with open(os.path.join(d, "ports.json"), "w") as f:
             json.dump({"vnc": vnc_port}, f)
     for k in ("qmp", "qmp-view", "qga", "vnc"):  # stale sockets from a crashed VM
@@ -1262,28 +1262,78 @@ def _stopped(name):
         raise SystemExit(f"{name} is running; stop it first: terminal-vm stop {name}")
 
 
-def _no_clones(name, what):
-    """A clone's disk is an overlay on its source's: changing the source would corrupt every clone."""
-    clones = [n for n in sorted(os.listdir(STORE)) if n != name and os.path.isfile(os.path.join(STORE, n, "machine.json"))
-              and load(n).get("base") == name] if os.path.isdir(STORE) else []
-    if clones:
-        raise SystemExit(f"cannot {what} {name}: it is the base of {', '.join(clones)} (remove those first)")
+def _snapshots(disk):
+    r = subprocess.run([qemu_bin("qemu-img"), "snapshot", "-l", disk], capture_output=True, text=True)
+    return [t[1] for t in (line.split() for line in r.stdout.splitlines()) if len(t) > 2 and t[0].isdigit()]
+
+
+def _backing(disk):
+    r = subprocess.run([qemu_bin("qemu-img"), "info", "-U", "--output=json", disk], capture_output=True, text=True)
+    try:
+        return json.loads(r.stdout).get("backing-filename")
+    except ValueError:
+        return None
+
+
+def _untouched(disk):
+    """An overlay holding no data of its own (every cluster comes from its backing file)."""
+    r = subprocess.run([qemu_bin("qemu-img"), "map", "-U", "--output=json", disk], capture_output=True, text=True)
+    try:
+        return r.returncode == 0 and not any(e["depth"] == 0 and e["data"] for e in json.loads(r.stdout))
+    except (ValueError, KeyError):
+        return False
+
+
+def _gc_bases():
+    """Delete the base images no VM disk (or other base) is built on any more."""
+    bases = os.path.join(STORE, ".bases")
+    while os.path.isdir(bases):
+        files = {os.path.normcase(os.path.join(bases, f)) for f in os.listdir(bases)}
+        disks = [os.path.join(STORE, n, "disk.qcow2") for n in os.listdir(STORE)] + list(files)
+        used = {os.path.normcase(os.path.abspath(b)) for b in map(_backing, filter(os.path.isfile, disks)) if b}
+        if not files - used:
+            return
+        for f in files - used:
+            os.chmod(f, 0o600)
+            os.remove(f)
 
 
 def clone(src, new):
-    """New VM whose disk is a copy-on-write overlay on SRC's (instant, small). SRC becomes read-only:
-    it cannot start, reset, be removed or change snapshots while clones exist."""
+    """New VM whose disk is a copy-on-write overlay (instant, small). SRC's disk becomes a read-only base image
+    under STORE/.bases and SRC an overlay on it too, so both keep running and changing on their own; the base
+    goes when its last VM is removed or reset."""
     _stopped(src)
     d = vm_dir(new)
     if os.path.exists(os.path.join(d, "machine.json")):
         raise SystemExit(f"VM {new!r} already exists in {d}")
+    disk = os.path.join(vm_dir(src), "disk.qcow2")
+    snaps = _snapshots(disk)
+    if snaps:  # they would stay inside the base, out of reach of SRC's overlay
+        raise SystemExit(f"{src} has snapshots ({', '.join(snaps)}): load the one to clone from, then remove them "
+                         f"(terminal-vm snapshot {src} rm TAG) and clone again")
     m = load(src)
     with quota_lock():
         quota_check({"disk_gb": vm_disk_gb(src, m)})  # the overlay can grow to the base's size
         os.makedirs(d, mode=0o700, exist_ok=True)
         save(new, dict(m, base=src))
-    subprocess.run([qemu_bin("qemu-img"), "create", "-f", "qcow2", "-F", "qcow2", "-b",
-                    os.path.join(vm_dir(src), "disk.qcow2"), os.path.join(d, "disk.qcow2")], check=True, stdout=subprocess.DEVNULL)
+    bases, base = os.path.join(STORE, ".bases"), _backing(disk)
+    if base and os.path.dirname(os.path.abspath(base)) == os.path.abspath(bases) and _untouched(disk):
+        targets = [os.path.join(d, "disk.qcow2")]  # SRC wrote nothing since its last clone: share that base
+    else:  # a new base layer
+        os.makedirs(bases, exist_ok=True)
+        base = os.path.join(bases, f"{src}-{secrets.token_hex(4)}.qcow2")
+        targets = [disk, os.path.join(d, "disk.qcow2")]
+        os.replace(disk, base)
+    try:
+        for target in targets:
+            subprocess.run([qemu_bin("qemu-img"), "create", "-f", "qcow2", "-F", "qcow2", "-b", base, target],
+                           check=True, stdout=subprocess.DEVNULL)
+    except BaseException:
+        if disk in targets:
+            os.replace(base, disk)  # SRC as it was; the half-made clone goes
+        shutil.rmtree(d, ignore_errors=True)
+        raise
+    os.chmod(base, 0o444)  # QEMU only reads it; nothing should write it while overlays exist
     m.update(base=src, installed=True)  # no answers drive in the clone: it boots the installed disk
     m.pop("networks", None)  # each NIC's MAC is per VM: attach the clone again
     save(new, m)
@@ -1292,8 +1342,8 @@ def clone(src, new):
 
 def rm(name):
     _stopped(name)
-    _no_clones(name, "remove")  # its network memberships go with its machine.json
-    shutil.rmtree(vm_dir(name))
+    shutil.rmtree(vm_dir(name))  # its network memberships go with its machine.json
+    _gc_bases()
     print(json.dumps({"removed": name}))
 
 
@@ -1301,12 +1351,12 @@ def reset(name):
     """Blank disk of the same size, so the next start installs again (Windows answers rewritten, account kept).
     Deletes the disk's snapshots too."""
     _stopped(name)
-    _no_clones(name, "reset")
     disk = os.path.join(vm_dir(name), "disk.qcow2")
     info = subprocess.run([qemu_bin("qemu-img"), "info", "--output=json", disk], check=True, capture_output=True, text=True)
     subprocess.run([qemu_bin("qemu-img"), "create", "-f", "qcow2", disk + ".new", str(json.loads(info.stdout)["virtual-size"])],
                    check=True, stdout=subprocess.DEVNULL)
     os.replace(disk + ".new", disk)  # the old disk survives a failed create
+    _gc_bases()
     m = load(name)
     m.pop("installed", None)
     answers = os.path.join(vm_dir(name), "answers")
@@ -1329,7 +1379,6 @@ def snapshot(name, cmd, tag=None):
     if cmd != "ls" and not re.fullmatch(r"[\w.-]{1,64}", tag or ""):
         raise SystemExit(f"snapshot {cmd} needs a TAG (letters, digits, . _ -)")
     if cmd != "ls":
-        _no_clones(name, "change snapshots of")
         if load(name).get("sandbox") and state(name) != "stopped":
             raise SystemExit(f"{name} is sandboxed: its disk changes are discarded at stop, so stop it first "
                              "(a stopped VM's snapshot is the state each sandboxed run starts from)")
@@ -2200,9 +2249,16 @@ def agent_call(tool, a, approve):
         m = load(vm); m["created_by"] = "agent"; save(vm, m)
         return out
     if tool == "vm_clone":
-        managed(vm)
+        src = load(vm)
+        users = not (src.get("sandbox") or src.get("created_by") == "agent")
+        if users:  # a copy of their disk and account
+            approve(f"Clone your VM {vm} as {a['new']} (an offline copy of its disk and account the agent manages)?",
+                    f"terminal-vm clone {vm} {a['new']}")
         out = quiet(clone, vm, a["new"])
-        m = load(a["new"]); m["created_by"] = "agent"; save(a["new"], m)
+        m = load(a["new"]); m["created_by"] = "agent"
+        if users and not m.get("sandbox"):
+            m["offline"] = True  # internet stays the user's call (vm_internet)
+        save(a["new"], m)
         return out
     if tool == "net_list":
         return net_ls()
@@ -2291,7 +2347,7 @@ AGENT_TOOLS = [
               "max_cpus": {"type": "integer", "minimum": 1}, "max_memory_gb": {"type": "integer", "minimum": 1},
               "memory_gb": {"type": "integer", "minimum": 1}, "disk_gb": {"type": "integer", "minimum": 4},
               "sandbox": {"type": "boolean"}, "iso": {"type": "string"}}, ["vm"])),
-    ("vm_clone", "Copy-on-write clone of a stopped managed VM (the source then stays read-only while clones exist).",
+    ("vm_clone", "Copy-on-write clone of a stopped VM, in seconds (install once, clone many). Both stay usable. Cloning one of the user's VMs needs their approval; the clone starts offline.",
      _schema({**_VM, "new": {"type": "string"}}, ["vm", "new"])),
     ("vm_start", "Start a managed VM, within the host quota." + _MANAGED, _schema(_VM, ["vm"])),
     ("vm_stop", "Shut a managed VM down (force: power off at once).",
