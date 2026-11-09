@@ -43,6 +43,7 @@ or install this folder as a Claude Code plugin (`.claude-plugin/`).
 |---|---|
 | `ls`, `status NAME`, `doctor`, `help`, `version` | list VMs, state + screen + logged-in users, host checks |
 | `start NAME [--window]`, `pause`, `resume` | lifecycle |
+| `daemon run\|start\|stop\|status`, `supervise NAME [--restart always\|never] [--idle-pause MIN]`, `events [-n 50] [--vm V]` | supervision: restarts, health, idle pause, events (see [Supervision](#supervision)) |
 | `resume [--stay]`, `autostart [on\|off]` | start again the VMs that were running before a restart; at each logon (see [Restarts](#restarts)) |
 | `project ls`, `project show [P]`, `project notes [P [TEXT]]`, `project move NAME P`; `create --project P` | projects (see [Projects](#projects)) |
 | `stop NAME [--timeout 60]` / `--force` | asks the guest and waits; reports a guest showing a confirmation dialog |
@@ -151,7 +152,8 @@ The server asks through MCP elicitation when the client supports it (a yes/no fo
 
 - `start` and `stop` record what each VM should be doing (`want` in its folder). After the PC (or WSL) restarts,
   `resume` (no VM name) starts again the VMs that were running, within the quota, and leaves alone those stopped on
-  purpose. A VM shut down from inside the guest stays "running" in that record and comes back.
+  purpose. A VM shut down from inside the guest is recorded as stopped (its watcher sees the guest's own
+  shutdown); one whose QEMU was killed, or the PC cut, comes back.
 - `autostart on` runs it at each logon: on Windows (also from WSL) a scheduled task `terminal-vm-resume` (from
   WSL: `conhost --headless wsl.exe ... resume --stay`, which keeps WSL up while VMs run); on Linux a systemd user
   service (at login; `loginctl enable-linger` for boot without login). `autostart off` removes it, `autostart` alone
@@ -169,6 +171,33 @@ The server asks through MCP elicitation when the client supports it (a yes/no fo
 - Agents: the MCP tool `autostart` shows the setting and turns it on or off with the user's approval; with `vm`,
   it does that for terminal-ct inside that Linux VM (run as the logged-in user through the guest agent), also with
   approval.
+
+## Supervision
+
+`start` also starts the supervision daemon (`terminal-vm daemon run|start|stop|status`; one per store, it ends by
+itself 10 minutes after the last VM that should run). Every 5 s it:
+
+- starts again a VM that should run but stopped without a guest shutdown (QEMU crashed or was killed: checked on
+  the disk's lock, or on Windows QEMU's process, since QMP answers one client at a time), after 5 s,
+  then 10, 20... up to 5 min between tries while it keeps failing (counted again from 5 s once it stayed up 10 min);
+  a refusal (quota) is retried the same way. `supervise NAME --restart never` leaves such a VM down; closing the
+  window of a VM started with `--window` stops it for good. The daemon and `start`, `stop`, `rm`, `reset`,
+  `clone` and `snapshot` take a per-VM lock, so a restart never runs across one of them.
+- pings the guest agent of running VMs: `unhealthy` after 3 misses in a row (not in the first 5 minutes, not in
+  the minute after a use, only for VMs whose agent answered once), `healthy` when it answers again. Reported, not
+  acted on: a VM holds state.
+- pauses a VM nobody used for its `supervise NAME --idle-pause MINUTES` (no screen action, `exec`, file copy,
+  open `view`, or VNC client such as `show`) that is not computing either (QEMU under 20 % of a core; an idle guest
+  costs it 4-12 %). The next use wakes it at once (`stop` too); a pause by the user (`pause`) stays. Off by
+  default (`--idle-pause 0`). A guest paused for long may find its clock behind when it wakes (Windows syncs it
+  later; Linux with an NTP client).
+
+What it does goes to `STORE/events.log` (`events [-n 50] [--vm V]`: `restarted`, `restart_failed`, `unhealthy`,
+`healthy`, `idle_paused`, `woken`, `window_closed`, `supervise_failed`, `daemon_started`/`stopped`), in
+terminal-ct's line format (`vm` where it has `container`). Linux guests also
+give unused memory back to the host while they run (virtio-balloon with free page reporting). Measured (WSL,
+TinyCore): QEMU killed -> running again in 3 s; idle pause and wake by a screenshot as described.
+`TERMINAL_VM_DAEMON=0` turns supervision off.
 
 ## Projects
 

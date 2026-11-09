@@ -3,6 +3,8 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import terminal_vm as tl
 
+os.environ["TERMINAL_VM_DAEMON"] = "0"  # no supervision daemon spawned by the tests' starts
+
 POSIX = os.name == "posix" and hasattr(socket, "AF_UNIX")
 
 
@@ -954,6 +956,162 @@ class StoppedVm(unittest.TestCase):
         self.assertIn("cache=unsafe", " ".join(tl.qemu_args("v", m, False)))
         m["installed"] = True
         self.assertNotIn("cache=unsafe", " ".join(tl.qemu_args("v", m, False)))
+
+
+class Supervision(unittest.TestCase):
+    """The daemon's passes: restart with growing delays, guest agent health, idle pause and wake, events."""
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(); tl.STORE = self.tmp
+        for n in ("a", "b"):
+            os.makedirs(os.path.join(self.tmp, n))
+            tl.save(n, {"cpus": 1, "memory_mb": 1024, "os": "linux"})
+        self.states = {"a": "stopped", "b": "stopped"}
+        self.started, self.qmp_cmds, self.agent = [], [], {"a": True, "b": True}
+        self.cpu = {"a": 0.0, "b": 0.0}
+        test = self
+
+        class Q:
+            def cmd(self, c, **k):
+                test.qmp_cmds.append(c)
+                if c == "stop": test.states["a"] = "paused"
+                if c == "cont": test.states["a"] = "running"
+                return {"status": test.states["a"]} if c == "query-status" else {}
+            def close(self): pass
+
+        class Agent:
+            def __init__(self, n, timeout=0.5):
+                if not test.agent[n]: raise OSError("no agent")
+            def call(self, *a, **k): return {}
+
+        def start(n, window=False, set_want=True):
+            if n == "b": raise SystemExit("quota exceeded")
+            self.started.append(n); self.states[n] = "running"; print(json.dumps({"started": n}))
+        self.disk_held = set()
+        self.real_disk_in_use = tl.disk_in_use
+        self.patches = [mock.patch.object(tl, "state", lambda n: self.states[n]), mock.patch.object(tl, "start", start),
+                        mock.patch.object(tl, "qmp", lambda n: Q()), mock.patch.object(tl, "QGA", Agent),
+                        mock.patch.object(tl, "_pid", lambda n: 1),
+                        mock.patch.object(tl, "disk_in_use", lambda n: n in self.disk_held),
+                        mock.patch.object(tl, "_proc_times", lambda pid: (self.cpu["a"], 0))]
+        for p in self.patches: p.start()
+
+    def tearDown(self):
+        for p in self.patches: p.stop()
+
+    def test_restart_with_growing_delays(self):
+        st = {}
+        tl.want("a", "running"); tl.want("b", "stopped")
+        out = tl.supervise_pass(st, now=1000)
+        self.assertEqual((self.started, [e["event"] for e in out]), (["a"], ["restarted"]))  # b: stopped on purpose
+        self.states["a"] = "stopped"                                       # crashed again at once
+        self.assertEqual(tl.supervise_pass(st, now=1001), [])               # waits: 5 s, then 10, 20...
+        tl.supervise_pass(st, now=1006)
+        self.assertEqual(self.started, ["a", "a"])
+        self.assertEqual(st["a"]["next_try"], 1016)
+        tl.supervise(  "a", restart="never"); self.states["a"] = "stopped"
+        self.assertEqual(tl.supervise_pass(st, now=5000), [])                # never: left down
+        tl.want("b", "running")
+        self.assertEqual([e["event"] for e in tl.supervise_pass(st, now=5000)], ["restart_failed"])  # quota: later
+        tl.want("b", "stopped")
+        tl.supervise("a", restart="always"); tl.want("a", "running")
+        self.disk_held.add("a")                                            # QMP busy, QEMU alive: not a crash
+        self.assertEqual(tl.supervise_pass(st, now=6000), [])
+        self.disk_held.clear()
+        open(os.path.join(self.tmp, "a", "window"), "w").close()           # its window was closed
+        self.assertEqual([e["event"] for e in tl.supervise_pass(st, now=6000)], ["window_closed"])
+        self.assertEqual(tl.wanted("a"), "stopped")
+        tl.want("a", "running")
+        with tl.vm_op("a"):                                                # a user operation on it: next pass
+            tl.vm_op.held.clear()                                          # held by "another process"
+            try:
+                self.assertEqual(tl.supervise_pass(st, now=6000), [])
+            finally:
+                tl.vm_op.held["a"] = 1
+        self.assertEqual([e["event"] for e in tl.events()][-2:], ["restart_failed", "window_closed"])
+        self.assertEqual(tl.events(vm="a")[0]["event"], "restarted")
+
+    def test_health_and_idle_pause(self):
+        st, cpu, T = {}, {}, 100000
+        self.states["a"] = "running"
+        tl.supervise_pass(st, now=T + 0, cpu=cpu)                               # agent answers: known to have one
+        self.agent["a"] = False
+        outs = [tl.supervise_pass(st, now=t, cpu=cpu) for t in (T + 10, T + 400, T + 410, T + 420)]
+        self.assertEqual([[e["event"] for e in o] for o in outs], [[], [], [], ["unhealthy"]])  # after the grace, 3 misses
+        self.agent["a"] = True
+        self.assertEqual([e["event"] for e in tl.supervise_pass(st, now=T + 430, cpu=cpu)], ["healthy"])
+        # idle: QEMU's CPU time unchanged between passes (0 %) for idle_pause minutes -> paused, marker for wake
+        tl.supervise("a", idle_pause=1)
+        self.assertEqual([tl.supervise_pass(st, now=t, cpu=cpu) for t in (T + 500, T + 510, T + 560)], [[], [], []])
+        out = tl.supervise_pass(st, now=T + 570, cpu=cpu)
+        self.assertEqual([e["event"] for e in out], ["idle_paused"])
+        self.assertEqual(self.states["a"], "paused")
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, "a", "idle_paused")))
+        tl.wake("a")                                                       # the next action
+        self.assertEqual((self.states["a"], self.qmp_cmds[-1]), ("running", "cont"))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "a", "idle_paused")))
+        for t in (T + 600, T + 700, T + 800):                                          # computing: 30 CPU s per 100 s = 30 %
+            self.cpu["a"] += 30.0
+            self.assertEqual(tl.supervise_pass(st, now=t, cpu=cpu), [])
+        used = os.path.join(self.tmp, "a", "last_use")                     # touched by wake: a use
+        self.assertTrue(os.path.exists(used))
+        self.assertEqual(tl.supervise_pass(st, now=T + 910, cpu=cpu), [])       # quiet from 910...
+        os.utime(used, (T + 960, T + 960))                                         # ...but used at 960
+        self.assertEqual(tl.supervise_pass(st, now=T + 975, cpu=cpu), [])       # 65 s after 910, 15 after the use
+        self.assertEqual([e["event"] for e in tl.supervise_pass(st, now=T + 1025, cpu=cpu)], ["idle_paused"])
+        tl.wake("a")
+        with contextlib.redirect_stdout(io.StringIO()):
+            tl.pause("a")                                                  # the user's pause: not woken
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "a", "idle_paused")))
+        tl.wake("a")
+        self.assertEqual(self.states["a"], "paused")
+
+    def test_one_vm_failing_does_not_stop_the_pass(self):
+        tl.want("a", "running"); tl.want("b", "running")
+        old = tl.load
+        with mock.patch.object(tl, "load", lambda n: (_ for _ in ()).throw(ValueError("broken")) if n == "a" else old(n)):
+            out = tl.supervise_pass({}, now=1000)
+        self.assertEqual([(e["event"], e["vm"]) for e in out], [("supervise_failed", "a"), ("restart_failed", "b")])
+
+    def test_vm_op_lock(self):
+        with tl.vm_op("a"):
+            with tl.vm_op("a"):                                            # re-entrant in one process
+                pass
+            self.assertTrue(os.path.isdir(os.path.join(self.tmp, "a", ".op.lock")))
+            with self.assertRaisesRegex(SystemExit, "busy"):
+                tl.vm_op.held.clear()                                      # as another process would see it
+                try:
+                    with tl.vm_op("a", wait=0.3):
+                        pass
+                finally:
+                    tl.vm_op.held["a"] = 1
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "a", ".op.lock")))
+
+    def test_long_use_and_daemon_lock(self):
+        used = os.path.join(self.tmp, "a", "last_use")
+        with tl.in_use("a"):                                               # an exec or a file copy
+            os.utime(used, (1, 1))
+        self.assertGreater(os.path.getmtime(used), 1000)                   # fresh again at its end
+        lock = tl._claim_daemon_lock()
+        self.assertTrue(lock and os.path.isdir(lock))
+        with mock.patch.object(tl.time, "sleep", lambda s: None):
+            self.assertIsNone(tl._claim_daemon_lock())                     # young lock, no beat: being started
+            os.utime(lock, (1, 1))                                         # old and no beat: left by a dead daemon
+            self.assertEqual(tl._claim_daemon_lock(), lock)                # taken over (a reused pid is no proof)
+
+    @unittest.skipIf(tl.WINDOWS, "the image lock probe is for Linux hosts")
+    def test_disk_in_use_needs_a_lock_message(self):
+        open(os.path.join(self.tmp, "a", "disk.qcow2"), "w").close()
+        for err, held in (("Failed to get shared \"write\" lock", True), ("Could not open: corrupt image", False)):
+            with mock.patch.object(tl, "qemu_bin", lambda n: n), \
+                    mock.patch.object(tl.subprocess, "run", lambda *a, **k: tl.subprocess.CompletedProcess(a, 1, "", err)):
+                self.assertEqual(self.real_disk_in_use("a"), held)          # only a lock error means "in use"
+
+    def test_settings_and_status(self):
+        self.assertEqual(tl.supervise("a"), {"name": "a", "restart": "always", "idle_pause": 0})
+        with self.assertRaises(SystemExit):
+            tl.supervise("a", restart="sometimes")
+        s = tl.daemon("status")
+        self.assertEqual((s["daemon"], [v["name"] for v in s["supervised"]]), ("stopped", ["a", "b"]))
 
 
 class SettledScreenshot(unittest.TestCase):

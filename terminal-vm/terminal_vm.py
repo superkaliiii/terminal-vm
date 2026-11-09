@@ -23,6 +23,9 @@ Virtualization), which is also the default for `up` and `create` without `--os`.
   net create NET [--project P] | net rm NET | net ls | net attach|detach NAME NET   isolated VM-to-VM networks
   internet NAME [on|off]   NAT internet access (for a sandboxed VM, on = the user's approval)
   top                      running VMs' real CPU and memory on the host, allotments, quota
+  daemon run|start|stop|status   supervision (started by start): a VM that stopped without a guest shutdown is
+                           started again (growing delay), guest agent health, idle pause; events [-n 50] [--vm V]
+  supervise NAME [--restart always|never] [--idle-pause MINUTES]   how the daemon looks after a VM
   quota [--cpus N --memory GiB --disk GiB --vms N]   host-wide ceiling for all VMs (default from the host)
   resources NAME [--cpus N] [--memory GiB]   within the VM's ceiling (create --max-cpus/--max-memory); live where possible
   sandbox NAME [on|off]   no network, no guest agent or file copy, disk reset at each stop, actions logged
@@ -43,7 +46,7 @@ WINDOWS = os.name == "nt"
 if not WINDOWS:
     import fcntl, termios, tty  # terminal viewer only
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 _DATA = os.environ.get("LOCALAPPDATA", os.path.expanduser("~")) if WINDOWS else \
     os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
 # VMs made before the rename to terminal-vm stay where they are: the old folder is used until a new one exists
@@ -282,6 +285,11 @@ def guest_shell(name, command, timeout=60):
         raise SystemExit(f"{name} is a sandbox: no guest agent to run commands through (use the screen tools)")
     if state(name) == "stopped":
         raise SystemExit(f"{name} is not running; start it: terminal-vm start {name}")
+    with in_use(name):  # a long command is a use until it ends
+        return _guest_shell(name, m, command, timeout)
+
+
+def _guest_shell(name, m, command, timeout):
     try:
         if PROFILES[m.get("os", "linux")]["family"] == "windows":
             enc = base64.b64encode(command.encode("utf-16-le")).decode()
@@ -319,6 +327,115 @@ def project_dir(project):
     d = os.path.join(STORE, ".projects", check_project(project or DEFAULT_PROJECT).replace("/", "+"))
     os.makedirs(d, exist_ok=True)
     return d
+
+
+NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if WINDOWS else {}  # a detached daemon: no console flash
+
+
+# ---------- one operation per VM at a time ----------
+
+class vm_op:
+    """One operation on a VM at a time between processes (an atomic mkdir in its folder): the daemon's restart
+    against the user's stop, rm, reset, clone and snapshot. Re-entrant within a process. wait: seconds to wait for
+    it, then SystemExit."""
+    held = collections.Counter()
+
+    def __init__(self, name, wait=30):
+        self.name, self.wait = name, wait
+
+    def __enter__(self):
+        if vm_op.held[self.name]:
+            vm_op.held[self.name] += 1
+            return self
+        path, end = os.path.join(vm_dir(self.name), ".op.lock"), time.monotonic() + self.wait
+        while True:
+            try:
+                os.mkdir(path)
+                break
+            except FileNotFoundError:  # no such VM (folder gone): nothing to guard
+                break
+            except FileExistsError:
+                with contextlib.suppress(OSError):
+                    if time.time() - os.path.getmtime(path) > 3600:  # left by a killed command
+                        stale = f"{path}.{os.getpid()}"
+                        os.rename(path, stale)  # of two seeing it stale, one claims it
+                        os.rmdir(stale)
+                        continue
+                if time.monotonic() >= end:
+                    raise SystemExit(f"{self.name} is busy with another terminal-vm operation; try again")
+                time.sleep(0.2)
+        vm_op.held[self.name] += 1
+        return self
+
+    def __exit__(self, *exc):
+        vm_op.held[self.name] -= 1
+        if not vm_op.held[self.name]:
+            with contextlib.suppress(OSError):
+                os.rmdir(os.path.join(vm_dir(self.name), ".op.lock"))
+
+
+def locked_op(f):
+    """f(name, ...) run under vm_op(name)."""
+    def run(name, *a, **k):
+        with vm_op(name):
+            return f(name, *a, **k)
+    run.__name__, run.__doc__ = f.__name__, f.__doc__
+    return run
+
+
+def disk_in_use(name):
+    """True while a QEMU runs this VM, proof that does not depend on QMP answering (one client at a time): the
+    disk's image lock; on Windows, where QEMU takes no file locks, the process qemu.pid names, if it was created
+    before that file was written (a pid left by a crash or a reboot may name another process now)."""
+    disk = os.path.join(vm_dir(name), "disk.qcow2")
+    if WINDOWS:
+        pid = _pid(name)
+        born = _proc_created(pid) if pid else None
+        try:
+            return born is not None and born <= os.path.getmtime(os.path.join(vm_dir(name), "qemu.pid")) + 5
+        except OSError:
+            return False
+    if not os.path.exists(disk):
+        return False
+    r = subprocess.run([qemu_bin("qemu-img"), "info", disk], capture_output=True, text=True, **NO_WINDOW)
+    return r.returncode != 0 and "lock" in (r.stderr or "").lower()  # a corrupt disk or no qemu-img is no proof
+
+
+def _proc_created(pid):
+    """Windows: when the process was created (epoch seconds), or None if it is gone."""
+    import ctypes
+    from ctypes import wintypes
+    k = ctypes.windll.kernel32
+    k.OpenProcess.restype = wintypes.HANDLE
+    h = k.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+    if not h:
+        return None
+    try:
+        t = [wintypes.FILETIME() for _ in range(4)]
+        if not k.GetProcessTimes(h, *[ctypes.byref(x) for x in t]):
+            return None
+        return ((t[0].dwHighDateTime << 32 | t[0].dwLowDateTime) - 116444736000000000) / 1e7
+    finally:
+        k.CloseHandle(h)
+
+
+@contextlib.contextmanager
+def in_use(name):
+    """A long use (exec, file copy): its last use kept fresh every 30 s while it lasts, so no idle pause hits it
+    halfway; a VM the daemon paused is woken first."""
+    with contextlib.suppress(RuntimeError, OSError):  # QMP busy: the operation itself says what is wrong
+        wake(name)
+    done = threading.Event()
+
+    def keep():
+        while not done.wait(30):
+            touch_use(name)
+    threading.Thread(target=keep, daemon=True).start()
+    try:
+        yield
+    finally:
+        done.set()
+        touch_use(name)
 
 
 # ---------- resume after a restart ----------
@@ -581,6 +698,7 @@ def settled_screenshot(name, before=None, timeout=1.5):
 
 def act(name, tool, a):
     """Shared by the CLI and MCP. Coordinates are pixels of the latest screenshot."""
+    wake(name)
     q = qmp(name)
     try:
         return _act(name, tool, a, q)
@@ -958,7 +1076,8 @@ def write_answers(d, m, key, ui_language):
         m["balloon"] = True  # the tools include the balloon driver
 
 
-def start(name, window=False):
+@locked_op
+def start(name, window=False, set_want=True):
     with quota_lock():
         m = load(name)
         if state(name) == "stopped":
@@ -971,13 +1090,20 @@ def start(name, window=False):
                 save(name, m)
             quota_check({"cpus": run_cpus(name, m), "memory_gb": vm_ram_mb(m) / 1024, "vms": 1})
         _start(name, window)
-    want(name, "running")
+    if set_want:  # the daemon's restart leaves it as it is: a stop typed meanwhile wins
+        want(name, "running")
+    if os.environ.get("TERMINAL_VM_DAEMON", "1") != "0":  # 0: no supervision (tests, or by choice)
+        with contextlib.suppress(Exception):
+            daemon("start")
 
 
 def _start(name, window=False):
     d, m = vm_dir(name), load(name)
-    if state(name) != "stopped":
+    if state(name) != "stopped" or disk_in_use(name):  # the second: QEMU alive behind a busy QMP
         raise SystemExit(f"{name} is already running")
+    for f, on in (("window", window), ("idle_paused", False)):  # window: closing it is the user's way to stop it
+        with contextlib.suppress(OSError):
+            open(os.path.join(d, f), "w").close() if on else os.remove(os.path.join(d, f))
     if len(os.path.join(d, "qmp-view.sock").encode()) >= 108:  # sun_path limit
         raise SystemExit(f"VM folder path too long for its sockets: {d}; shorten the name or set TERMINAL_VM_HOME")
     vnc_port = None
@@ -1026,10 +1152,17 @@ def _start(name, window=False):
     raise SystemExit(f"QEMU did not start; see {os.path.join(d, 'qemu.log')}")
 
 
+@locked_op
 def stop(name, force=False, timeout=60):
     load(name)
+    touch_use(name)  # no idle pause in the middle of a shutdown
     want(name, "stopped")  # first: stopped on purpose, resume leaves it so
+    if not force and os.path.exists(_idle_marker(name)):  # paused by the daemon: a paused guest ignores the button
+        with contextlib.suppress(RuntimeError, OSError):
+            wake(name)
     if state(name) == "stopped":  # a stale qemu.pid may name an unrelated process now
+        if disk_in_use(name):  # QMP busy, QEMU alive
+            raise SystemExit(f"{name}: QEMU is busy (another command holds its monitor); try again in a moment")
         print(json.dumps({"stopped": name, "already": True})); return
     if force:
         with open(os.path.join(vm_dir(name), "qemu.pid")) as f:
@@ -1054,6 +1187,8 @@ def stop(name, force=False, timeout=60):
 
 
 def pause(name, resume=False):
+    with contextlib.suppress(OSError):  # the user's own pause or resume: no longer the daemon's idle pause
+        os.remove(_idle_marker(name))
     q = qmp(name)
     q.cmd("cont" if resume else "stop")
     q.close()
@@ -1117,6 +1252,358 @@ def mac_machines():
         return []
     return [{"name": m["name"], "os": "macos", "engine": "terminal-mac", "cpus": m.get("cpu"),
              "memory_gb": m.get("memoryGiB"), "display": f"{m.get('width')}x{m.get('height')}"} for m in machines]
+
+
+# ---------- supervision: the daemon ----------
+# `terminal-vm daemon` (started by `start`): every SUP_TICK seconds it starts again a VM that should run (want:
+# running) but stopped without a guest shutdown (QEMU crashed or was killed; confirmed by the disk's lock, not only
+# by QMP, which answers one client at a time), with a growing delay; pings the guest agent of running VMs (health);
+# pauses a VM nobody used for its `idle_pause` minutes (no screen action, exec, file copy, view, show or VNC
+# client) that is not computing either (QEMU under IDLE_CPU), and the next use wakes it. What it does goes to
+# STORE/events.log (terminal-ct's line format, `vm` for `container`). It ends by itself once no VM has wanted to run
+# for IDLE_EXIT seconds.
+SUP_TICK = 5
+SUP_BACKOFF_MAX = 300
+SUP_STABLE = 600  # up this long: the next crash starts the delays from the beginning again
+HEALTH_GRACE = 300  # no health verdict in a VM's first minutes (Windows boots slowly)
+HEALTH_RETRIES = 3
+IDLE_CPU = 20.0  # % of one core: an idle guest still costs QEMU 4-12 % (measured: TinyCore in WSL); a job more
+IDLE_EXIT = 600
+
+
+def event(kind, vm=None, detail=None):
+    e = {"time": time.strftime("%Y-%m-%dT%H:%M:%S"), "event": kind,
+         **{k: v for k, v in (("vm", vm), ("detail", detail)) if v}}
+    path = os.path.join(STORE, "events.log")
+    with contextlib.suppress(OSError):
+        os.makedirs(STORE, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(e) + "\n")
+        if os.path.getsize(path) > 4 * 2 ** 20:  # a daemon runs for months: keep the latest lines
+            with open(path, encoding="utf-8") as f:
+                keep = f.readlines()[-10000:]
+            tmp = f"{path}.{os.getpid()}.new"
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.writelines(keep)
+                os.replace(tmp, path)  # Windows: refused while another process appends; trimmed next time
+            finally:
+                with contextlib.suppress(OSError):
+                    os.remove(tmp)
+    return e
+
+
+def events(n=50, vm=None, project=None):
+    try:
+        with open(os.path.join(STORE, "events.log"), encoding="utf-8") as f:
+            rows = [json.loads(l) for l in f if l.strip()]
+    except (OSError, ValueError):
+        return []
+    mine = None if project is None else {v for v in machines() if under(project_of(load(v)), project)}
+    return [e for e in rows if (vm is None or e.get("vm") == vm) and (mine is None or e.get("vm") in mine)][-n:]
+
+
+def _idle_marker(name):
+    return os.path.join(vm_dir(name), "idle_paused")
+
+
+def touch_use(name):
+    with contextlib.suppress(OSError, SystemExit):
+        open(os.path.join(vm_dir(name), "last_use"), "w").close()
+
+
+def wake(name):
+    """Called on every use of a VM: records it (idle_pause counts from the last use), and runs a VM the daemon
+    paused for idleness again (a pause by the user stays). The marker goes only once QEMU runs it again: a busy QMP
+    leaves it for the next use to retry."""
+    touch_use(name)
+    if not os.path.exists(_idle_marker(name)):
+        return
+    q = qmp(name)
+    try:
+        if q.cmd("query-status")["status"] == "paused":
+            q.cmd("cont")
+            event("woken", name)
+    finally:
+        q.close()
+    with contextlib.suppress(OSError):
+        os.remove(_idle_marker(name))
+
+
+def supervise(name, restart=None, idle_pause=None):
+    """Show, or set, how the daemon looks after a VM: restart always|never; idle_pause minutes (0: never)."""
+    m = load(name)
+    if restart is not None:
+        if restart not in ("always", "never"):
+            raise SystemExit("restart is always or never")
+        m["restart"] = restart
+    if idle_pause is not None:
+        if idle_pause < 0:
+            raise SystemExit("idle_pause is a number of minutes (0: never)")
+        m["idle_pause"] = idle_pause
+    if restart is not None or idle_pause is not None:
+        save(name, m)
+    return {"name": name, "restart": m.get("restart", "always"), "idle_pause": m.get("idle_pause", 0)}
+
+
+def _sup_file():
+    return os.path.join(STORE, ".supervisor.json")
+
+
+def _sup_load():
+    try:
+        with open(_sup_file()) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _sup_save(st):
+    tmp = f"{_sup_file()}.{os.getpid()}.new"
+    with open(tmp, "w") as f:
+        json.dump(st, f)
+    os.replace(tmp, _sup_file())
+
+
+def _pid(name):
+    try:
+        with open(os.path.join(vm_dir(name), "qemu.pid")) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _restart(n, s, now):
+    """A VM that should run is down: start it again, unless a window was closed (wanted: off), the VM is busy with a
+    user operation, or its disk is still held (QEMU alive, QMP only busy)."""
+    if os.path.exists(os.path.join(vm_dir(n), "window")):  # QEMU's window closed: the user's way to stop it
+        os.remove(os.path.join(vm_dir(n), "window"))
+        want(n, "stopped")
+        return [event("window_closed", n, "its window was closed: left stopped")]
+    try:
+        with vm_op(n, wait=0):
+            if wanted(n) != "running" or disk_in_use(n):  # changed meanwhile, or QEMU alive behind a busy QMP
+                return []
+            s["restarts"] = s.get("restarts", 0) + 1
+            s["next_try"] = now + min(SUP_BACKOFF_MAX, 5 * 2 ** min(s.get("streak", 0), 6))
+            s["streak"] = s.get("streak", 0) + 1
+            try:
+                quiet(start, n, set_want=False)
+            except (SystemExit, Exception) as e:  # quota, a missing disk: try again later
+                return [event("restart_failed", n, str(e))]
+            return [event("restarted", n, f"restart {s['restarts']} (it stopped without a guest shutdown)")]
+    except SystemExit:  # a user operation holds it: next pass
+        return []
+
+
+def supervise_pass(st, now=None, cpu=None):
+    """One pass over the VMs; st: the daemon's memory (saved to STORE/.supervisor.json), cpu: {name: (time, CPU s)}
+    kept in the daemon's process between passes. Returns the events it caused. One VM's failure (a busy QMP) never
+    stops the pass for the others."""
+    now, cpu, done = time.time() if now is None else now, cpu if cpu is not None else {}, []
+    for n in machines():
+        s = st.setdefault(n, {})
+        try:
+            done += _supervise_one(n, s, now, cpu)
+            s.pop("error", None)
+        except (SystemExit, Exception) as e:
+            if s.get("error") != str(e):  # once per distinct error, not every pass
+                done.append(event("supervise_failed", n, str(e)))
+            s["error"] = str(e)
+    for gone in set(st) - set(machines()):
+        st.pop(gone)
+    return done
+
+
+def _supervise_one(n, s, now, cpu):
+    m, st_ = load(n), state(n)
+    if st_ == "stopped":
+        candidate = wanted(n) == "running" and m.get("restart", "always") != "never"
+        if candidate and disk_in_use(n):  # QMP busy or not answering, QEMU alive: unknown, judge nothing
+            return []
+        cpu.pop(n, None)
+        for k in ("since", "health_fails", "agent", "idle_since"):
+            s.pop(k, None)
+        return _restart(n, s, now) if candidate and now >= s.get("next_try", 0) else []
+    if "since" not in s:
+        s["since"] = now
+    if now - s["since"] > SUP_STABLE:
+        s["streak"] = 0
+    if st_ != "running":  # paused: by the user, or idle (woken by the next use)
+        cpu.pop(n, None)
+        return []
+    done = []
+    try:
+        used = os.path.getmtime(os.path.join(vm_dir(n), "last_use"))
+    except OSError:
+        used = 0
+    # health: judged only once the guest agent has answered (VMs without one are not), after a grace period, and
+    # not right after a use (exec and file copies hold the agent's one connection); a short wait until it answered
+    if now - used > 60:
+        try:
+            QGA(n, timeout=2 if s.get("agent") else 0.5).call("guest-ping")
+            if s.get("health_fails", 0) >= HEALTH_RETRIES:
+                done.append(event("healthy", n))
+            s["agent"], s["health_fails"] = True, 0
+        except (OSError, RuntimeError, ValueError):
+            if s.get("agent") and now - s["since"] > HEALTH_GRACE:
+                s["health_fails"] = s.get("health_fails", 0) + 1
+                if s["health_fails"] == HEALTH_RETRIES:
+                    done.append(event("unhealthy", n, f"guest agent silent {HEALTH_RETRIES} times in a row"))
+    # idle pause: QEMU's CPU % between two passes, the last use, VNC clients
+    minutes, pid = m.get("idle_pause", 0), _pid(n)
+    t = _proc_times(pid) if minutes and pid else None
+    if not t:
+        return done
+    last, cpu[n] = cpu.get(n), (now, t[0])
+    if not last or now <= last[0]:
+        return done
+    if (t[0] - last[1]) / (now - last[0]) * 100 >= IDLE_CPU:  # computing: not idle, whoever uses it
+        s.pop("idle_since", None)
+        return done
+    if now - max(s.setdefault("idle_since", now), used) < minutes * 60:
+        return done
+    q = qmp(n)
+    try:
+        if q.cmd("query-vnc").get("clients"):  # someone watches through a VNC viewer (show): in use
+            s["idle_since"] = now
+            return done
+        with contextlib.suppress(OSError):  # a use since the start of this pass wins
+            if now - os.path.getmtime(os.path.join(vm_dir(n), "last_use")) < minutes * 60:
+                return done
+        open(_idle_marker(n), "w").close()  # first: a use from now on finds it and wakes the VM
+        try:
+            q.cmd("stop")
+        except Exception:
+            os.remove(_idle_marker(n))
+            raise
+    finally:
+        q.close()
+    s.pop("idle_since", None)
+    return done + [event("idle_paused", n, f"unused and under {IDLE_CPU:g}% CPU for {minutes} min; woken by the next use")]
+
+
+def _daemon_file(kind):
+    return os.path.join(STORE, f"daemon.{kind}")
+
+
+def daemon_alive():
+    try:
+        with open(_daemon_file("beat")) as f:
+            return time.time() - float(f.read().split()[0]) < 5 * SUP_TICK
+    except (OSError, ValueError, IndexError):
+        return False
+
+
+def _claim_daemon_lock():
+    """The daemon's lock (a folder). Its owner beats (daemon.beat) from the start; a lock with no beat for
+    2 * SUP_TICK that is older than 30 s was left by a daemon that died (a pid alone proves nothing after a reboot:
+    numbers are reused), and is taken over by rename, so of two takers only one wins."""
+    lock = os.path.join(STORE, ".daemon.lock")
+    os.makedirs(STORE, exist_ok=True)
+    for _ in range(2):
+        try:
+            os.mkdir(lock)
+            return lock
+        except FileExistsError:
+            for _ in range(4 * SUP_TICK):
+                if daemon_alive():
+                    return None  # one daemon per store
+                time.sleep(0.5)
+            try:
+                if time.time() - os.path.getmtime(lock) < 30:  # a daemon starting right now
+                    return None
+            except OSError:
+                continue  # removed meanwhile: try mkdir again
+            stale = f"{lock}.stale-{os.getpid()}"
+            try:
+                os.rename(lock, stale)
+            except OSError:
+                return None  # another taker won
+            shutil.rmtree(stale, ignore_errors=True)
+    return None
+
+
+def daemon(cmd="status"):
+    if cmd == "status":
+        return {"daemon": "running" if daemon_alive() else "stopped", "supervised": [
+            dict(supervise(n), want=wanted(n), status=state(n)) for n in machines()]}
+    if cmd == "stop":
+        if daemon_alive():
+            open(_daemon_file("stop"), "w").close()
+            for _ in range(6 * SUP_TICK):
+                if not daemon_alive():
+                    break
+                time.sleep(0.5)
+        return {"daemon": "running" if daemon_alive() else "stopped"}
+    if cmd == "start":
+        if daemon_alive():
+            return {"daemon": "running"}
+        with contextlib.suppress(OSError):
+            os.remove(_daemon_file("stop"))
+        os.makedirs(STORE, exist_ok=True)
+        args = [sys.executable, os.path.abspath(__file__), "daemon", "run"]
+        with open(_daemon_file("log"), "ab") as log:  # the child keeps its own handle
+            if WINDOWS:  # out of the parent's job too: else it dies with the terminal or MCP server that started it
+                base = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+                try:
+                    subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                     creationflags=base | 0x01000000)  # CREATE_BREAKAWAY_FROM_JOB
+                except OSError:  # a job that forbids breaking away
+                    subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log, creationflags=base)
+            else:
+                subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+        return {"daemon": "started"}
+    if cmd != "run":
+        raise SystemExit("daemon run|start|stop|status")
+    lock = _claim_daemon_lock()
+    if not lock:
+        return {"daemon": "running"}
+    alive = threading.Event()
+
+    def beat():  # its own thread: a slow pass (QMP timeouts on several VMs) must not make the daemon look dead
+        while not alive.is_set():
+            with contextlib.suppress(OSError):
+                tmp = f"{_daemon_file('beat')}.new"
+                with open(tmp, "w") as f:
+                    f.write(f"{time.time()} {os.getpid()}")
+                os.replace(tmp, _daemon_file("beat"))
+            alive.wait(SUP_TICK)
+    try:
+        threading.Thread(target=beat, daemon=True).start()
+        event("daemon_started", detail=f"pid {os.getpid()}")
+        st, cpu, quiet_since, last_err = _sup_load(), {}, time.time(), None
+        while not os.path.exists(_daemon_file("stop")):
+            try:
+                supervise_pass(st, cpu=cpu)
+                _sup_save(st)
+                last_err = None
+            except Exception as e:  # one bad pass must not end supervision; logged once, not every 5 s
+                if str(e) != last_err:
+                    print(f"{time.strftime('%H:%M:%S')} pass: {e}", file=sys.stderr, flush=True)
+                last_err = str(e)
+            if any(wanted(n) == "running" for n in machines()):
+                quiet_since = time.time()
+            elif time.time() - quiet_since > IDLE_EXIT:
+                alive.set()  # look stopped first: a start from now on launches a new daemon...
+                with contextlib.suppress(OSError):
+                    os.remove(_daemon_file("beat"))
+                if any(wanted(n) == "running" for n in machines()):  # ...or one came in just before: stay
+                    alive.clear()
+                    threading.Thread(target=beat, daemon=True).start()
+                    quiet_since = time.time()
+                    continue
+                event("daemon_stopped", detail="no VM to look after")
+                break
+            time.sleep(SUP_TICK)
+        else:
+            event("daemon_stopped")
+    finally:
+        alive.set()
+        for k in ("stop", "beat"):
+            with contextlib.suppress(OSError):
+                os.remove(_daemon_file(k))
+        shutil.rmtree(lock, ignore_errors=True)
 
 
 # ---------- networks ----------
@@ -1346,7 +1833,7 @@ def vm_disk_gb(name, m):
     """Virtual disk size, what the guest can fill (stored at create; read once for older VMs)."""
     if "disk_gb" not in m:
         r = subprocess.run([qemu_bin("qemu-img"), "info", "-U", "--output=json", os.path.join(vm_dir(name), "disk.qcow2")],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, **NO_WINDOW)
         try:
             m["disk_gb"] = -(-json.loads(r.stdout)["virtual-size"] // 2 ** 30)
         except (ValueError, KeyError):
@@ -1574,11 +2061,7 @@ def project_move(name, project):
 
 def _stopped(name):
     load(name)
-    busy = state(name) != "stopped"
-    disk = os.path.join(vm_dir(name), "disk.qcow2")
-    if not busy and os.path.exists(disk):  # QMP unreachable is not proof: a running QEMU also holds the image lock
-        busy = subprocess.run([qemu_bin("qemu-img"), "info", disk], capture_output=True).returncode != 0
-    if busy:
+    if state(name) != "stopped" or disk_in_use(name):  # QMP unreachable is not proof: a running QEMU holds the disk
         raise SystemExit(f"{name} is running; stop it first: terminal-vm stop {name}")
 
 
@@ -1618,6 +2101,7 @@ def _gc_bases():
             os.remove(f)
 
 
+@locked_op
 def clone(src, new):
     """New VM whose disk is a copy-on-write overlay (instant, small). SRC's disk becomes a read-only base image
     under STORE/.bases and SRC an overlay on it too, so both keep running and changing on their own; the base
@@ -1664,6 +2148,7 @@ def clone(src, new):
     print(json.dumps({"cloned": src, "to": new}))
 
 
+@locked_op
 def rm(name):
     _stopped(name)
     shutil.rmtree(vm_dir(name))  # its network memberships go with its machine.json
@@ -1671,6 +2156,7 @@ def rm(name):
     print(json.dumps({"removed": name}))
 
 
+@locked_op
 def reset(name):
     """Blank disk of the same size, so the next start installs again (Windows answers rewritten, account kept).
     Deletes the disk's snapshots too."""
@@ -1697,6 +2183,7 @@ def reset(name):
     print(json.dumps({"reset": name}))
 
 
+@locked_op
 def snapshot(name, cmd, tag=None):
     """qcow2 internal snapshots. Running VM: whole machine, memory included (savevm, pauses it a few
     seconds). Stopped VM: disk only (qemu-img); loading one then boots from that disk state."""
@@ -1875,6 +2362,11 @@ def set_sandbox(name, value=None):
 
 def transfer(name, direction, src, dest):
     """Copy a file to (push) or from (pull) the guest through qemu-guest-agent."""
+    with in_use(name):
+        return _transfer(name, direction, src, dest)
+
+
+def _transfer(name, direction, src, dest):
     if load(name).get("sandbox"):
         raise SystemExit(f"{name} is sandboxed: no file copy in or out (terminal-vm sandbox {name} off to allow it)")
     try:
@@ -1909,6 +2401,7 @@ def show(name, read_only=False):
     d = vm_dir(name)
     if state(name) == "stopped":
         raise SystemExit(f"{name} is not running; run: terminal-vm start {name}")
+    wake(name)
     for exe, argv in VIEWERS[1:] if read_only else VIEWERS:  # only TigerVNC has a view-only mode
         if shutil.which(exe):
             detach = {"creationflags": subprocess.DETACHED_PROCESS} if WINDOWS else {"start_new_session": True}
@@ -2232,8 +2725,13 @@ def view(name, fps=30, read_only=False):
     last, geom, held, cell, shown, prev_rgb, refine = None, None, set(), (20, 10), None, b"", cell_refiner()
     stale, mapped0 = False, 0
     active = time.monotonic()  # last screen change or input: capture at fps for 2 s after it, at 5 Hz when idle
+    used = 0.0
     try:
         while True:
+            if time.monotonic() - used > 30:  # someone watching: a use (the daemon's idle pause waits)
+                used = time.monotonic()
+                with contextlib.suppress(RuntimeError, OSError):
+                    wake(name)
             try:
                 data, (w, h) = screenshot(name, q, "view.png") if proto == "kitty" else screen_pixels(name, q)
             except (OSError, RuntimeError):  # a capture can stall >10 s on a loaded host: reconnect, keep viewing
@@ -2979,6 +3477,10 @@ def main(argv=None):
     lo = sub.add_parser("layout"); lo.add_argument("name"); lo.add_argument("layout", nargs="?", choices=sorted(LAYOUTS))
     sb = sub.add_parser("sandbox"); sb.add_argument("name"); sb.add_argument("value", nargs="?", choices=["on", "off"])
     sub.add_parser("top")
+    sub.add_parser("daemon").add_argument("daemon_cmd", choices=["run", "start", "stop", "status"])
+    su = sub.add_parser("supervise"); su.add_argument("name"); su.add_argument("--restart", choices=["always", "never"])
+    su.add_argument("--idle-pause", type=int, help="minutes unused (and under 20%% CPU) before the daemon pauses it (0: never)")
+    ev = sub.add_parser("events"); ev.add_argument("-n", type=int, default=50); ev.add_argument("--vm")
     ne = sub.add_parser("net"); nsub = ne.add_subparsers(dest="net_cmd", required=True)
     nsub.add_parser("create").add_argument("net"); nsub.add_parser("rm").add_argument("net")
     nsub.choices["create"].add_argument("--project")
@@ -3032,6 +3534,14 @@ def main(argv=None):
             change = {"cpus": o.cpus, "memory_gb": o.memory, "disk_gb": o.disk, "vms": o.vms}
             return print(json.dumps(quota(change if any(v is not None for v in change.values()) else None), indent=1))
         if o.cmd == "top": return print(json.dumps(top(), indent=1))
+        if o.cmd == "daemon":
+            r = daemon(o.daemon_cmd)
+            return None if o.daemon_cmd == "run" else print(json.dumps(r, indent=1))
+        if o.cmd == "supervise": return print(json.dumps(supervise(o.name, o.restart, o.idle_pause)))
+        if o.cmd == "events":
+            for e in events(o.n, o.vm):
+                print(json.dumps(e))
+            return
         if o.cmd == "internet": return print(json.dumps(set_internet(o.name, o.value)))
         if o.cmd == "net":
             return print(json.dumps(

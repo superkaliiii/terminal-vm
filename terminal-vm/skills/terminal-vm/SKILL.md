@@ -17,7 +17,7 @@ First call `project_status`: the VMs and networks of your project (with `want`, 
 
 ## Loop: observe -> act -> verify
 
-1. `status`. If it says the VM is not running, ask the user to run `terminal-vm up NAME` (or `start NAME`). If paused, `terminal-vm resume NAME`.
+1. `status`. If it says the VM is not running, ask the user to run `terminal-vm up NAME` (or `start NAME`). If paused, `terminal-vm resume NAME`. A VM the supervisor paused because nobody used it wakes by itself at your first action.
 2. `screenshot` and read it before every decision. Never guess coordinates.
 3. Do one meaningful action, then take a new screenshot to confirm the result.
 4. Prefer keyboard shortcuts when they are reliable (`ctrl+l` in a browser, `alt+f2` run dialog, `ctrl+alt+t` terminal on many desktops).
