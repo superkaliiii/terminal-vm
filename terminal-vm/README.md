@@ -43,6 +43,8 @@ or install this folder as a Claude Code plugin (`.claude-plugin/`).
 |---|---|
 | `ls`, `status NAME`, `doctor`, `help`, `version` | list VMs, state + screen + logged-in users, host checks |
 | `start NAME [--window]`, `pause`, `resume` | lifecycle |
+| `resume [--stay]`, `autostart [on\|off]` | start again the VMs that were running before a restart; at each logon (see [Restarts](#restarts)) |
+| `project ls`, `project show [P]`, `project notes [P [TEXT]]`, `project move NAME P`; `create --project P` | projects (see [Projects](#projects)) |
 | `stop NAME [--timeout 60]` / `--force` | asks the guest and waits; reports a guest showing a confirmation dialog |
 | `rm NAME` / `reset NAME` | delete a stopped VM / give it a blank disk of the same size (reinstalls on the next start, Windows answers kept) |
 | `clone SRC NEW` | copy-on-write copy of a stopped VM in under a second: install once, clone many (Windows Server 2025 clone ready in 0.3 s + 28 s boot instead of a 37-min install). SRC's disk moves to a read-only base in `.bases/` of the store and SRC becomes an overlay on it too, so both keep running and changing independently; clones of an unchanged SRC share one base, and a base is deleted with its last VM (`rm`/`reset`). SRC must have no snapshots (they would stay in the base). Clones keep SRC's account. A Windows clone with the guest agent takes its own computer name (from the VM name) at its first start, without a reboot: about 30 s after the agent answers, its session logs off and back on automatically; NetBIOS is turned off in it (the old name would stay registered until a reboot), names resolve through DNS/LLMNR |
@@ -54,7 +56,7 @@ or install this folder as a Claude Code plugin (`.claude-plugin/`).
 | `view NAME [--read-only]` | interactive terminal viewer (keyboard, mouse, wheel): Kitty graphics, else Sixel (adaptive 255-colour palette, text kept legible when shrunk), else the VNC window; centred, follows resizes, redraws only what changed; Ctrl+] exits, Ctrl+O opens the window |
 | `show NAME [--read-only]` / `hide NAME` | native window through VNC (unix socket); `--read-only` needs TigerVNC |
 | `action NAME screenshot\|click\|move\|drag\|scroll\|type\|key\|wait ...` | one action, JSON reply |
-| `mcp [NAME]` | stdio MCP server (also exposes `wait`: until the screen stops changing; with `screenshot: true` an action returns the screen once it has changed, up to 1.5 s) |
+| `mcp [NAME] [--project P]` | stdio MCP server (also exposes `wait`: until the screen stops changing; with `screenshot: true` an action returns the screen once it has changed, up to 1.5 s) |
 | `skills get\|path\|install` | agent skill |
 
 The viewer has its own QMP monitor, so agents keep working while someone watches.
@@ -143,7 +145,43 @@ Through MCP an agent can build a small infrastructure on its own, within the quo
 | `vm_clone` of one of the user's VMs (the clone starts offline) | `clone SRC NEW` |
 | `vm_remove`, `snapshot load\|rm` on a sandboxed VM the user created | `rm NAME`, `snapshot NAME load\|rm TAG` |
 
-The server asks through MCP elicitation when the client supports it (a yes/no form); otherwise, or on refusal, the tool fails and names the command. `vm_create` takes only images already in `images/` of the store (never a host path), creates a sandbox by default, and leaves a non-sandboxed VM offline. Every infrastructure call, failures included, is appended to `agent.log` in the store. Verified under WSL: an agent with MCP alone created two sandboxed Tiny Core VMs and a network, configured them, pinged one from the other (0% loss), then removed everything.
+The server asks through MCP elicitation when the client supports it (a yes/no form); otherwise, or on refusal, the tool fails and names the command. `vm_create` takes only images already in `images/` of the store (never a host path), creates a sandbox by default, and leaves a non-sandboxed VM offline. Every infrastructure call, failures included, is appended to the project's `agent.log` (`STORE/.projects/P/`). The `exec` tool runs a shell command in the guest through qemu-guest-agent (Linux: `sh -c` as root; Windows: PowerShell as SYSTEM; not in sandboxes, which have no guest agent): on the server's own VM, or on another VM the agent manages. Verified under WSL: an agent with MCP alone created two sandboxed Tiny Core VMs and a network, configured them, pinged one from the other (0% loss), then removed everything.
+
+## Restarts
+
+- `start` and `stop` record what each VM should be doing (`want` in its folder). After the PC (or WSL) restarts,
+  `resume` (no VM name) starts again the VMs that were running, within the quota, and leaves alone those stopped on
+  purpose. A VM shut down from inside the guest stays "running" in that record and comes back.
+- `autostart on` runs it at each logon: on Windows (also from WSL) a scheduled task `terminal-vm-resume` (from
+  WSL: `conhost --headless wsl.exe ... resume --stay`, which keeps WSL up while VMs run); on Linux a systemd user
+  service (at login; `loginctl enable-linger` for boot without login). `autostart off` removes it, `autostart` alone
+  tells whether it is on. To turn it on:
+
+  ```sh
+  # from Windows, terminal-vm in WSL (Claude Code: prefix with ! to run it in the session)
+  wsl -d Debian -- python3 /path/to/terminal_vm.py autostart on
+  # Windows host, or Linux, or inside WSL
+  python3 terminal_vm.py autostart on
+  ```
+- Containers inside a VM: install [terminal-ct](https://github.com/superkaliiii/terminal-conteneur) in the guest and
+  run `terminal-ct autostart on` there (as the guest's user); with the VM itself on autostart, its containers come
+  back too. Its containers can sit under the VM's project: `TERMINAL_CT_PROJECT=lab/<vm>` in the guest.
+- Agents: the MCP tool `autostart` shows the setting and turns it on or off with the user's approval; with `vm`,
+  it does that for terminal-ct inside that Linux VM (run as the logged-in user through the guest agent), also with
+  approval.
+
+## Projects
+
+- A project groups VMs and networks (`create --project P`, `net create NET --project P`; otherwise
+  `TERMINAL_VM_PROJECT`, else `default`) with their notes and agent log (`STORE/.projects/P/`). Sub-projects are
+  paths (`lab/web`, up to 4 levels); whoever has `lab` also has `lab/web`. `project move NAME P` only relabels.
+- `mcp --project P`: the agent sees and reaches only P's VMs and networks (and its sub-projects'), creates and clones
+  into P or below; outside P nothing is listed and nothing can be approved, so each agent keeps to its own project.
+  Its `quota` and `top` show the room left and its project's use, not the other projects'; a name taken elsewhere
+  is just "not available".
+- To resume, an agent calls `project_status` (VMs and networks with what each should be doing, notes, latest
+  actions with errors); `notes_write` keeps notes for the next session. The server says so at connection
+  (MCP `instructions`).
 
 ## Keyboard layouts and text
 

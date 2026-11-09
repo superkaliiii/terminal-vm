@@ -1,4 +1,5 @@
 import contextlib, io, json, os, re, socket, struct, sys, tempfile, threading, time, unittest, zlib
+from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import terminal_vm as tl
 
@@ -530,6 +531,77 @@ class StoppedVm(unittest.TestCase):
             f(*a)
         return json.loads(buf.getvalue())
 
+    def vm(self, name, **m):
+        os.makedirs(os.path.join(self.tmp, name), exist_ok=True)
+        tl.save(name, {"cpus": 1, "memory_mb": 1024, "width": 1280, "height": 800, "disk_gb": 4, **m})
+
+    def test_project_scope_is_closed(self):
+        yes = lambda m, c: None
+        self.vm("a", project="alpha", created_by="agent"); self.vm("w", project="alpha/web", created_by="agent")
+        self.vm("b", project="beta", created_by="agent")
+        listed = sorted(v["name"] for v in tl.agent_call("vm_list", {}, yes, project="alpha"))
+        self.assertEqual(listed, ["a", "w"])                                  # its sub-project too, not beta
+        for tool, a in (("vm_start", {"vm": "b"}), ("vm_resources", {"vm": "b"}), ("vm_internet", {"vm": "b"})):
+            with self.assertRaisesRegex(SystemExit, "not in this agent's project 'alpha'"):
+                tl.agent_call(tool, a, yes, project="alpha")                  # even approving would not help
+        with self.assertRaisesRegex(SystemExit, "not this agent's project"):
+            tl.agent_call("notes_write", {"text": "x", "project": "beta"}, yes, project="alpha")
+        with self.assertRaisesRegex(SystemExit, "is not available: choose another"):  # no project, no detail
+            tl.agent_call("vm_clone", {"vm": "a", "new": "b"}, yes, project="alpha")
+        tl.net_create("bnet", "beta")
+        with self.assertRaisesRegex(SystemExit, "not in this agent's project"):
+            tl.agent_call("net_attach", {"vm": "a", "net": "bnet"}, yes, project="alpha")
+        self.assertEqual(tl.agent_call("net_list", {}, yes, project="alpha"), [])
+        q = tl.scoped_quota("alpha")
+        self.assertEqual(q["cpus"]["used_by_project"], 0); self.assertNotIn("used", q["cpus"])
+        tl.agent_call("notes_write", {"text": "web: nginx left"}, yes, project="alpha/web")
+        st = tl.project_status("alpha")
+        self.assertEqual((sorted(v["name"] for v in st["vms"]), st["sub_projects"]), (["a", "w"], ["alpha/web"]))
+        self.assertIn("nginx left", tl.project_status("alpha/web")["notes"])
+        self.assertEqual(tl.project_move("b", "alpha"), {"vm": "b", "project": "alpha"})
+
+    def test_mcp_project_status_and_robust_log(self):
+        self.vm("a", project="site", created_by="agent")
+        lines = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                 {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "notes_write", "arguments": {"text": "t", "project": "../x"}}},
+                 {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "project_status", "arguments": {}}},
+                 {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "screenshot", "arguments": {"vm": "v"}}},
+                 {"jsonrpc": "2.0", "id": 5, "method": "ping"}]
+        old = sys.stdin
+        sys.stdin = io.StringIO("".join(json.dumps(x) + "\n" for x in lines))
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                tl.mcp("a", "site")
+        finally:
+            sys.stdin = old
+        msgs = [json.loads(x) for x in out.getvalue().splitlines()]
+        self.assertEqual([m["id"] for m in msgs], [1, 2, 3, 4, 5])               # still serving
+        self.assertIn("project_status first", msgs[0]["result"]["instructions"])
+        self.assertTrue(msgs[1]["result"]["isError"])
+        self.assertEqual([v["name"] for v in json.loads(msgs[2]["result"]["content"][0]["text"])["vms"]], ["a"])
+        self.assertIn("not in this agent's project", msgs[3]["result"]["content"][0]["text"])  # v is default's
+
+    def test_want_and_resume(self):
+        self.quiet(tl.stop, "v")
+        self.assertEqual(tl.wanted("v"), "stopped")
+        self.vm("up"); tl.want("up", "running")
+        started = []
+        with mock.patch.object(tl, "start", lambda n, window=False: (started.append(n), print(json.dumps({"started": n})))):
+            out = self.quiet(tl.resume_all)
+        self.assertEqual((started, [r["name"] for r in out["resumed"]]), (["up"], ["up"]))
+
+    def test_autostart_commands(self):
+        with mock.patch.object(tl, "in_wsl", lambda: True), mock.patch.dict(os.environ, {"WSL_DISTRO_NAME": "Debian"}):
+            out = tl.autostart(True)
+        self.assertTrue(out["runs"].startswith("conhost.exe --headless wsl.exe -d Debian --exec env "))
+        self.assertTrue(out["runs"].endswith(" resume --stay"))
+        self.assertEqual(self.calls[-1][:5], ["schtasks.exe", "/Create", "/TN", "terminal-vm-resume", "/SC"])
+        with self.assertRaisesRegex(RuntimeError, "terminal-vm autostart on"):
+            tl.agent_call("autostart", {"on": True}, lambda m, c: (_ for _ in ()).throw(RuntimeError(c)))
+        tl.save("v", dict(tl.load("v"), sandbox=True))
+        with self.assertRaisesRegex(SystemExit, "sandbox: no guest agent"):
+            tl.guest_shell("v", "true")
+
     def test_reset_keeps_size_and_config(self):
         tl.save("v", dict(tl.load("v"), base="src"))  # a clone: reset gives it a blank disk of its own
         self.quiet(tl.reset, "v")
@@ -825,7 +897,7 @@ class StoppedVm(unittest.TestCase):
         self.assertEqual(msgs[1]["method"], "elicitation/create")
         self.assertEqual(json.loads(msgs[2]["result"]["content"][0]["text"]), {"vm": "v", "internet": True})
         self.assertEqual(msgs[3]["id"], 3)                                   # the queued ping is answered after
-        with open(os.path.join(self.tmp, "agent.log"), encoding="utf-8") as f:
+        with open(os.path.join(self.tmp, ".projects", "default", "agent.log"), encoding="utf-8") as f:
             self.assertEqual(json.loads(f.readline())["tool"], "vm_internet")
         os.makedirs(os.path.join(self.tmp, "u")); tl.save("u", {"cpus": 1})  # the user's VM
         sys.stdin = io.StringIO(json.dumps({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {

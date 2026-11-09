@@ -11,6 +11,10 @@ terminal-vm gives you computer use inside a separate virtual machine (Linux, Win
 
 `screenshot`, `click` (`clicks: 2|3`, `button: right|middle`), `move`, `drag`, `scroll` (`dy`, negative scrolls down, 100 per notch), `type`, `key`, `status`, `wait` (until the screen stops changing, then a screenshot; `stable` seconds, `timeout`; a blinking cursor can keep it from settling, so read `stable` in the reply). Coordinates are pixels of the latest `screenshot`. Action tools accept `screenshot: true` to return a screenshot with the result, taken once the screen has changed (up to 1.5 s: a busy guest shows keystrokes late); if the effect is still missing, `wait` then `screenshot`.
 
+## Start and end of a session
+
+First call `project_status`: the VMs and networks of your project (with `want`, what each should be doing), the notes earlier sessions left, and their latest actions and errors. Pick up from there instead of rebuilding. Before you stop, `notes_write` what you set up, what works and what is left. A server started with `--project` shows you only that project (and its sub-projects, `lab/web`): the rest is not yours. `exec` runs a shell command in a managed, non-sandboxed VM (guest agent). `autostart` (with the user's approval) brings running VMs back after the PC restarts; with `vm`, it turns terminal-ct's autostart on inside that Linux VM.
+
 ## Loop: observe -> act -> verify
 
 1. `status`. If it says the VM is not running, ask the user to run `terminal-vm up NAME` (or `start NAME`). If paused, `terminal-vm resume NAME`.

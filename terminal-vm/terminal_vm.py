@@ -10,14 +10,17 @@ Virtualization), which is also the default for `up` and `create` without `--os`.
   up [NAME] [--os OS] [--iso PATH] [--no-view] [--plan]   guided: image, create, start, view
   create NAME [--os linux|winxp|win7|win8|win10|win11|win2016|win2019|win2022|win2025|macos]
               [--iso PATH] [--product-key KEY] [--cpus N] [--memory GiB] [--disk GiB]
-              [--width 1280] [--height 800] [--layout us|fr] [--offline]
+              [--width 1280] [--height 800] [--layout us|fr] [--offline] [--project P]
   ls | status NAME | doctor | help | version
   start NAME [--window] | stop NAME [--force] [--timeout 60] | pause NAME | resume NAME
+  resume [--stay]          no NAME: start again the VMs that were running before the PC restarted
+  autostart [on|off]       do that at each logon (Windows task, also from WSL; systemd user unit on Linux)
+  project ls | project show [P] | project notes [P [TEXT]] | project move NAME P   (sub-projects: lab/web)
   rm NAME | reset NAME     delete a stopped VM | blank its disk to reinstall
   clone SRC NEW            instant copy-on-write copy of a stopped VM (SRC then stays read-only)
   snapshot NAME save|load|rm TAG | snapshot NAME ls
   display NAME --width W --height H    screen size at the next start
-  net create|rm NET | net ls | net attach|detach NAME NET   isolated VM-to-VM networks (stopped VMs)
+  net create NET [--project P] | net rm NET | net ls | net attach|detach NAME NET   isolated VM-to-VM networks
   internet NAME [on|off]   NAT internet access (for a sandboxed VM, on = the user's approval)
   top                      running VMs' real CPU and memory on the host, allotments, quota
   quota [--cpus N --memory GiB --disk GiB --vms N]   host-wide ceiling for all VMs (default from the host)
@@ -29,10 +32,10 @@ Virtualization), which is also the default for `up` and `create` without `--os`.
   view NAME [--read-only]  terminal viewer (Kitty or Sixel: Windows Terminal, foot); Ctrl+] exits, Ctrl+O window
   show NAME [--read-only] | hide NAME   native window (VNC viewer)
   action NAME screenshot|click|move|drag|scroll|type|key|wait ...
-  mcp [NAME]         stdio MCP server
+  mcp [NAME] [--project P]   stdio MCP server (with --project: only that project and its sub-projects)
   skills get | skills path | skills install [--dir DIR]
 """
-import argparse, base64, collections, contextlib, hashlib, io, json, os, queue, re, secrets, shutil, signal, socket, struct, subprocess, sys, \
+import argparse, base64, collections, contextlib, hashlib, io, json, os, queue, re, secrets, shlex, shutil, signal, socket, struct, subprocess, sys, \
     threading, time, urllib.parse, urllib.request
 from xml.sax.saxutils import escape
 
@@ -248,22 +251,91 @@ def _kv(text):
     return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
 
 
-def guest_ps(name, script, timeout=120):
-    """Run a PowerShell script in a Windows guest through qemu-guest-agent (as SYSTEM): (exit code, output)."""
+def guest_exec(name, path, args, timeout=120):
+    """Run a program in the guest through qemu-guest-agent (root, or SYSTEM on Windows): exit code, stdout, stderr."""
     g = QGA(name, timeout=5)
     try:
-        enc = base64.b64encode(script.encode("utf-16-le")).decode()
-        pid = g.call("guest-exec", path="powershell.exe", arg=["-NoProfile", "-NonInteractive", "-EncodedCommand", enc],
-                     **{"capture-output": True})["pid"]
+        pid = g.call("guest-exec", path=path, arg=args, **{"capture-output": True})["pid"]
         end = time.time() + timeout
         while time.time() < end:
             st = g.call("guest-exec-status", pid=pid)
             if st.get("exited"):
-                return st.get("exitcode", 1), base64.b64decode(st.get("out-data", "")).decode("utf-8", "replace")
-            time.sleep(0.5)
-        raise OSError("guest command timed out")
+                dec = lambda k: base64.b64decode(st.get(k, "")).decode("utf-8", "replace")
+                return {"exit": st.get("exitcode", 1), "stdout": dec("out-data"), "stderr": dec("err-data")}
+            time.sleep(0.2)
+        raise OSError(f"guest command timed out ({timeout} s)")
     finally:
         g.sock.close()
+
+
+def guest_ps(name, script, timeout=120):
+    """Run a PowerShell script in a Windows guest through qemu-guest-agent (as SYSTEM): (exit code, output)."""
+    enc = base64.b64encode(script.encode("utf-16-le")).decode()
+    r = guest_exec(name, "powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", enc], timeout)
+    return r["exit"], r["stdout"]
+
+
+def guest_shell(name, command, timeout=60):
+    """A shell command in the guest: sh -c on Linux, PowerShell on Windows (no guest agent in a sandbox)."""
+    m = load(name)
+    if m.get("sandbox"):
+        raise SystemExit(f"{name} is a sandbox: no guest agent to run commands through (use the screen tools)")
+    if state(name) == "stopped":
+        raise SystemExit(f"{name} is not running; start it: terminal-vm start {name}")
+    try:
+        if PROFILES[m.get("os", "linux")]["family"] == "windows":
+            enc = base64.b64encode(command.encode("utf-16-le")).decode()
+            return guest_exec(name, "powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", enc], timeout)
+        return guest_exec(name, "/bin/sh", ["-c", command], timeout)
+    except OSError as e:
+        raise SystemExit(f"{name}: no guest agent answered ({e}); install qemu-guest-agent in the guest") from None
+
+
+# ---------- projects ----------
+# A project groups VMs and networks (machine.json / network "project"; "default" when none) with its notes and the
+# log of what agents did there, so the next session picks up where the last one stopped. Sub-projects are paths
+# (lab/web); terminal-ct inside a VM of project lab can put its containers under lab/<vm> (TERMINAL_CT_PROJECT).
+DEFAULT_PROJECT = os.environ.get("TERMINAL_VM_PROJECT") or "default"
+_PROJECT = re.compile(r"[a-z0-9][a-z0-9_.-]{0,47}(/[a-z0-9][a-z0-9_.-]{0,47}){0,3}")
+
+
+def check_project(p):
+    if not isinstance(p, str) or not _PROJECT.fullmatch(p):
+        raise SystemExit(f"invalid project: {p!r} (lowercase names, sub-projects as lab/web)")
+    return p
+
+
+def under(p, project):
+    """p is project itself or one of its sub-projects; no project means everything."""
+    return not project or p == project or p.startswith(project + "/")
+
+
+def project_of(m):
+    return m.get("project") or "default"
+
+
+def project_dir(project):
+    # one flat folder per project ("+" for "/") under .projects: a dot name no VM can have
+    d = os.path.join(STORE, ".projects", check_project(project or DEFAULT_PROJECT).replace("/", "+"))
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+# ---------- resume after a restart ----------
+# What each VM should be doing (vm_dir/want: running or stopped, written by start and stop), so after the PC (or
+# WSL) restarts, `resume` starts again what was running and leaves alone what was stopped on purpose.
+
+def want(name, value):
+    with open(os.path.join(vm_dir(name), "want"), "w") as f:
+        f.write(value)
+
+
+def wanted(name):
+    try:
+        with open(os.path.join(vm_dir(name), "want")) as f:
+            return f.read().strip()
+    except OSError:
+        return "stopped"
 
 
 # Rename a Windows clone without rebooting it (tested on Server 2025): the registry names (hostname, DNS, .NET read
@@ -780,8 +852,10 @@ def qemu_args(name, m, window, vnc_port=None):
 
 
 def create(name, iso, os_name="linux", cpus=None, memory=None, disk=None, width=1280, height=800, layout="us",
-           offline=False, product_key=None, ui_language="en-US", sandbox=False, max_cpus=None, max_memory=None):
+           offline=False, product_key=None, ui_language="en-US", sandbox=False, max_cpus=None, max_memory=None,
+           project=None):
     d = vm_dir(name)
+    project = check_project(project or DEFAULT_PROJECT)
     p = PROFILES.get(os_name)
     if p is None:
         raise SystemExit(f"unknown --os {os_name!r}; choose from {', '.join(PROFILES)}")
@@ -821,7 +895,7 @@ def create(name, iso, os_name="linux", cpus=None, memory=None, disk=None, width=
                    check=True, stdout=subprocess.DEVNULL)
     m = {"os": os_name, "iso": os.path.abspath(iso), "memory_mb": memory * 1024, "cpus": cpus, "width": width,
          "height": height, "layout": layout, "offline": offline or sandbox, **({"sandbox": True} if sandbox else {}),
-         "max_cpus": top[0], "max_memory_mb": top[1] * 1024, "disk_gb": disk,
+         "max_cpus": top[0], "max_memory_mb": top[1] * 1024, "disk_gb": disk, "project": project,
          **({"balloon": True} if p["family"] == "linux" else {})}
     if p["family"] == "windows":
         # 12 characters: within XP's 14-character limit, and the suffix meets Server's complexity policy
@@ -831,7 +905,7 @@ def create(name, iso, os_name="linux", cpus=None, memory=None, disk=None, width=
         write_answers(d, m, key, ui_language)
     with open(os.path.join(d, "machine.json"), "w") as f:
         json.dump(m, f)
-    out = {"created": name, "os": os_name, "path": d}
+    out = {"created": name, "os": os_name, "path": d, "project": project}
     if p["family"] == "windows":
         out.update(user=m["user"], password=m["password"], note="Windows installs unattended on first start (10-40 min)")
     print(json.dumps(out))
@@ -871,6 +945,7 @@ def start(name, window=False):
                 save(name, m)
             quota_check({"cpus": run_cpus(name, m), "memory_gb": vm_ram_mb(m) / 1024, "vms": 1})
         _start(name, window)
+    want(name, "running")
 
 
 def _start(name, window=False):
@@ -924,6 +999,8 @@ def _start(name, window=False):
 
 
 def stop(name, force=False, timeout=60):
+    load(name)
+    want(name, "stopped")  # first: stopped on purpose, resume leaves it so
     if state(name) == "stopped":  # a stale qemu.pid may name an unrelated process now
         print(json.dumps({"stopped": name, "already": True})); return
     if force:
@@ -1043,8 +1120,9 @@ def net_members(net):
     return [(n, load(n)["networks"][net]) for n in machines() if net in load(n).get("networks", {})]
 
 
-def net_create(net):
+def net_create(net, project=None):
     path = net_file(net)
+    project = check_project(project or DEFAULT_PROJECT)
     with quota_lock():  # the host-wide lock also makes the index allocation atomic
         if os.path.exists(path):
             raise SystemExit(f"network {net!r} already exists")
@@ -1052,7 +1130,7 @@ def net_create(net):
         idx = next((i for i in range(1, 251) if i not in used), None)
         if idx is None:
             raise SystemExit("250 networks at most")
-        cfg = {"name": net, "index": idx, "port": 40000 + idx, "subnet": f"10.77.{idx}.0/24"}
+        cfg = {"name": net, "index": idx, "port": 40000 + idx, "subnet": f"10.77.{idx}.0/24", "project": project}
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as f:
             json.dump(cfg, f)
@@ -1341,10 +1419,123 @@ def ls():
         for n in sorted(os.listdir(STORE)):
             if os.path.isfile(os.path.join(STORE, n, "machine.json")):
                 m = load(n)
-                out.append({"name": n, "os": m.get("os", "linux"), "status": state(n), "cpus": m["cpus"], "memory_gb": m["memory_mb"] // 1024,
+                out.append({"name": n, "os": m.get("os", "linux"), "status": state(n), "project": project_of(m),
+                            "cpus": m["cpus"], "memory_gb": m["memory_mb"] // 1024,
                             "display": f"{m.get('width', 1280)}x{m.get('height', 800)}", "layout": m.get("layout", "us"),
                             **({"base": m["base"]} if m.get("base") else {}), **({"sandbox": True} if m.get("sandbox") else {})})
     print(json.dumps(out + mac_machines(), indent=1))
+
+
+def resume_all(stay=False):
+    """Start every VM that was running when the machine stopped (within the quota). stay: then keep this process
+    alive while any VM runs (WSL shuts its VM down once no Windows process uses it)."""
+    out = []
+    for n in machines():
+        if wanted(n) == "running" and state(n) == "stopped":
+            try:
+                out.append(dict(quiet(start, n), name=n))
+            except (SystemExit, Exception) as e:  # one refusal (quota) must not keep the others down
+                out.append({"name": n, "error": str(e)})
+    print(json.dumps({"resumed": out}))
+    while stay and any(state(n) != "stopped" for n in machines()):
+        time.sleep(60)
+
+
+AUTOSTART = "terminal-vm-resume"
+
+
+def autostart(on=None):
+    """Run `resume` at each logon: a Windows scheduled task (for WSL: wsl.exe running it inside the distribution,
+    kept alive while VMs run), else a systemd user service on Linux."""
+    me = [sys.executable, os.path.abspath(__file__)]
+    unit = os.path.expanduser(f"~/.config/systemd/user/{AUTOSTART}.service")
+    env = {k: os.environ[k] for k in ("TERMINAL_VM_HOME", "TERMINAL_LINUX_HOME", "XDG_DATA_HOME") if os.environ.get(k)}
+    if on:  # VMs running now, started before `want` was kept: they are to come back too
+        for n in machines():
+            if state(n) != "stopped" and not os.path.isfile(os.path.join(vm_dir(n), "want")):
+                want(n, "running")
+    if WINDOWS or in_wsl():
+        schtasks = "schtasks.exe" if in_wsl() else "schtasks"
+        if on is None:
+            return {"autostart": subprocess.run([schtasks, "/Query", "/TN", AUTOSTART], capture_output=True).returncode == 0}
+        if not on:
+            subprocess.run([schtasks, "/Delete", "/TN", AUTOSTART, "/F"], capture_output=True)
+            return {"autostart": False}
+        if in_wsl():  # conhost --headless: no console window at logon; wsl.exe reads a Windows command line
+            cmd = "conhost.exe --headless " + subprocess.list2cmdline(
+                ["wsl.exe", "-d", os.environ.get("WSL_DISTRO_NAME", "Debian"), "--exec", "env",
+                 *(f"{k}={v}" for k, v in env.items()), *me, "resume", "--stay"])
+        else:
+            if env:  # shortcut: a task's command line sets no variables; set them as user variables to use this
+                raise SystemExit(f"autostart on Windows uses the default store; unset {', '.join(env)} first")
+            cmd = subprocess.list2cmdline(me + ["resume"])
+        if len(cmd) > 261:  # schtasks /TR limit
+            raise SystemExit(f"the task's command line is {len(cmd)} characters, schtasks takes 261: {cmd}")
+        r = subprocess.run([schtasks, "/Create", "/TN", AUTOSTART, "/SC", "ONLOGON", "/TR", cmd, "/F"],
+                           capture_output=True, text=True)
+        if r.returncode:
+            raise SystemExit((r.stderr or r.stdout).strip())
+        return {"autostart": True, "task": AUTOSTART, "runs": cmd}
+    if on is None:
+        return {"autostart": os.path.isfile(unit)}
+    if not on:
+        subprocess.run(["systemctl", "--user", "disable", f"{AUTOSTART}.service"], capture_output=True)
+        with contextlib.suppress(OSError):
+            os.remove(unit)
+        return {"autostart": False}
+    os.makedirs(os.path.dirname(unit), exist_ok=True)
+    with open(unit, "w") as f:  # no After=default.target: with WantedBy it made an ordering cycle
+        f.write("[Unit]\nDescription=terminal-vm: start again the VMs that were running\n\n[Service]\nType=oneshot\n"
+                + "".join(f"Environment={shlex.quote(f'{k}={v}')}\n" for k, v in env.items())
+                + f"ExecStart={shlex.join(me + ['resume'])}\n\n[Install]\nWantedBy=default.target\n")
+    r = subprocess.run(["systemctl", "--user", "enable", f"{AUTOSTART}.service"], capture_output=True, text=True)
+    if r.returncode:
+        raise SystemExit((r.stderr or r.stdout).strip())
+    return {"autostart": True, "unit": unit, "note": "runs at your login; for boot without login: loginctl enable-linger"}
+
+
+def projects():
+    names = {DEFAULT_PROJECT} | {project_of(load(n)) for n in machines()} | {net_load(n).get("project", "default")
+                                                                            for n in networks()}
+    if os.path.isdir(os.path.join(STORE, ".projects")):
+        names |= {d.replace("+", "/") for d in os.listdir(os.path.join(STORE, ".projects"))}
+    vms = [(n, project_of(load(n))) for n in machines()]
+    return [{"project": p, "vms": sum(q == p for _, q in vms), "running": sum(q == p and state(n) != "stopped" for n, q in vms),
+             "networks": sum(net_load(n).get("project", "default") == p for n in networks())} for p in sorted(names)]
+
+
+def project_status(project=None, log_lines=30):
+    """Everything an agent needs to resume: the project's VMs and networks as they are now (want: what each should
+    be doing), its notes, and the latest actions (with errors) from its log."""
+    project = check_project(project or DEFAULT_PROJECT)
+    d = project_dir(project)
+    notes, log = "", []
+    with contextlib.suppress(OSError):
+        with open(os.path.join(d, "notes.md"), encoding="utf-8") as f:
+            notes = f.read()
+    with contextlib.suppress(OSError):
+        with open(os.path.join(d, AGENT_LOG), encoding="utf-8") as f:
+            log = [json.loads(l) for l in collections.deque(f, log_lines) if l.strip()]
+    vms = [dict(v, want=wanted(v["name"])) for v in quiet(ls) if v.get("engine") is None and under(v["project"], project)]
+    return {"project": project, "vms": vms,
+            "networks": [n for n in net_ls() if under(n.get("project", "default"), project)],
+            "sub_projects": sorted(p["project"] for p in projects() if p["project"].startswith(project + "/")),
+            "notes": notes, "recent_actions": log}
+
+
+def notes_write(project, text, mode="append"):
+    path = os.path.join(project_dir(project), "notes.md")
+    with open(path, "a" if mode == "append" else "w", encoding="utf-8") as f:
+        f.write((f"\n## {time.strftime('%Y-%m-%d %H:%M')}\n" if mode == "append" else "") + text.rstrip() + "\n")
+    return {"project": project or DEFAULT_PROJECT, "notes": mode, "bytes": os.path.getsize(path)}
+
+
+def project_move(name, project):
+    """Move a VM to another project (its files stay where they are: only its label changes)."""
+    m = load(name)
+    m["project"] = check_project(project)
+    save(name, m)
+    return {"vm": name, "project": project}
 
 
 def _stopped(name):
@@ -2323,11 +2514,70 @@ def _net_owned(net):
     return net_load(net).get("created_by") == "agent"
 
 
-def agent_call(tool, a, approve):
+def in_scope(name, project):
+    """A server with a project reaches nothing outside it (and its sub-projects), approval or not."""
+    if not under(project_of(load(name)), project):
+        raise SystemExit(f"{name} is not in this agent's project {project!r}")
+
+
+def scoped_quota(project):
+    """The room left and this project's own use: not what the other projects take."""
+    q, use = quota(), {"cpus": 0, "memory_gb": 0, "vms": 0}
+    for n in machines():
+        m = load(n)
+        if under(project_of(m), project) and state(n) != "stopped":
+            use["cpus"] += run_cpus(n, m); use["memory_gb"] += vm_ram_mb(m) / 1024; use["vms"] += 1
+    return {k: {"limit": v["limit"], "free": v["free"], **({"used_by_project": round(use[k], 1)} if k in use else {})}
+            for k, v in q.items()}
+
+
+def agent_call(tool, a, approve, project=None):
+    """project: the server's own (--project); then nothing outside it is visible or reachable."""
     vm, net = a.get("vm"), a.get("net")
+    asked = a.get("project")  # where a creation or a note goes: this server's project or below it
+    if asked is not None and not under(check_project(asked), project):
+        raise SystemExit(f"project {asked!r} is not this agent's project {project!r} or below it")
+    where = asked or project
+    if project and vm and tool != "vm_create":  # reads too: another project's VMs are not this agent's business
+        in_scope(vm, project)
+    if project and net and tool != "net_create" and net in networks() and \
+            not under(net_load(net).get("project", "default"), project):
+        raise SystemExit(f"network {net!r} is not in this agent's project {project!r}")
     if tool == "vm_list":
         return [dict(v, managed=v.get("engine") is None and bool(load(v["name"]).get("sandbox") or agent_owned(v["name"])))
-                for v in quiet(ls)]
+                for v in quiet(ls) if not project or v.get("engine") is None and under(v["project"], project)]
+    if tool == "project_status":
+        return project_status(where)
+    if tool == "notes_write":
+        return notes_write(where, a["text"], a.get("mode", "append"))
+    if tool == "autostart":
+        if vm:  # inside the guest: terminal-ct starts its containers again when the VM boots
+            if a.get("on") is None:
+                raise SystemExit("inside a VM: give on (true or false)")
+            if PROFILES[load(vm).get("os", "linux")]["family"] != "linux":
+                raise SystemExit("autostart inside a VM is for terminal-ct in Linux guests")
+            users = guest_users(vm)
+            if not users:
+                raise SystemExit(f"{vm} has no logged-in user to run terminal-ct as: sign in first (terminal-vm view {vm})")
+            what = "on" if a["on"] else "off"
+            approve(f"Inside {vm}, turn terminal-ct's autostart {what} (its containers start again when the VM boots)?",
+                    f"terminal-ct autostart {what}   (in {vm}, as {users[0]})")
+            r = guest_shell(vm, f"runuser -l {shlex.quote(users[0])} -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) "
+                                f"terminal-ct autostart {what}'")
+            if r["exit"]:
+                raise SystemExit(f"in {vm}: {(r['stderr'] or r['stdout']).strip() or 'failed'} "
+                                 "(is terminal-ct installed in the guest, on PATH?)")
+            return {"vm": vm, "inside": json.loads(r["stdout"].strip().splitlines()[-1])}
+        if a.get("on") is not None:
+            approve(("Start the VMs that were running again by themselves after each restart of the PC (a task at "
+                     "your logon)?") if a["on"] else "Stop restarting VMs after a restart of the PC?",
+                    f"terminal-vm autostart {'on' if a['on'] else 'off'}")
+        return autostart(a.get("on"))
+    if tool in ("vm_create", "vm_clone", "net_create"):
+        taken = (a.get("new") if tool == "vm_clone" else vm) if tool != "net_create" else None
+        if taken is not None and os.path.exists(os.path.join(vm_dir(taken), "machine.json")) or \
+                tool == "net_create" and net in networks():
+            raise SystemExit(f"the name {taken or net!r} is not available: choose another")  # same answer, any project
     if tool == "vm_create":
         os_name, sandbox = a.get("os", "linux"), a.get("sandbox", True)
         if a.get("iso"):  # only images already in the store: never an arbitrary host file as the guest's CD
@@ -2345,7 +2595,7 @@ def agent_call(tool, a, approve):
             approve(f"Create {vm} with a {mm} GiB memory ceiling?", f"terminal-vm resources {vm} --max-memory {mm}")
         # A non-sandboxed agent VM starts offline too: internet is the user's call (vm_internet)
         out = quiet(create, vm, iso, os_name, a.get("cpus"), a.get("memory_gb"), a.get("disk_gb"),
-                    offline=not sandbox, sandbox=sandbox, max_cpus=a.get("max_cpus"), max_memory=mm)
+                    offline=not sandbox, sandbox=sandbox, max_cpus=a.get("max_cpus"), max_memory=mm, project=where)
         m = load(vm); m["created_by"] = "agent"; save(vm, m)
         return out
     if tool == "vm_clone":
@@ -2356,14 +2606,16 @@ def agent_call(tool, a, approve):
                     f"terminal-vm clone {vm} {a['new']}")
         out = quiet(clone, vm, a["new"])
         m = load(a["new"]); m["created_by"] = "agent"
+        if where:
+            m["project"] = where
         if users and not m.get("sandbox"):
             m["offline"] = True  # internet stays the user's call (vm_internet)
         save(a["new"], m)
         return out
     if tool == "net_list":
-        return net_ls()
+        return [n for n in net_ls() if under(n.get("project", "default"), project)]
     if tool == "net_create":
-        cfg = net_create(net)
+        cfg = net_create(net, where)
         with open(net_file(net), "w") as f:
             json.dump(dict(cfg, created_by="agent"), f)
         return cfg
@@ -2432,6 +2684,9 @@ TOOLS = [
     ("wait", "Wait until the screen stops changing (loading, installing, animations), then return a screenshot. "
              "stable: seconds without change (default 1); timeout: default 30. A blinking cursor can keep it from settling.",
      _schema({"stable": _N, "timeout": _N})),
+    ("exec", "Run a shell command in the guest through its guest agent (Linux: sh -c as root; Windows: PowerShell as "
+             "SYSTEM) and return its exit code, stdout and stderr. Not in sandboxes (no guest agent).",
+     _schema({"command": {"type": "string"}, "timeout": _N}, ["command"])),
 ]
 INPUT_TOOLS = {"click", "move", "drag", "scroll", "type", "key"}
 _VM, _NET = {"vm": {"type": "string"}}, {"net": {"type": "string"}}
@@ -2468,8 +2723,23 @@ AGENT_TOOLS = [
     ("net_attach", "Plug a stopped managed VM into a network; set the suggested address in the guest. A network "
                    "the user created needs their approval.", _schema({**_VM, **_NET}, ["vm", "net"])),
     ("net_detach", "Unplug a stopped managed VM from a network.", _schema({**_VM, **_NET}, ["vm", "net"])),
+    ("autostart", "Show (without on) or change whether the VMs that were running start again by themselves after "
+                  "the PC restarts (a task at the user's logon). With vm: inside that Linux VM, turn terminal-ct's "
+                  "autostart on or off (its containers start again when the VM boots). Changing needs the user's "
+                  "approval.", _schema({"on": {"type": "boolean"}, **_VM})),
+    ("project_status", "Start here: the project's VMs and networks as they are now (want: what each should be "
+                       "doing), the notes left by earlier sessions, and the latest actions with their errors.",
+     _schema({"project": {"type": "string", "description": "Only when this server has no project of its own"}})),
+    ("notes_write", "Keep notes for the next session (what is set up, what is left to do): appended with the date, "
+                    "or mode=replace to rewrite them.",
+     _schema({"text": {"type": "string"}, "mode": {"type": "string", "enum": ["append", "replace"]},
+              "project": {"type": "string"}}, ["text"])),
 ]
 AGENT_NAMES = {n for n, _, _ in AGENT_TOOLS}
+PROJECT_ARG_TOOLS = {"vm_create", "vm_clone", "net_create", "project_status", "notes_write"}
+INSTRUCTIONS = ("terminal-vm: VMs with a desktop for computer-use agents. Call project_status first: it says what "
+                "this project already has and what earlier sessions did and noted. Before you stop, record with "
+                "notes_write what you set up and what is left, so the next session can pick up from there.")
 _OTHER = {"vm": {"type": "string", "description": "Another VM this agent manages (default: this server's VM)"}}
 SCREEN_TOOLS = [(n, d, s if n in ("top", "quota") else dict(s, properties={**s["properties"], **_OTHER}))
                 for n, d, s in TOOLS]
@@ -2479,22 +2749,35 @@ def image(data):
     return {"type": "image", "data": base64.b64encode(data).decode(), "mimeType": "image/png"}
 
 
-def mcp(name):
+def mcp(name, project=None):
+    """project: the agent sees and reaches only that project's VMs and networks (and its sub-projects'), and its
+    notes and log are that project's."""
+    if project:
+        check_project(project)
+        if os.path.isfile(os.path.join(vm_dir(name), "machine.json")):
+            in_scope(name, project)
     agents = {}  # per VM: whether qemu-guest-agent answered once; unknown until asked
     seen = {}  # per VM: when a logged-in session was last confirmed
     can_ask, pending, asks = False, collections.deque(), iter(range(1, 1 << 30))
 
     def record(tool, a, vm, error=None):  # sandbox screen actions, and every infrastructure action, for review
         try:
-            journal = os.path.join(vm_dir(vm), "actions.log") if load(vm).get("sandbox") else None
-        except SystemExit:  # no such VM
-            journal = None
-        path = os.path.join(STORE, AGENT_LOG) if tool in AGENT_NAMES else journal
-        if path:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps({"time": time.strftime("%Y-%m-%dT%H:%M:%S"), "tool": tool, "arguments": a,
-                                    **({"error": error} if error else {})}) + "\n")
+            m = {}
+            with contextlib.suppress(SystemExit):
+                m = load(vm) if vm else {}
+            # the log of the project the action belongs to: this server's, else the one a creation names, else the
+            # VM's own; never one an agent merely names (it would forge another project's history)
+            p = project or (a.get("project") if tool in PROJECT_ARG_TOOLS else None) or (m and project_of(m))
+            p = p if isinstance(p, str) and _PROJECT.fullmatch(p) and under(p, project) else project or DEFAULT_PROJECT
+            mine = under(project_of(m), project)
+            path = os.path.join(project_dir(p), AGENT_LOG) if tool in AGENT_NAMES else \
+                os.path.join(vm_dir(vm), "actions.log") if m.get("sandbox") and mine else None
+            if path:
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"time": time.strftime("%Y-%m-%dT%H:%M:%S"), "tool": tool, "arguments": a,
+                                        **({"vm": vm} if vm else {}), **({"error": error} if error else {})}) + "\n")
+        except (OSError, TypeError, ValueError, SystemExit):  # a log that cannot be written must not end the server
+            pass
 
     def send(msg):
         sys.stdout.write(json.dumps(msg) + "\n"); sys.stdout.flush()
@@ -2539,16 +2822,19 @@ def mcp(name):
             can_ask = "elicitation" in (req.get("params", {}).get("capabilities") or {})
             send({"jsonrpc": "2.0", "id": rid, "result": {
                 "protocolVersion": req.get("params", {}).get("protocolVersion", "2025-06-18"),
-                "capabilities": {"tools": {}}, "serverInfo": {"name": "terminal-vm", "version": VERSION}}})
+                "capabilities": {"tools": {}}, "serverInfo": {"name": "terminal-vm", "version": VERSION},
+                "instructions": INSTRUCTIONS + (f" This server's project: {project}." if project else "")}})
         elif method == "tools/list":
             send({"jsonrpc": "2.0", "id": rid, "result": {"tools": [
                 {"name": n, "description": d, "inputSchema": s} for n, d, s in SCREEN_TOOLS + AGENT_TOOLS]}})
         elif method == "tools/call":
             p = req.get("params", {})
             tool, a = p.get("name"), dict(p.get("arguments") or {})
-            vm = name if tool in AGENT_NAMES else a.pop("vm", None) or name
+            vm = a.get("vm") if tool in AGENT_NAMES else a.pop("vm", None) or name
             try:
-                if vm != name:  # screen tools on another VM: only one this agent manages
+                if project and tool not in AGENT_NAMES and tool not in ("top", "quota"):
+                    in_scope(vm, project)  # every call: a VM moved to another project leaves this agent's reach
+                if vm != name and tool not in AGENT_NAMES:  # screen tools on another VM: only one this agent manages
                     managed(vm)
                 # one guest-agent round trip per burst of input, not per click: a session seen < 5 s ago still holds
                 if tool in INPUT_TOOLS and agents.get(vm) is not False and time.time() - seen.get(vm, 0) > 5:
@@ -2561,9 +2847,13 @@ def mcp(name):
                 # the screen before input, to return the screen after its effect rather than a fixed delay later
                 before = shot_pixels(vm) if a.get("screenshot") and tool in INPUT_TOOLS else None
                 # resources opens its own QMP session (QEMU takes one client at a time), so not through act()
-                out = (agent_call(tool, a, approve) if tool in AGENT_NAMES else
+                out = (agent_call(tool, a, approve, project) if tool in AGENT_NAMES else
                        resources(vm, a.get("cpus"), a.get("memory_gb")) if tool == "resources" else
-                       quota() if tool == "quota" else top() if tool == "top" else act(vm, tool, a))
+                       (scoped_quota(project) if project else quota()) if tool == "quota" else
+                       (lambda t: dict(t, vms=[v for v in t["vms"] if under(project_of(load(v["name"])), project)],
+                                       quota=scoped_quota(project)) if project else t)(top())
+                       if tool == "top" else
+                       guest_shell(vm, a["command"], float(a.get("timeout", 60))) if tool == "exec" else act(vm, tool, a))
                 record(tool, a, vm)
                 if tool == "screenshot":
                     content = [image(out[0])]
@@ -2605,14 +2895,20 @@ def main(argv=None):
         sp.add_argument("--sandbox", action="store_true", help="no network or file sharing, disposable disk, actions logged")
         sp.add_argument("--max-cpus", type=int, help="ceiling agents may raise CPUs to (default: per --os, host-capped)")
         sp.add_argument("--max-memory", type=int, help="ceiling in GiB agents may raise memory to (default: per --os)")
+        sp.add_argument("--project", help="project (sub-projects as lab/web; default TERMINAL_VM_PROJECT or default)")
     u = sub.add_parser("up"); u.add_argument("name", nargs="?", default="default"); u.add_argument("--iso")
     u.add_argument("--no-view", action="store_true"); u.add_argument("--plan", action="store_true"); sizes(u)
     c = sub.add_parser("create"); c.add_argument("name"); c.add_argument("--iso"); sizes(c)
     s = sub.add_parser("start"); s.add_argument("name"); s.add_argument("--window", action="store_true")
     t = sub.add_parser("stop"); t.add_argument("name"); t.add_argument("--force", action="store_true")
     t.add_argument("--timeout", type=int, default=60)
-    for n in ("status", "hide", "pause", "resume", "rm", "reset"):
+    for n in ("status", "hide", "pause", "rm", "reset"):
         sub.add_parser(n).add_argument("name")
+    re_ = sub.add_parser("resume", help="NAME: un-pause it; no NAME: start again what ran before a restart")
+    re_.add_argument("name", nargs="?"); re_.add_argument("--stay", action="store_true")
+    sub.add_parser("autostart").add_argument("state", nargs="?", choices=["on", "off"])
+    pj = sub.add_parser("project"); pj.add_argument("project_cmd", choices=["ls", "show", "notes", "move"])
+    pj.add_argument("args", nargs="*")
     for n in ("view", "show"):
         v = sub.add_parser(n); v.add_argument("name"); v.add_argument("--read-only", action="store_true")
     sub.add_parser("ls"); sub.add_parser("doctor"); sub.add_parser("help"); sub.add_parser("version")
@@ -2625,7 +2921,7 @@ def main(argv=None):
     im.add_argument("--plan", action="store_true")
     for n in ("push", "pull"):
         x = sub.add_parser(n); x.add_argument("name"); x.add_argument("src"); x.add_argument("dest")
-    m = sub.add_parser("mcp"); m.add_argument("name", nargs="?", default="default")
+    m = sub.add_parser("mcp"); m.add_argument("name", nargs="?", default="default"); m.add_argument("--project")
     k = sub.add_parser("skills"); k.add_argument("skill_cmd", choices=["get", "path", "install"]); k.add_argument("--dir")
     a = sub.add_parser("action"); a.add_argument("name"); a.add_argument("tool"); a.add_argument("args", nargs="*")
     a.add_argument("--output"); a.add_argument("--button", default="left"); a.add_argument("--double", action="store_true")
@@ -2636,8 +2932,8 @@ def main(argv=None):
     sb = sub.add_parser("sandbox"); sb.add_argument("name"); sb.add_argument("value", nargs="?", choices=["on", "off"])
     sub.add_parser("top")
     ne = sub.add_parser("net"); nsub = ne.add_subparsers(dest="net_cmd", required=True)
-    for c in ("create", "rm"):
-        nsub.add_parser(c).add_argument("net")
+    nsub.add_parser("create").add_argument("net"); nsub.add_parser("rm").add_argument("net")
+    nsub.choices["create"].add_argument("--project")
     nsub.add_parser("ls")
     for c in ("attach", "detach"):
         x = nsub.add_parser(c); x.add_argument("name"); x.add_argument("net")
@@ -2652,14 +2948,26 @@ def main(argv=None):
     rs.add_argument("--max-memory", type=int, help="new ceiling in GiB (stopped VM)")
     o = p.parse_args(argv)
 
-    opts = ({k: getattr(o, k) for k in ("os_name", "cpus", "memory", "disk", "width", "height", "layout", "offline", "product_key", "ui_language", "sandbox", "max_cpus", "max_memory")}
+    opts = ({k: getattr(o, k) for k in ("os_name", "cpus", "memory", "disk", "width", "height", "layout", "offline", "product_key", "ui_language", "sandbox", "max_cpus", "max_memory", "project")}
             if o.cmd in ("up", "create") else {})
     try:
         if o.cmd == "up": return up(o.name, o.iso, o.no_view, o.plan, **opts)
         if o.cmd == "create": return create(o.name, o.iso or default_image(os_name=o.os_name), **opts)
         if o.cmd == "start": return start(o.name, o.window)
         if o.cmd == "stop": return stop(o.name, o.force, o.timeout)
+        if o.cmd == "resume" and not o.name: return resume_all(o.stay)
         if o.cmd in ("pause", "resume"): return pause(o.name, o.cmd == "resume")
+        if o.cmd == "autostart": return print(json.dumps(autostart(None if o.state is None else o.state == "on"), indent=1))
+        if o.cmd == "project":
+            n_ok = {"ls": (0, 0), "show": (0, 1), "notes": (0, 2), "move": (2, 2)}[o.project_cmd]
+            if not n_ok[0] <= len(o.args) <= n_ok[1]:
+                raise SystemExit({"ls": "project ls", "show": "project show [PROJECT]", "notes": "project notes [PROJECT [TEXT]]",
+                                  "move": "project move VM PROJECT"}[o.project_cmd])
+            if o.project_cmd == "notes" and len(o.args) < 2:
+                return print(project_status(*o.args)["notes"], end="")
+            return print(json.dumps({"ls": lambda: projects(), "show": lambda: project_status(*o.args),
+                                     "move": lambda: project_move(*o.args),
+                                     "notes": lambda: notes_write(*o.args)}[o.project_cmd](), indent=1))
         if o.cmd == "ls": return ls()
         if o.cmd == "doctor": return doctor()
         if o.cmd == "help": return p.print_help()
@@ -2679,14 +2987,14 @@ def main(argv=None):
         if o.cmd == "internet": return print(json.dumps(set_internet(o.name, o.value)))
         if o.cmd == "net":
             return print(json.dumps(
-                net_create(o.net) if o.net_cmd == "create" else net_rm(o.net) if o.net_cmd == "rm" else
+                net_create(o.net, o.project) if o.net_cmd == "create" else net_rm(o.net) if o.net_cmd == "rm" else
                 net_ls() if o.net_cmd == "ls" else net_attach(o.name, o.net, o.net_cmd == "attach"), indent=1))
         if o.cmd == "image": return print(json.dumps({"image": default_image(o.plan, o.os_name)}))
         if o.cmd in ("push", "pull"): return transfer(o.name, o.cmd, o.src, o.dest)
         if o.cmd == "view": return view(o.name, read_only=o.read_only)
         if o.cmd == "show": return show(o.name, o.read_only)
         if o.cmd == "hide": return hide(o.name)
-        if o.cmd == "mcp": return mcp(o.name)
+        if o.cmd == "mcp": return mcp(o.name, o.project)
         if o.cmd == "skills": return skills(o.skill_cmd, o.dir)
         if o.cmd == "status":
             print(json.dumps(act(o.name, "status", {}))); return
