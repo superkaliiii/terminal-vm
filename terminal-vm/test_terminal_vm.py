@@ -1182,7 +1182,8 @@ class WebDashboard(unittest.TestCase):
         self.assertEqual(len(self.calls()), n)
         self.assertEqual([v["name"] for v in api("GET", "/api/vms")["vms"]], ["a", "b"])
         self.assertEqual([v["name"] for v in api("GET", "/api/vms", {"project": "lab"})["vms"]], ["b"])
-        self.assertIn("cpus", api("GET", "/api/quota")["quota"])
+        with mock.patch.object(tl, "quota", lambda: {"cpus": {}}):  # the real one measures disks with qemu-img
+            self.assertIn("cpus", api("GET", "/api/quota")["quota"])
         self.assertEqual(api("GET", "/api/logs", {"name": "web1"}), b"line 1\n")
         self.assertEqual(api("GET", "/api/stack", {"name": "lab"})["desired"]["services"],
                          {"app": {"image": "nginx", "replicas": 2}})                    # running is status, not desired
