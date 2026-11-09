@@ -519,6 +519,28 @@ class MacHandoff(unittest.TestCase):
         self.assertEqual(tl.mac_machines(), [])
 
 
+class NoWake(unittest.TestCase):
+    """action VM screenshot --no-wake (terminal-ct's thumbnails): looking resumes no paused VM."""
+    def test_screenshot_without_waking(self):
+        tl.STORE = tempfile.mkdtemp(); os.makedirs(os.path.join(tl.STORE, "v"))
+        closed, out = [], os.path.join(tl.STORE, "shot.png")
+
+        class Q:
+            def close(self):
+                closed.append(1)
+
+        def act(*a, **k):
+            raise AssertionError("act() wakes the VM")
+        with mock.patch.object(tl, "qmp", lambda n: Q()), mock.patch.object(tl, "act", act), \
+                mock.patch.object(tl, "screenshot", lambda n, q=None, file="": (b"PNG", (4, 3))), \
+                contextlib.redirect_stdout(io.StringIO()) as o:
+            tl.main(["action", "v", "screenshot", "--no-wake", "--output", out])
+        self.assertEqual(json.loads(o.getvalue())["width"], 4)
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), b"PNG")
+        self.assertEqual(closed, [1])                                           # QMP takes one client: closed
+
+
 class StoppedVm(unittest.TestCase):
     """rm, reset, display and offline snapshots: no QEMU running, qemu-img faked."""
     def setUp(self):
@@ -1123,7 +1145,7 @@ class Supervision(unittest.TestCase):
 class SharedDashboard(unittest.TestCase):
     """The web dashboard's code is one block, identical in terminal-ct and terminal-vm: change it in both, then set
     SHARED_SHA in both tests to the new value."""
-    SHARED_SHA = "107763a31819e193f9c19d1199f58350ea2a9bad0c80669135a846d232fbbcb2"
+    SHARED_SHA = "7e5a6d078fad6b5a27d96b0dcc889ea461941444dc39d7d642a5ff2ce69268eb"
 
     @staticmethod
     def block(path):
