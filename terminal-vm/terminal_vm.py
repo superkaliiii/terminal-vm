@@ -2898,7 +2898,7 @@ def mcp(name, project=None):
                        (lambda t: dict(t, vms=[v for v in t["vms"] if under(project_of(load(v["name"])), project)],
                                        quota=scoped_quota(project)) if project else t)(top())
                        if tool == "top" else
-                       guest_shell(vm, a["command"], min(float(a.get("timeout", 60)), 600)) if tool == "exec" else
+                       guest_shell(vm, a["command"], max(1.0, min(float(a.get("timeout", 60)), 600))) if tool == "exec" else
                        act(vm, tool, a))
                 record(tool, a, vm)
                 if tool == "screenshot":
