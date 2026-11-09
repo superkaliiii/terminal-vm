@@ -1123,7 +1123,7 @@ class Supervision(unittest.TestCase):
 class SharedDashboard(unittest.TestCase):
     """The web dashboard's code is one block, identical in terminal-ct and terminal-vm: change it in both, then set
     SHARED_SHA in both tests to the new value."""
-    SHARED_SHA = "f1c7258c1765ba1682b5e2fb241d7c55b97c6768fb0e10079ae8bec43e333889"
+    SHARED_SHA = "107763a31819e193f9c19d1199f58350ea2a9bad0c80669135a846d232fbbcb2"
 
     @staticmethod
     def block(path):

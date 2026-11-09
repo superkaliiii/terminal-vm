@@ -1829,8 +1829,11 @@ def peer_cli(env, exe):
 def cli_call(cli, args, timeout=60, lines=False, raw=False):
     """Run a JSON command line: its reply (the last line when progress lines come first; every line with lines;
     the text with raw). A failure raises RuntimeError with the tool's own message."""
-    r = subprocess.run(cli + args, capture_output=True, text=True, timeout=timeout, encoding="utf-8", errors="replace",
-                       **NO_WINDOW)
+    try:
+        r = subprocess.run(cli + args, capture_output=True, text=True, timeout=timeout, encoding="utf-8",
+                           errors="replace", **NO_WINDOW)
+    except OSError as e:  # TERMINAL_VM naming a program that is not there
+        raise RuntimeError(f"{cli[0]}: {e.strerror or e}") from None
     if r.returncode:
         err = (r.stderr or r.stdout).strip()
         with contextlib.suppress(ValueError, AttributeError, IndexError):
