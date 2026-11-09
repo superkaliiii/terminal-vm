@@ -40,7 +40,7 @@ Virtualization), which is also the default for `up` and `create` without `--os`.
   mcp [NAME] [--project P]   stdio MCP server (with --project: only that project and its sub-projects)
   skills get | skills path | skills install [--dir DIR]
 """
-import argparse, base64, collections, contextlib, hashlib, http.server, io, json, os, queue, re, secrets, shlex, shutil, signal, \
+import argparse, base64, collections, contextlib, hashlib, http.server, io, json, os, platform, queue, re, secrets, shlex, shutil, signal, \
     socket, socketserver, struct, subprocess, sys, threading, time, urllib.parse, urllib.request, webbrowser
 from xml.sax.saxutils import escape
 
@@ -3606,6 +3606,73 @@ def doctor():
         sys.exit(1)
 
 
+# ---------- bench: timings of terminal-vm's own operations ----------
+
+BENCH_FROM = "t2"  # a small stopped VM (TinyCore) to clone
+
+
+def _timed(f, *a, **k):
+    t = time.perf_counter()
+    quiet(f, *a, **k)
+    return (time.perf_counter() - t) * 1000
+
+
+def _summary(ms):
+    ms = sorted(ms)
+    return {"median_ms": round(ms[len(ms) // 2] if len(ms) % 2 else (ms[len(ms) // 2 - 1] + ms[len(ms) // 2]) / 2, 1),
+            "min_ms": round(ms[0], 1), "max_ms": round(ms[-1], 1), "runs": len(ms)}
+
+
+def _stop_wait(name, timeout=30):
+    """Forced stop, until QEMU is gone (stop --force only sends the signal)."""
+    quiet(stop, name, force=True)
+    end = time.monotonic() + timeout
+    while state(name) != "stopped" or disk_in_use(name):  # Windows: TerminateProcess ends QEMU a bit later
+        if time.monotonic() > end:
+            raise SystemExit(f"{name}: still running {timeout} s after a forced stop")
+        time.sleep(0.1)
+
+
+def bench(runs=10, src=None):
+    """Time terminal-vm's own operations: median, min and max of `runs` cycles on a copy-on-write clone of SRC
+    (a stopped VM; default t2): clone, start, screenshot, pause, resume, the listing, the dashboard's data, forced
+    stop, rm. SRC is never started; cloning makes its disk an overlay on a shared base, as any clone does. The
+    bench-* clone is removed after; the quota applies as for any start."""
+    src = src or BENCH_FROM
+    if load(src).get("os", "linux") != "linux":  # a Windows clone is renamed by a long guest session at start
+        raise SystemExit(f"bench clones a Linux VM; {src} is not one (--from VM)")
+    _stopped(src)
+    times, name = collections.defaultdict(list), f"bench-{os.getpid()}-{secrets.token_hex(2)}"
+    created = False  # only bench's own clone is ever stopped or removed
+    try:
+        for _ in range(runs):
+            times["clone"].append(_timed(clone, src, name))
+            created = True
+            times["start"].append(_timed(start, name, set_want=False))  # not supervised: no restart in between
+            times["screenshot"].append(_timed(screenshot, name, file="bench.png"))
+            times["pause"].append(_timed(pause, name))
+            times["resume"].append(_timed(pause, name, resume=True))
+            times["ls"].append(_timed(vm_list))
+            times["dashboard_data"].append(_timed(_vm_rows))
+            times["stop_force"].append(_timed(_stop_wait, name))
+            times["rm"].append(_timed(rm, name))
+            created = False
+    finally:
+        if created:  # the step's own error goes on; cleanup errors (SystemExit too) must not hide it
+            with contextlib.suppress(Exception, SystemExit):
+                if state(name) != "stopped" or disk_in_use(name):
+                    _stop_wait(name)
+            with contextlib.suppress(Exception, SystemExit):
+                quiet(rm, name)
+    qemu = None
+    with contextlib.suppress(OSError, SystemExit, subprocess.SubprocessError):
+        qemu = subprocess.run([qemu_bin("qemu-system-x86_64"), "--version"], capture_output=True, text=True,
+                              **NO_WINDOW).stdout.split("\n")[0].strip()
+    return {"tool": f"terminal-vm {VERSION}", "qemu": qemu, "accel": " ".join(a for a in accelerators()[0] if a != "-accel"),
+            "host": platform.platform() + (" (WSL)" if in_wsl() else ""), "date": time.strftime("%Y-%m-%d"),
+            "from": f"{src} ({load(src).get('os', 'linux')})", "results": {k: _summary(v) for k, v in times.items()}}
+
+
 def skills(cmd, dest=None):
     if cmd == "get":
         with open(SKILL) as f:
@@ -4090,6 +4157,7 @@ def main(argv=None):
     su.add_argument("--idle-pause", type=int, help="minutes unused (and under 20%% CPU) before the daemon pauses it (0: never)")
     ev = sub.add_parser("events"); ev.add_argument("-n", type=int, default=50); ev.add_argument("--vm")
     wb = sub.add_parser("web"); wb.add_argument("--project"); wb.add_argument("--no-open", action="store_true")
+    bn = sub.add_parser("bench"); bn.add_argument("--runs", type=int, default=10); bn.add_argument("--from", dest="src")
     ne = sub.add_parser("net"); nsub = ne.add_subparsers(dest="net_cmd", required=True)
     nsub.add_parser("create").add_argument("net"); nsub.add_parser("rm").add_argument("net")
     nsub.choices["create"].add_argument("--project")
@@ -4148,6 +4216,7 @@ def main(argv=None):
             return None if o.daemon_cmd == "run" else print(json.dumps(r, indent=1))
         if o.cmd == "supervise": return print(json.dumps(supervise(o.name, o.restart, o.idle_pause)))
         if o.cmd == "web": return print(json.dumps(web(not o.no_open, o.project), indent=1))
+        if o.cmd == "bench": return print(json.dumps(bench(max(1, o.runs), o.src), indent=1))
         if o.cmd == "events":
             for e in events(o.n, o.vm):
                 print(json.dumps(e))

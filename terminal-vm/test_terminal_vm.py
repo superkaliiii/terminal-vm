@@ -1212,6 +1212,103 @@ class WebDashboard(unittest.TestCase):
         self.assertIn("terminal-ct not found", d["note"])
 
 
+class Bench(unittest.TestCase):
+    """bench: every step timed on a clone of SRC; the clone removed after, even when a step fails."""
+
+    @staticmethod
+    def write(path, text):
+        with open(path, "w") as f:
+            f.write(text)
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.running, self.log, self.fail_start = set(), [], 0
+        os.makedirs(os.path.join(self.tmp, "src"))
+        write = self.write
+        write(os.path.join(self.tmp, "src", "machine.json"), '{"os": "linux"}')
+        self.fail_rm, self.fail_shot = False, False
+
+        def clone(src, new):
+            if os.path.exists(os.path.join(self.tmp, new)):
+                raise SystemExit(f"VM {new!r} already exists")
+            os.makedirs(os.path.join(self.tmp, new)); write(os.path.join(self.tmp, new, "machine.json"), "{}")
+            self.log.append("clone")
+
+        def screenshot(n, file=""):
+            if self.fail_shot:
+                raise RuntimeError("QMP gone")
+            return b"png", (1, 1)
+
+        def start(n, set_want=True):
+            self.assertFalse(set_want)                                   # bench's clone is never supervised
+            self.fail_start -= 1
+            if self.fail_start == 0:
+                raise SystemExit("quota")
+            self.running.add(n); self.log.append("start")
+
+        def rm(n):
+            if n in self.running or self.fail_rm:
+                raise SystemExit(f"{n} is running")
+            import shutil; shutil.rmtree(os.path.join(self.tmp, n)); self.log.append("rm")
+
+        def stop(n, force=False):
+            self.assertTrue(force); self.running.discard(n); self.log.append("stop")
+        self.patches = [mock.patch.object(tl, "STORE", self.tmp), mock.patch.object(tl, "clone", clone),
+                        mock.patch.object(tl, "start", start), mock.patch.object(tl, "rm", rm),
+                        mock.patch.object(tl, "stop", stop),
+                        mock.patch.object(tl, "state", lambda n: "running" if n in self.running else "stopped"),
+                        mock.patch.object(tl, "disk_in_use", lambda n: n in self.running),
+                        mock.patch.object(tl, "screenshot", screenshot),
+                        mock.patch.object(tl, "pause", lambda n, resume=False: None),
+                        mock.patch.object(tl, "vm_list", lambda: []), mock.patch.object(tl, "_vm_rows", lambda: [])]
+        for p in self.patches: p.start()
+
+    def tearDown(self):
+        for p in self.patches: p.stop()
+        import shutil; shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_timings(self):
+        r = tl.bench(3, "src")
+        self.assertEqual(set(r["results"]), {"clone", "start", "screenshot", "pause", "resume", "ls", "dashboard_data",
+                                             "stop_force", "rm"})
+        self.assertEqual(r["results"]["start"]["runs"], 3)
+        self.assertEqual(r["from"], "src (linux)")
+        self.assertEqual(sorted(os.listdir(self.tmp)), ["src"])
+
+    def test_clone_removed_when_a_step_fails(self):
+        self.fail_start = 2                                              # the second start fails
+        with self.assertRaisesRegex(SystemExit, "quota"):
+            tl.bench(3, "src")
+        self.assertEqual(self.log[-2:], ["clone", "rm"])
+        self.assertEqual(sorted(os.listdir(self.tmp)), ["src"])
+
+    def test_running_clone_stopped_then_removed_and_error_kept(self):
+        self.fail_shot = True                                            # fails while the clone runs
+        with self.assertRaisesRegex(RuntimeError, "QMP gone"):
+            tl.bench(2, "src")
+        self.assertEqual(self.log, ["clone", "start", "stop", "rm"])
+        self.fail_shot, self.fail_rm, self.log = True, True, []          # cleanup failing too: the step's error shows
+        with self.assertRaisesRegex(RuntimeError, "QMP gone"):
+            tl.bench(2, "src")
+
+    def test_never_touches_an_existing_vm(self):
+        with mock.patch.object(tl.secrets, "token_hex", lambda n: "abcd"):
+            mine = os.path.join(self.tmp, f"bench-{os.getpid()}-abcd")
+            os.makedirs(mine); self.write(os.path.join(mine, "machine.json"), "{}")   # a VM with that very name
+            with self.assertRaisesRegex(SystemExit, "already exists"):
+                tl.bench(1, "src")
+        self.assertTrue(os.path.exists(os.path.join(mine, "machine.json")))
+        self.assertEqual(self.log, [])
+
+    def test_linux_source_only(self):
+        self.write(os.path.join(self.tmp, "src", "machine.json"), '{"os": "win11"}')
+        with self.assertRaisesRegex(SystemExit, "Linux"):
+            tl.bench(1, "src")
+
+    def test_summary(self):
+        self.assertEqual(tl._summary([3, 1, 2, 10]), {"median_ms": 2.5, "min_ms": 1, "max_ms": 10, "runs": 4})
+
+
 class SettledScreenshot(unittest.TestCase):
     def test_waits_for_the_input_to_show(self):
         frames = iter([b"old", b"old", b"new"])  # a loaded guest draws the keystroke late

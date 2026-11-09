@@ -44,6 +44,7 @@ or install this folder as a Claude Code plugin (`.claude-plugin/`).
 | `ls`, `status NAME`, `doctor`, `help`, `version` | list VMs, state + screen + logged-in users, host checks |
 | `start NAME [--window]`, `pause`, `resume` | lifecycle |
 | `web [--project P] [--no-open]` | web dashboard of the VMs and, when installed, terminal-ct's containers (see [Web dashboard](#web-dashboard)) |
+| `bench [--runs 10] [--from VM]` | timings of terminal-vm's own operations on a clone (see [Measurements](#measurements)) |
 | `daemon run\|start\|stop\|status`, `supervise NAME [--restart always\|never] [--idle-pause MIN]`, `events [-n 50] [--vm V]` | supervision: restarts, health, idle pause, events (see [Supervision](#supervision)) |
 | `resume [--stay]`, `autostart [on\|off]` | start again the VMs that were running before a restart; at each logon (see [Restarts](#restarts)) |
 | `project ls`, `project show [P]`, `project notes [P [TEXT]]`, `project move NAME P`; `create --project P` | projects (see [Projects](#projects)) |
@@ -215,6 +216,15 @@ command line. It is the same dashboard as `terminal-ct web` (one block of code, 
   fragment; other Host names are refused.
 - Thumbnails are not a use: watching a VM does not keep it from its idle pause; its larger view neither. Use `view`
   or `show` to work with it.
+
+## Measurements
+
+`terminal-vm bench [--runs 10] [--from VM]` times terminal-vm's own operations on a copy-on-write clone of a
+stopped VM (default `t2`; the clone `bench-*` is removed after, the VM itself is never started): clone, start,
+screenshot, pause, resume, `ls`, the dashboard's data, forced stop, rm. Median, min and max per step;
+[`bench/results.json`](bench/results.json) keeps the runs. In WSL with KVM (TinyCore guest), medians: clone 69 ms,
+start 122 ms (QEMU running, not the guest booted), screenshot 16 ms, pause 4 ms, resume 1 ms, `ls` 2 ms, dashboard
+data 509 ms (mostly `top`'s 0.5 s CPU sample), forced stop 6 ms, rm 48 ms.
 
 ## Projects
 
