@@ -833,8 +833,9 @@ class StoppedVm(unittest.TestCase):
         self.assertFalse(tl.set_internet("v")["internet"])                     # approval does not carry over
 
     def test_top(self):
-        cpu, rss = tl._proc_times(os.getpid())          # this test process, on Linux and Windows alike
-        self.assertTrue(cpu >= 0 and rss > 1 << 20)
+        if sys.platform != "darwin":                     # no /proc on macOS: top shows no figures there
+            cpu, rss = tl._proc_times(os.getpid())      # this test process, on Linux and Windows alike
+            self.assertTrue(cpu >= 0 and rss > 1 << 20)
         self.assertIsNone(tl._proc_times(2 ** 22 + 7))  # no such process
         out = tl.top()
         self.assertEqual(out["vms"], [])                 # nothing running here
