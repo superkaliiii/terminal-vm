@@ -166,6 +166,14 @@ class Qmp(unittest.TestCase):
             return b'{"event": "X"}\n' + json.dumps({"return": {"status": self.status}}).encode() + b"\n"
         self.q = FakeServer(os.path.join(d, "qmp.sock"), b'{"QMP": {}}\n', reply); self.q.start()
 
+    def test_watch_marks_a_guest_shutdown_as_wanted_off(self):
+        tl.want("t", "running")
+        ev = b'{"event": "SHUTDOWN", "data": {"guest": true, "reason": "guest-shutdown"}}\n'
+        FakeServer(os.path.join(self.tmp, "t", "qmp-watch.sock"), b'{"QMP": {}}\n',
+                   lambda m: b'{"return": {}}\n' + ev).start()
+        tl.watch("t")                                                         # returns at the guest's shutdown
+        self.assertEqual(tl.wanted("t"), "stopped")                           # resume will leave it off
+
     def test_click_type_and_layout(self):
         tl.act("t", "click", {"x": 639, "y": 0, "button": "right"})
         events = [m for m in self.q.log if m["execute"] == "input-send-event"]
@@ -542,14 +550,14 @@ class StoppedVm(unittest.TestCase):
         listed = sorted(v["name"] for v in tl.agent_call("vm_list", {}, yes, project="alpha"))
         self.assertEqual(listed, ["a", "w"])                                  # its sub-project too, not beta
         for tool, a in (("vm_start", {"vm": "b"}), ("vm_resources", {"vm": "b"}), ("vm_internet", {"vm": "b"})):
-            with self.assertRaisesRegex(SystemExit, "not in this agent's project 'alpha'"):
+            with self.assertRaisesRegex(SystemExit, "no VM named 'b'"):
                 tl.agent_call(tool, a, yes, project="alpha")                  # even approving would not help
         with self.assertRaisesRegex(SystemExit, "not this agent's project"):
             tl.agent_call("notes_write", {"text": "x", "project": "beta"}, yes, project="alpha")
         with self.assertRaisesRegex(SystemExit, "is not available: choose another"):  # no project, no detail
             tl.agent_call("vm_clone", {"vm": "a", "new": "b"}, yes, project="alpha")
         tl.net_create("bnet", "beta")
-        with self.assertRaisesRegex(SystemExit, "not in this agent's project"):
+        with self.assertRaisesRegex(SystemExit, "no network named 'bnet'"):
             tl.agent_call("net_attach", {"vm": "a", "net": "bnet"}, yes, project="alpha")
         self.assertEqual(tl.agent_call("net_list", {}, yes, project="alpha"), [])
         q = tl.scoped_quota("alpha")
@@ -579,7 +587,29 @@ class StoppedVm(unittest.TestCase):
         self.assertIn("project_status first", msgs[0]["result"]["instructions"])
         self.assertTrue(msgs[1]["result"]["isError"])
         self.assertEqual([v["name"] for v in json.loads(msgs[2]["result"]["content"][0]["text"])["vms"]], ["a"])
-        self.assertIn("not in this agent's project", msgs[3]["result"]["content"][0]["text"])  # v is default's
+        self.assertIn("no VM named 'v'", msgs[3]["result"]["content"][0]["text"])  # v is default's
+
+    def test_project_server_without_its_vm_and_exec_approval(self):
+        self.vm("a", project="site")                                          # the user's VM in the project
+        lines = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                 {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "screenshot", "arguments": {}}},
+                 {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "exec", "arguments": {"vm": "a", "command": "id"}}}]
+        old = sys.stdin
+        sys.stdin = io.StringIO("".join(json.dumps(x) + "\n" for x in lines))
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                tl.mcp("v", "site")                                           # v is default's: served without it
+        finally:
+            sys.stdin = old
+        msgs = [json.loads(x) for x in out.getvalue().splitlines()]
+        self.assertIn("name the VM", msgs[1]["result"]["content"][0]["text"])
+        self.assertIn("belongs to the user", msgs[2]["result"]["content"][0]["text"])  # not its own: off-limits
+        tl.save("a", dict(tl.load("a"), sandbox=True))
+        with self.assertRaisesRegex(SystemExit, "no guest agent"):
+            tl.guest_shell("a", "id")
+        net = tl.net_create("n", "site")
+        self.vm("q", project="other"); m = tl.load("q"); m["networks"] = {"n": {"mac": "x", "ip": "10.77.1.10"}}; tl.save("q", m)
+        self.assertEqual(tl.agent_call("net_list", {}, None, project="site")[0]["vms"], [])  # q is another project's
 
     def test_want_and_resume(self):
         self.quiet(tl.stop, "v")

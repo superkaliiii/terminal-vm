@@ -325,6 +325,31 @@ def project_dir(project):
 # What each VM should be doing (vm_dir/want: running or stopped, written by start and stop), so after the PC (or
 # WSL) restarts, `resume` starts again what was running and leaves alone what was stopped on purpose.
 
+def watch(name):
+    """Started by start, until the VM ends: a shutdown from inside the guest (QMP SHUTDOWN, guest: true) means it is
+    meant to stay off, so resume after a restart leaves it so. A host signal or a power cut is not a guest shutdown:
+    such a VM comes back."""
+    for _ in range(50):
+        try:
+            q = QMP(endpoint(name, "qmp-watch"))
+            break
+        except RuntimeError:
+            time.sleep(0.2)
+    else:
+        return
+    try:
+        q.sock.settimeout(None)
+        while True:
+            msg = q._recv()
+            if msg.get("event") == "SHUTDOWN" and (msg.get("data") or {}).get("guest"):
+                want(name, "stopped")
+                return
+    except (OSError, RuntimeError, ValueError):  # QEMU gone
+        return
+    finally:
+        q.close()
+
+
 def want(name, value):
     with open(os.path.join(vm_dir(name), "want"), "w") as f:
         f.write(value)
@@ -837,6 +862,7 @@ def qemu_args(name, m, window, vnc_port=None):
               if sandbox and not WINDOWS else []),  # QEMU for Windows is built without seccomp
             "-qmp", ep("qmp") + ",server=on,wait=off",
             "-qmp", ep("qmp-view") + ",server=on,wait=off",  # the viewer's own monitor
+            "-qmp", ep("qmp-watch") + ",server=on,wait=off",  # watch(): tells a shutdown from inside the guest
             # VNC takes a display number; password=on refuses every client until the password is set
             "-vnc", ep("vnc") if vnc_port is None else f"127.0.0.1:{vnc_port - 5900},password=on",
             "-pidfile", os.path.join(d, "qemu.pid"), "-display", ("sdl" if WINDOWS else "gtk") if window else "none"]
@@ -960,7 +986,7 @@ def _start(name, window=False):
         vnc_port = next(p for p in iter(lambda: free_ports(1)[0], None) if p >= 5900)
         with open(os.path.join(d, "ports.json"), "w") as f:
             json.dump({"vnc": vnc_port}, f)
-    for k in ("qmp", "qmp-view", "qga", "vnc"):  # stale sockets from a crashed VM
+    for k in ("qmp", "qmp-view", "qmp-watch", "qga", "vnc"):  # stale sockets from a crashed VM
         if os.path.exists(os.path.join(d, k + ".sock")):
             os.unlink(os.path.join(d, k + ".sock"))
     for f in os.listdir(d):  # raw frames left by viewers that were killed (2-10 MB each)
@@ -993,6 +1019,8 @@ def _start(name, window=False):
                     q.close()
                 with open(os.path.join(d, "vnc.pass"), "w") as f:
                     f.write(pw)
+            subprocess.Popen([sys.executable, os.path.abspath(__file__), "_watch", name], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=log, **detach)
             print(json.dumps({"started": name})); return
         time.sleep(0.1)
     raise SystemExit(f"QEMU did not start; see {os.path.join(d, 'qemu.log')}")
@@ -1058,10 +1086,12 @@ def macos_handoff(argv):
         return [cmd] + rest[:i] + rest[i + 2:]  # terminal-mac makes macOS VMs only: no --os
     if not MAC:
         return None
+    if cmd == "mcp" and "--project" in rest:
+        return None  # projects are terminal-vm's: terminal-mac's server has none (its VMs are out of such a scope)
     if cmd in ("up", "create", "image") and "--os" not in rest:
         return argv  # a Mac's own guest by default, as terminal-mac always did (x86 guests would be emulated)
-    if cmd not in NAMED:
-        return None
+    if cmd not in NAMED or cmd == "resume" and not [a for a in rest if not a.startswith("-")]:
+        return None  # resume without a name: every VM that ran before a restart, not a macOS VM's un-pause
     name = next((a for a in rest if not a.startswith("-")), "default")
     mine = os.path.isfile(os.path.join(STORE, name, "machine.json"))
     return argv if not mine and os.path.isdir(os.path.join(MAC_HOME, "machines", name)) else None
@@ -1485,7 +1515,10 @@ def autostart(on=None):
         return {"autostart": False}
     os.makedirs(os.path.dirname(unit), exist_ok=True)
     with open(unit, "w") as f:  # no After=default.target: with WantedBy it made an ordering cycle
+        # RemainAfterExit + KillMode=process: resume exits at once, and systemd would otherwise kill the QEMU
+        # processes it started (same cgroup) as the unit ends
         f.write("[Unit]\nDescription=terminal-vm: start again the VMs that were running\n\n[Service]\nType=oneshot\n"
+                "RemainAfterExit=yes\nKillMode=process\n"
                 + "".join(f"Environment={shlex.quote(f'{k}={v}')}\n" for k, v in env.items())
                 + f"ExecStart={shlex.join(me + ['resume'])}\n\n[Install]\nWantedBy=default.target\n")
     r = subprocess.run(["systemctl", "--user", "enable", f"{AUTOSTART}.service"], capture_output=True, text=True)
@@ -1518,7 +1551,8 @@ def project_status(project=None, log_lines=30):
             log = [json.loads(l) for l in collections.deque(f, log_lines) if l.strip()]
     vms = [dict(v, want=wanted(v["name"])) for v in quiet(ls) if v.get("engine") is None and under(v["project"], project)]
     return {"project": project, "vms": vms,
-            "networks": [n for n in net_ls() if under(n.get("project", "default"), project)],
+            "networks": [dict(n, vms=[v for v in n["vms"] if under(project_of(load(v["vm"])), project)])
+                         for n in net_ls() if under(n.get("project", "default"), project)],
             "sub_projects": sorted(p["project"] for p in projects() if p["project"].startswith(project + "/")),
             "notes": notes, "recent_actions": log}
 
@@ -2516,8 +2550,8 @@ def _net_owned(net):
 
 def in_scope(name, project):
     """A server with a project reaches nothing outside it (and its sub-projects), approval or not."""
-    if not under(project_of(load(name)), project):
-        raise SystemExit(f"{name} is not in this agent's project {project!r}")
+    if not under(project_of(load(name)), project):  # the same answer as for no VM: other projects' names stay unseen
+        raise SystemExit(f"no VM named {name!r}; create it with: terminal-vm up {name}")
 
 
 def scoped_quota(project):
@@ -2542,7 +2576,7 @@ def agent_call(tool, a, approve, project=None):
         in_scope(vm, project)
     if project and net and tool != "net_create" and net in networks() and \
             not under(net_load(net).get("project", "default"), project):
-        raise SystemExit(f"network {net!r} is not in this agent's project {project!r}")
+        raise SystemExit(f"no network named {net!r}; create it with: terminal-vm net create {net}")
     if tool == "vm_list":
         return [dict(v, managed=v.get("engine") is None and bool(load(v["name"]).get("sandbox") or agent_owned(v["name"])))
                 for v in quiet(ls) if not project or v.get("engine") is None and under(v["project"], project)]
@@ -2557,6 +2591,8 @@ def agent_call(tool, a, approve, project=None):
             if PROFILES[load(vm).get("os", "linux")]["family"] != "linux":
                 raise SystemExit("autostart inside a VM is for terminal-ct in Linux guests")
             users = guest_users(vm)
+            if users and not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", users[0]):
+                raise SystemExit(f"{vm}: unexpected user name {users[0]!r} reported by the guest")
             if not users:
                 raise SystemExit(f"{vm} has no logged-in user to run terminal-ct as: sign in first (terminal-vm view {vm})")
             what = "on" if a["on"] else "off"
@@ -2569,8 +2605,8 @@ def agent_call(tool, a, approve, project=None):
                                  "(is terminal-ct installed in the guest, on PATH?)")
             return {"vm": vm, "inside": json.loads(r["stdout"].strip().splitlines()[-1])}
         if a.get("on") is not None:
-            approve(("Start the VMs that were running again by themselves after each restart of the PC (a task at "
-                     "your logon)?") if a["on"] else "Stop restarting VMs after a restart of the PC?",
+            approve(("Start the VMs that were running (in every project) again by themselves after each restart of "
+                     "the PC (a task at your logon)?") if a["on"] else "Stop restarting VMs after a restart of the PC?",
                     f"terminal-vm autostart {'on' if a['on'] else 'off'}")
         return autostart(a.get("on"))
     if tool in ("vm_create", "vm_clone", "net_create"):
@@ -2613,7 +2649,8 @@ def agent_call(tool, a, approve, project=None):
         save(a["new"], m)
         return out
     if tool == "net_list":
-        return [n for n in net_ls() if under(n.get("project", "default"), project)]
+        return [dict(n, vms=[v for v in n["vms"] if under(project_of(load(v["vm"])), project)])
+                for n in net_ls() if under(n.get("project", "default"), project)]
     if tool == "net_create":
         cfg = net_create(net, where)
         with open(net_file(net), "w") as f:
@@ -2754,8 +2791,9 @@ def mcp(name, project=None):
     notes and log are that project's."""
     if project:
         check_project(project)
-        if os.path.isfile(os.path.join(vm_dir(name), "machine.json")):
-            in_scope(name, project)
+        if not os.path.isfile(os.path.join(vm_dir(name), "machine.json")) or not under(project_of(load(name)), project):
+            name = None  # its VM (by default "default") is outside the project: serve without one of its own
+    shell_ok = set()  # VMs whose root shell (exec) the user approved in this session
     agents = {}  # per VM: whether qemu-guest-agent answered once; unknown until asked
     seen = {}  # per VM: when a logged-in session was last confirmed
     can_ask, pending, asks = False, collections.deque(), iter(range(1, 1 << 30))
@@ -2770,7 +2808,7 @@ def mcp(name, project=None):
             p = project or (a.get("project") if tool in PROJECT_ARG_TOOLS else None) or (m and project_of(m))
             p = p if isinstance(p, str) and _PROJECT.fullmatch(p) and under(p, project) else project or DEFAULT_PROJECT
             mine = under(project_of(m), project)
-            path = os.path.join(project_dir(p), AGENT_LOG) if tool in AGENT_NAMES else \
+            path = os.path.join(project_dir(p), AGENT_LOG) if tool in AGENT_NAMES or tool == "exec" else \
                 os.path.join(vm_dir(vm), "actions.log") if m.get("sandbox") and mine else None
             if path:
                 with open(path, "a", encoding="utf-8") as f:
@@ -2832,10 +2870,17 @@ def mcp(name, project=None):
             tool, a = p.get("name"), dict(p.get("arguments") or {})
             vm = a.get("vm") if tool in AGENT_NAMES else a.pop("vm", None) or name
             try:
+                if not vm and tool not in AGENT_NAMES and tool not in ("top", "quota"):
+                    raise ValueError("name the VM (vm): this server has no VM of its own in its project")
                 if project and tool not in AGENT_NAMES and tool not in ("top", "quota"):
                     in_scope(vm, project)  # every call: a VM moved to another project leaves this agent's reach
                 if vm != name and tool not in AGENT_NAMES:  # screen tools on another VM: only one this agent manages
                     managed(vm)
+                if tool == "exec" and vm not in shell_ok:  # root (SYSTEM) in the guest: more than its screen
+                    if load(vm).get("created_by") != "agent":
+                        approve(f"Let the agent run commands as root (SYSTEM) inside your VM {vm}?",
+                                f"terminal-vm mcp {vm}   (or run the commands yourself)")
+                    shell_ok.add(vm)
                 # one guest-agent round trip per burst of input, not per click: a session seen < 5 s ago still holds
                 if tool in INPUT_TOOLS and agents.get(vm) is not False and time.time() - seen.get(vm, 0) > 5:
                     users = guest_users(vm)
@@ -2853,7 +2898,8 @@ def mcp(name, project=None):
                        (lambda t: dict(t, vms=[v for v in t["vms"] if under(project_of(load(v["name"])), project)],
                                        quota=scoped_quota(project)) if project else t)(top())
                        if tool == "top" else
-                       guest_shell(vm, a["command"], float(a.get("timeout", 60))) if tool == "exec" else act(vm, tool, a))
+                       guest_shell(vm, a["command"], min(float(a.get("timeout", 60)), 600)) if tool == "exec" else
+                       act(vm, tool, a))
                 record(tool, a, vm)
                 if tool == "screenshot":
                     content = [image(out[0])]
@@ -2876,6 +2922,8 @@ def mcp(name, project=None):
 def main(argv=None):
     if (sys.argv[1:] if argv is None else argv)[:1] == ["_switch"]:  # internal: started by start for its networks
         return net_switch((sys.argv[2:] if argv is None else argv[1:])[0])
+    if (sys.argv[1:] if argv is None else argv)[:1] == ["_watch"]:  # internal: started by start for each VM
+        return watch((sys.argv[2:] if argv is None else argv[1:])[0])
     if (sys.argv[1:] if argv is None else argv)[:1] == ["_rename"]:  # internal: started by start for a Windows clone
         return rename_guest((sys.argv[2:] if argv is None else argv[1:])[0])
     mac_args = macos_handoff(sys.argv[1:] if argv is None else argv)
