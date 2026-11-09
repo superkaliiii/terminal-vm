@@ -15,6 +15,20 @@ def tiny_png(w, h):
         chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
 
 
+def in_thread(f):
+    """f() run in another thread: its result, or its exception raised here."""
+    out = {}
+    def run():
+        try:
+            out["r"] = f()
+        except BaseException as e:
+            out["e"] = e
+    t = threading.Thread(target=run); t.start(); t.join()
+    if "e" in out:
+        raise out["e"]
+    return out.get("r")
+
+
 class FakeServer(threading.Thread):
     """Line-JSON unix socket server; `reply(msg)` returns the reply line(s) to write."""
     def __init__(self, path, greeting, reply):
@@ -1022,11 +1036,7 @@ class Supervision(unittest.TestCase):
         self.assertEqual(tl.wanted("a"), "stopped")
         tl.want("a", "running")
         with tl.vm_op("a"):                                                # a user operation on it: next pass
-            tl.vm_op.held.clear()                                          # held by "another process"
-            try:
-                self.assertEqual(tl.supervise_pass(st, now=6000), [])
-            finally:
-                tl.vm_op.held["a"] = 1
+            self.assertEqual(in_thread(lambda: tl.supervise_pass(st, now=6000)), [])  # another thread waits for it
         self.assertEqual([e["event"] for e in tl.events()][-2:], ["restart_failed", "window_closed"])
         self.assertEqual(tl.events(vm="a")[0]["event"], "restarted")
 
@@ -1077,13 +1087,8 @@ class Supervision(unittest.TestCase):
             with tl.vm_op("a"):                                            # re-entrant in one process
                 pass
             self.assertTrue(os.path.isdir(os.path.join(self.tmp, "a", ".op.lock")))
-            with self.assertRaisesRegex(SystemExit, "busy"):
-                tl.vm_op.held.clear()                                      # as another process would see it
-                try:
-                    with tl.vm_op("a", wait=0.3):
-                        pass
-                finally:
-                    tl.vm_op.held["a"] = 1
+            with self.assertRaisesRegex(SystemExit, "busy"):               # another thread (a web click) waits
+                in_thread(lambda: tl.vm_op("a", wait=0.3).__enter__())
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "a", ".op.lock")))
 
     def test_long_use_and_daemon_lock(self):
@@ -1112,6 +1117,99 @@ class Supervision(unittest.TestCase):
             tl.supervise("a", restart="sometimes")
         s = tl.daemon("status")
         self.assertEqual((s["daemon"], [v["name"] for v in s["supervised"]]), ("stopped", ["a", "b"]))
+
+
+class SharedDashboard(unittest.TestCase):
+    """The web dashboard's code is one block, identical in terminal-ct and terminal-vm: change it in both, then set
+    SHARED_SHA in both tests to the new value."""
+    SHARED_SHA = "a66afc10e8c277b0ac2b05f23ed7d5058dfb50aa3bc532170fb4f2993ffada72"
+
+    @staticmethod
+    def block(path):
+        text = open(path, encoding="utf-8").read().replace("\r\n", "\n")
+        return text[text.index("# ===== shared web dashboard"):text.index("# ===== end of shared web dashboard =====")]
+
+    def test_block_is_the_shared_one(self):
+        import hashlib
+        mine = self.block(tl.__file__)
+        self.assertEqual(hashlib.sha256(mine.encode()).hexdigest(), self.SHARED_SHA,
+                         "the shared dashboard block changed: copy it to the other tool and update SHARED_SHA in both")
+        other = os.environ.get("TERMINAL_CT_SRC") or os.path.join(os.path.dirname(os.path.abspath(tl.__file__)), "..", "..", "terminal-conteneur", "terminal_ct.py")
+        if os.path.isfile(other):  # both checked out side by side: compare them directly
+            self.assertEqual(mine, self.block(other))
+
+
+class WebDashboard(unittest.TestCase):
+    """terminal-vm's side of the shared dashboard: VMs here, containers through terminal-ct's command line."""
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(); tl.STORE = self.tmp
+        for n, p in (("a", "default"), ("b", "lab")):
+            os.makedirs(os.path.join(self.tmp, n))
+            tl.save(n, {"cpus": 1, "memory_mb": 1024, "os": "linux", "project": p})
+        self.ct = os.path.join(self.tmp, "fake_ct.py")
+        with open(self.ct, "w") as f:
+            f.write("import json, sys\na = sys.argv[1:]\n"
+                    "open(sys.argv[0] + '.log', 'a').write(json.dumps(a) + '\\n')\n"
+                    "if a[:2] == ['dash', '--json']: print(json.dumps({'engine': 'podman', 'daemon': True, "
+                    "'rows': [{'name': 'web1'}], 'stacks': [], 'events': [{'time': 't', 'event': 'started'}]}))\n"
+                    "elif a[0] == 'stack': print(json.dumps({'stack': a[2], 'project': 'default', "
+                    "'services': {'app': {'image': 'nginx', 'replicas': 2, 'running': 1}}}))\n"
+                    "elif a[0] == 'logs': print('line 1')\n"
+                    "elif a[0] == 'apply': print(json.dumps(json.load(open(a[1]))))\n"
+                    "elif a[0] in ('start', 'stop', 'rm', 'scale'): print(json.dumps({a[0]: a[1:]}))\n"
+                    "else: sys.stderr.write(json.dumps({'error': 'no such container'}) + '\\n'); sys.exit(1)\n")
+        self.patches = [mock.patch.object(tl, "state", lambda n: "stopped"),
+                        mock.patch.dict(os.environ, {"TERMINAL_CT": f'"{sys.executable}" "{self.ct}"'})]
+        for p in self.patches: p.start()
+        tl._CT_CACHE.clear()
+
+    def tearDown(self):
+        for p in self.patches: p.stop()
+
+    def calls(self):
+        with open(self.ct + ".log") as f:
+            return [json.loads(l) for l in f]
+
+    def test_api(self):
+        api = lambda m, path, q=None, body=None: tl.web_api(m, path, q or {}, body)[1]
+        d = api("GET", "/api/state")
+        self.assertEqual((d["tool"], d["engine"], d["rows"]), ("terminal-vm", "podman", [{"name": "web1"}]))
+        self.assertEqual(self.calls()[-1], ["dash", "--json"])
+        api("GET", "/api/state", {"project": "lab"})
+        self.assertEqual(self.calls()[-1], ["dash", "--json", "--project", "lab"])
+        n = len(self.calls())
+        api("GET", "/api/state", {"project": "lab"})                                   # another tab: cached
+        self.assertEqual(len(self.calls()), n)
+        self.assertEqual([v["name"] for v in api("GET", "/api/vms")["vms"]], ["a", "b"])
+        self.assertEqual([v["name"] for v in api("GET", "/api/vms", {"project": "lab"})["vms"]], ["b"])
+        self.assertIn("cpus", api("GET", "/api/quota")["quota"])
+        self.assertEqual(api("GET", "/api/logs", {"name": "web1"}), b"line 1\n")
+        self.assertEqual(api("GET", "/api/stack", {"name": "lab"})["desired"]["services"],
+                         {"app": {"image": "nginx", "replicas": 2}})                    # running is status, not desired
+        self.assertEqual(api("POST", "/api/do", body={"op": "start", "name": "web1"}), {"start": ["web1"]})
+        api("GET", "/api/state", {"project": "lab"})                                   # an action: fresh state
+        self.assertEqual(self.calls()[-1], ["dash", "--json", "--project", "lab"])
+        self.assertEqual(api("POST", "/api/do", body={"op": "scale", "stack": "lab", "service": "app", "replicas": 3}),
+                         {"scale": ["lab", "app", "3"]})
+        spec = {"stack": "lab", "services": {"app": {"image": "nginx"}}}
+        self.assertEqual(api("POST", "/api/do", body={"op": "apply", "stack": spec}), spec)
+        self.assertEqual(os.listdir(os.path.join(self.tmp, "web")), [])               # its temporary file removed
+        for bad in ({"op": "rm", "name": "-rf"}, {"op": "start", "name": "../x"}, {"op": "scale", "stack": "a b"},
+                    {"kind": "vm", "op": "rm", "name": "a"}, {"op": "format"}):
+            with self.assertRaises((ValueError, SystemExit)):
+                api("POST", "/api/do", body=bad)
+        with self.assertRaisesRegex(RuntimeError, "no such container"):
+            api("GET", "/api/shot", {"name": "nope"})
+        with mock.patch.object(tl, "start", lambda n, window=False, set_want=True: print(json.dumps({"started": n}))):
+            self.assertEqual(api("POST", "/api/do", body={"kind": "vm", "op": "start", "name": "a"}), {"started": "a"})
+        with self.assertRaises(tl.NoRoute):
+            api("GET", "/api/nothing")
+
+    def test_without_terminal_ct(self):
+        with mock.patch.dict(os.environ, {"TERMINAL_CT": ""}), mock.patch.object(tl.shutil, "which", lambda e: None):
+            d = tl.web_api("GET", "/api/state", {}, None)[1]
+        self.assertEqual((d["rows"], d["tool"]), ([], "terminal-vm"))
+        self.assertIn("terminal-ct not found", d["note"])
 
 
 class SettledScreenshot(unittest.TestCase):

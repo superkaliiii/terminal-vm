@@ -26,6 +26,8 @@ Virtualization), which is also the default for `up` and `create` without `--os`.
   daemon run|start|stop|status   supervision (started by start): a VM that stopped without a guest shutdown is
                            started again (growing delay), guest agent health, idle pause; events [-n 50] [--vm V]
   supervise NAME [--restart always|never] [--idle-pause MINUTES]   how the daemon looks after a VM
+  web [--project P] [--no-open]   web dashboard (VMs; terminal-ct's containers when installed), served by the
+                           daemon on 127.0.0.1 (TERMINAL_VM_WEB_PORT, default 7172) behind a token
   quota [--cpus N --memory GiB --disk GiB --vms N]   host-wide ceiling for all VMs (default from the host)
   resources NAME [--cpus N] [--memory GiB]   within the VM's ceiling (create --max-cpus/--max-memory); live where possible
   sandbox NAME [on|off]   no network, no guest agent or file copy, disk reset at each stop, actions logged
@@ -38,15 +40,15 @@ Virtualization), which is also the default for `up` and `create` without `--os`.
   mcp [NAME] [--project P]   stdio MCP server (with --project: only that project and its sub-projects)
   skills get | skills path | skills install [--dir DIR]
 """
-import argparse, base64, collections, contextlib, hashlib, io, json, os, queue, re, secrets, shlex, shutil, signal, socket, struct, subprocess, sys, \
-    threading, time, urllib.parse, urllib.request
+import argparse, base64, collections, contextlib, hashlib, http.server, io, json, os, queue, re, secrets, shlex, shutil, signal, \
+    socket, socketserver, struct, subprocess, sys, threading, time, urllib.parse, urllib.request, webbrowser
 from xml.sax.saxutils import escape
 
 WINDOWS = os.name == "nt"
 if not WINDOWS:
     import fcntl, termios, tty  # terminal viewer only
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 _DATA = os.environ.get("LOCALAPPDATA", os.path.expanduser("~")) if WINDOWS else \
     os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
 # VMs made before the rename to terminal-vm stay where they are: the old folder is used until a new one exists
@@ -336,16 +338,17 @@ NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if WINDOWS else {}  #
 
 class vm_op:
     """One operation on a VM at a time between processes (an atomic mkdir in its folder): the daemon's restart
-    against the user's stop, rm, reset, clone and snapshot. Re-entrant within a process. wait: seconds to wait for
+    against the user's stop, rm, reset, clone and snapshot. Re-entrant within a thread (the daemon's web threads and
+    its supervisor wait for each other like processes). wait: seconds to wait for
     it, then SystemExit."""
     held = collections.Counter()
 
     def __init__(self, name, wait=30):
-        self.name, self.wait = name, wait
+        self.name, self.wait, self.key = name, wait, (threading.get_ident(), name)
 
     def __enter__(self):
-        if vm_op.held[self.name]:
-            vm_op.held[self.name] += 1
+        if vm_op.held[self.key]:
+            vm_op.held[self.key] += 1
             return self
         path, end = os.path.join(vm_dir(self.name), ".op.lock"), time.monotonic() + self.wait
         while True:
@@ -364,12 +367,13 @@ class vm_op:
                 if time.monotonic() >= end:
                     raise SystemExit(f"{self.name} is busy with another terminal-vm operation; try again")
                 time.sleep(0.2)
-        vm_op.held[self.name] += 1
+        vm_op.held[self.key] += 1
         return self
 
     def __exit__(self, *exc):
-        vm_op.held[self.name] -= 1
-        if not vm_op.held[self.name]:
+        vm_op.held[self.key] -= 1
+        if not vm_op.held[self.key]:
+            del vm_op.held[self.key]  # one key per web thread: none left behind
             with contextlib.suppress(OSError):
                 os.rmdir(os.path.join(vm_dir(self.name), ".op.lock"))
 
@@ -1245,11 +1249,12 @@ def mac_machines():
     exe = mac_bin() if MAC else None
     if not exe:
         return []
-    r = subprocess.run([exe, "ls"], capture_output=True, text=True)
     try:
+        r = subprocess.run([exe, "ls"], capture_output=True, text=True, timeout=10)
         machines = json.loads(r.stdout) if r.returncode == 0 else []
-    except ValueError:
+    except (ValueError, subprocess.TimeoutExpired):
         return []
+    machines = [m for m in machines if isinstance(m, dict) and m.get("name")]
     return [{"name": m["name"], "os": "macos", "engine": "terminal-mac", "cpus": m.get("cpu"),
              "memory_gb": m.get("memoryGiB"), "display": f"{m.get('width')}x{m.get('height')}"} for m in machines]
 
@@ -1571,6 +1576,7 @@ def daemon(cmd="status"):
             alive.wait(SUP_TICK)
     try:
         threading.Thread(target=beat, daemon=True).start()
+        threading.Thread(target=web_serve, daemon=True).start()
         event("daemon_started", detail=f"pid {os.getpid()}")
         st, cpu, quiet_since, last_err = _sup_load(), {}, time.time(), None
         while not os.path.exists(_daemon_file("stop")):
@@ -1582,8 +1588,8 @@ def daemon(cmd="status"):
                 if str(e) != last_err:
                     print(f"{time.strftime('%H:%M:%S')} pass: {e}", file=sys.stderr, flush=True)
                 last_err = str(e)
-            if any(wanted(n) == "running" for n in machines()):
-                quiet_since = time.time()
+            if any(wanted(n) == "running" for n in machines()) or time.time() - WEB_LAST[0] < IDLE_EXIT:
+                quiet_since = time.time()  # VMs to look after, or a dashboard open
             elif time.time() - quiet_since > IDLE_EXIT:
                 alive.set()  # look stopped first: a start from now on launches a new daemon...
                 with contextlib.suppress(OSError):
@@ -1600,10 +1606,608 @@ def daemon(cmd="status"):
             event("daemon_stopped")
     finally:
         alive.set()
-        for k in ("stop", "beat"):
+        for k in ("stop", "beat", "web"):
             with contextlib.suppress(OSError):
                 os.remove(_daemon_file(k))
         shutil.rmtree(lock, ignore_errors=True)
+
+
+# ---------- web dashboard: terminal-vm's side (VMs here, terminal-ct's containers through its command line) ----------
+TOOL = "terminal-vm"
+WEB_PORT = int(os.environ.get("TERMINAL_VM_WEB_PORT") or 7172)  # terminal-ct's is 7171: both can run
+_CT_NAME = re.compile(r"[a-z0-9][a-z0-9_.-]{0,62}")  # terminal-ct's container, stack and service names
+
+
+def ct_cli():
+    return peer_cli("TERMINAL_CT", "terminal-ct")
+
+
+def ct_call(args, timeout=60, **k):
+    cli = ct_cli()
+    if not cli:
+        raise RuntimeError("terminal-ct not found: put it on the PATH, or set TERMINAL_CT")
+    return cli_call(cli, args, timeout, **k)
+
+
+def _ct_name(n):
+    if not isinstance(n, str) or not _CT_NAME.fullmatch(n):
+        raise ValueError(f"invalid container or stack name {n!r}")
+    return n
+
+
+def _vm_rows(project=None):
+    """ls's rows of this store's VMs in the project, with the real use of the running ones (top)."""
+    rows = [v for v in vm_list() + mac_machines() if under(v.get("project") or DEFAULT_PROJECT, project)]
+    if any(v.get("status", "stopped") != "stopped" for v in rows):  # terminal-mac's: shown, run by it
+        use = {v["name"]: v for v in top().get("vms", [])}
+        for v in rows:
+            v.update({k: use.get(v["name"], {}).get(k) for k in ("cpu_percent", "host_memory_gb")})
+    return rows
+
+
+_CT_CACHE = {}  # project: (time, reply): several tabs, one terminal-ct call every few seconds
+
+
+def ct_dash(project=None, max_age=2):
+    hit = _CT_CACHE.get(project)
+    if hit and time.time() - hit[0] < max_age:
+        return dict(hit[1])
+    d = ct_call(["dash", "--json"] + (["--project", project] if project else []), timeout=30)
+    _CT_CACHE[project] = (time.time(), d)
+    return dict(d)
+
+
+def web_api(method, path, q, body=None):
+    """One dashboard call: (content type, bytes or a JSON-able value). Raises on a bad request."""
+    project = q.get("project") or None
+    if project:
+        check_project(project)
+    if method == "GET" and path == "/api/state":  # containers: terminal-ct's own reply, if it is installed
+        d = {"engine": None, "daemon": daemon_alive(), "project": project, "rows": [], "stacks": [], "events": []}
+        if not ct_cli():
+            d["note"] = "terminal-ct not found (PATH or TERMINAL_CT): no containers shown"
+        else:
+            try:
+                d = ct_dash(project)
+                if not d.get("daemon") and d.get("stacks"):  # its stacks are not kept while its daemon is down
+                    d["note"] = "terminal-ct's daemon is stopped: its stacks are not kept (terminal-ct daemon start)"
+            except (RuntimeError, ValueError, subprocess.TimeoutExpired) as e:
+                d["note"] = f"terminal-ct: {e}"
+        d["tool"], d["daemon"] = TOOL, daemon_alive()  # the header shows the daemon serving this page
+        return "application/json", d
+    if method == "GET" and path == "/api/vms":
+        return "application/json", {"vms": _vm_rows(project), "events": events(8, project=project)}
+    if method == "GET" and path == "/api/quota":
+        return "application/json", {"quota": quota(), "projects": [p["project"] for p in projects()]}
+    if method == "GET" and path == "/api/shot":
+        name = q.get("name", "")
+        if q.get("kind") == "vm":  # not a use: watching thumbnails must not keep a VM from its idle pause
+            qm, f = qmp(name), f"web{threading.get_ident()}.png"  # QMP takes one client: closed at once
+            try:
+                return "image/png", screenshot(name, qm, f)[0]
+            finally:
+                qm.close()
+                with contextlib.suppress(OSError):
+                    os.remove(os.path.join(vm_dir(name), f))
+        os.makedirs(os.path.join(STORE, "web"), mode=0o700, exist_ok=True)  # screenshots, stacks (env values)
+        out = os.path.join(STORE, "web", f"ct-{_ct_name(name)}.{threading.get_ident()}.png")
+        try:
+            ct_call(["action", name, "screenshot", "--output", out], timeout=20)
+            with open(out, "rb") as f:
+                return "image/png", f.read()
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(out)
+    if method == "GET" and path == "/api/logs":
+        n = str(max(1, min(int(q.get("n") or 200), 10000)))
+        return "text/plain; charset=utf-8", ct_call(["logs", _ct_name(q.get("name")), "-n", n], raw=True).encode()
+    if method == "GET" and path == "/api/stack":
+        st = ct_call(["stack", "show", _ct_name(q.get("name"))])
+        services = {k: {a: b for a, b in v.items() if a != "running"} for k, v in st.get("services", {}).items()}
+        return "application/json", {"desired": {"stack": st["stack"], "project": st.get("project"), "services": services},
+                                    "status": st}
+    if method == "POST" and path == "/api/do":
+        if not isinstance(body, dict):
+            raise ValueError("a JSON object")
+        op, name = body.get("op"), body.get("name") or ""
+        if body.get("kind") == "vm":
+            if op not in ("start", "stop", "force_stop"):
+                raise ValueError("VMs: start, stop or force_stop")
+            vm_dir(name)  # a valid VM name
+            if op == "start":
+                return "application/json", quiet(start, name)
+            try:
+                return "application/json", quiet(stop, name, force=op == "force_stop")
+            except SystemExit as e:
+                if e.code == 1:  # stop printed why on stderr: the guest ignored the power button
+                    raise RuntimeError(f"{name}: the guest did not shut down within 60 s (no ACPI handling, or a "
+                                       f"dialog is open); take a look, or force stop") from None
+                raise
+        _CT_CACHE.clear()  # the next refresh shows the container's new state at once
+        try:
+            if op in ("start", "stop", "rm"):
+                return "application/json", ct_call([op, _ct_name(name)], timeout=120)
+            if op == "restart":
+                ct_call(["stop", _ct_name(name)], timeout=120)
+                return "application/json", ct_call(["start", name], timeout=120)
+            if op == "scale":
+                return "application/json", ct_call(["scale", _ct_name(body.get("stack")), _ct_name(body.get("service")),
+                                                    str(int(body.get("replicas")))], timeout=300)
+            if op == "stack_rm":
+                return "application/json", ct_call(["stack", "rm", _ct_name(body.get("stack"))], timeout=300)
+            if op == "apply":
+                if not isinstance(body.get("stack"), dict):
+                    raise ValueError("apply needs the stack as a JSON object")
+                os.makedirs(os.path.join(STORE, "web"), mode=0o700, exist_ok=True)  # screenshots, stacks (env values)
+                f = os.path.join(STORE, "web", f"stack.{threading.get_ident()}.json")
+                try:
+                    with open(f, "w", encoding="utf-8") as out:
+                        json.dump(body["stack"], out)
+                    args = ["apply", f] + (["--project", check_project(body["project"])] if body.get("project") else [])
+                    return "application/json", ct_call(args, timeout=300)
+                finally:
+                    with contextlib.suppress(OSError):
+                        os.remove(f)
+            raise ValueError(f"unknown op {op!r}")
+        finally:
+            _CT_CACHE.clear()  # a refresh during the action cached the old state
+    raise NoRoute(path)
+
+
+# ===== shared web dashboard: identical in terminal-ct and terminal-vm (their tests compare it; edit both) =====
+# The daemon serves it on 127.0.0.1. GET / is the page (no data in it); every /api/ call needs the X-Token header,
+# which a cross-site page cannot set without a CORS preflight this server never grants, and a Host header naming
+# this server (DNS rebinding). Each tool defines around it: TOOL, WEB_PORT, STORE, WINDOWS, NO_WINDOW, in_wsl,
+# check_project, daemon, daemon_alive, _daemon_file, and web_api(method, path, query, body) -> (content type,
+# value): its own objects directly, the other tool's through that tool's JSON command line (cli_call).
+
+class _Capture(threading.local):
+    buf = None
+
+
+_CAPTURE = _Capture()
+
+
+class _Stdout:
+    """sys.stdout once a thread captures: each thread's prints go to its own buffer, the others' to the real one
+    (contextlib.redirect_stdout swaps it for every thread: the daemon's work and the web's actions mixed)."""
+    def __init__(self, real):
+        self.real = real
+
+    def write(self, s):
+        return (_CAPTURE.buf or self.real).write(s)
+
+    def __getattr__(self, k):
+        return getattr(_CAPTURE.buf or self.real, k)
+
+
+@contextlib.contextmanager
+def captured(buf):
+    if not isinstance(sys.stdout, _Stdout):
+        sys.stdout = _Stdout(sys.stdout)
+    old, _CAPTURE.buf = _CAPTURE.buf, buf
+    try:
+        yield buf
+    finally:
+        _CAPTURE.buf = old
+
+
+def peer_cli(env, exe):
+    """The other tool's command: from the environment (e.g. TERMINAL_VM="python3 /path/terminal_vm.py"), else
+    found on the PATH, else None."""
+    if os.environ.get(env):
+        return [a.strip('"') for a in shlex.split(os.environ[env], posix=not WINDOWS)]  # Windows paths keep their backslashes
+    found = shutil.which(exe)
+    return [found] if found else None
+
+
+def cli_call(cli, args, timeout=60, lines=False, raw=False):
+    """Run a JSON command line: its reply (the last line when progress lines come first; every line with lines;
+    the text with raw). A failure raises RuntimeError with the tool's own message."""
+    r = subprocess.run(cli + args, capture_output=True, text=True, timeout=timeout, encoding="utf-8", errors="replace",
+                       **NO_WINDOW)
+    if r.returncode:
+        err = (r.stderr or r.stdout).strip()
+        with contextlib.suppress(ValueError, AttributeError, IndexError):
+            err = json.loads(err.splitlines()[-1])["error"]
+        raise RuntimeError(err or f"{os.path.basename(cli[-1])} {args[0]} failed")
+    out = r.stdout if raw else r.stdout.strip()
+    if raw:
+        return out
+    if lines:
+        return [json.loads(l) for l in out.splitlines() if l.strip()]
+    try:
+        return json.loads(out) if out else {}
+    except ValueError:  # progress lines first: the reply is the last one
+        return json.loads(out.splitlines()[-1])
+
+
+class NoRoute(Exception):
+    pass
+
+
+def _web_write(path, text, mode=0o644):
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.new"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    for i in range(20):  # Windows: refused while another process has the file open for a moment
+        try:
+            return os.replace(tmp, path)
+        except PermissionError:
+            if i == 19:
+                raise
+            time.sleep(0.05)
+
+
+def web_token():
+    """The dashboard's token (STORE/web.token, owner only): kept across daemon restarts, so open tabs go on."""
+    path = os.path.join(STORE, "web.token")
+    with contextlib.suppress(OSError):
+        with open(path) as f:
+            t = f.read().strip()
+        if len(t) >= 32:
+            return t
+    # missing, or cut short (a crash while writing): an empty token would let any request in
+    os.makedirs(STORE, exist_ok=True)
+    t = secrets.token_urlsafe(24)
+    _web_write(path, t, 0o600)
+    return t
+
+
+WEB_LAST = [0.0]  # time of the latest API call: a daemon with an open dashboard does not end for being idle
+
+
+class _WebServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = not WINDOWS  # on Windows it lets a second process bind the same port
+    allow_reuse_port = False  # never share the port with another store's daemon
+
+    def server_bind(self):  # HTTPServer's also looks up this host's FQDN: seconds on some Macs, and unused here
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
+class _WebHandler(http.server.BaseHTTPRequestHandler):
+    server_version = "terminal-dashboard"
+    timeout = 30  # a client stalling mid-request frees its thread
+
+    def log_message(self, *a):  # quiet: the daemon's log is for its own work
+        pass
+
+    def _send(self, code, ctype, body):
+        if not isinstance(body, bytes):
+            body = json.dumps(body).encode()
+        self.send_response(code)
+        for k, v in (("Content-Type", ctype), ("Content-Length", str(len(body))), ("Cache-Control", "no-store"),
+                     ("X-Content-Type-Options", "nosniff"), ("Referrer-Policy", "no-referrer"),
+                     ("Content-Security-Policy", "default-src 'self'; img-src 'self' blob:; style-src 'unsafe-inline'; "
+                                                 "script-src 'unsafe-inline'; frame-ancestors 'none'")):
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle(self, method):
+        if self.headers.get("Host") not in self.server.hosts:
+            return self._send(403, "application/json", {"error": "unknown host"})
+        u = urllib.parse.urlsplit(self.path)
+        if method == "GET" and u.path == "/":
+            return self._send(200, "text/html; charset=utf-8", WEB_PAGE.encode())
+        given = self.headers.get("X-Token", "").encode("utf-8", "replace")
+        if not given or not secrets.compare_digest(given, web_token().encode()):
+            return self._send(401, "application/json", {"error": f"token: open the dashboard with {TOOL} web"})
+        WEB_LAST[0] = time.time()
+        try:
+            body = None
+            if method == "POST":
+                if self.headers.get_content_type() != "application/json":  # no cross-site "simple" request
+                    raise ValueError("Content-Type must be application/json")
+                n = int(self.headers.get("Content-Length") or 0)
+                if not 0 <= n <= 2 ** 20:
+                    raise ValueError("body too large")
+                body = json.loads(self.rfile.read(n) or b"null")
+            ctype, out = web_api(method, u.path, dict(urllib.parse.parse_qsl(u.query)), body)
+            self._send(200, ctype, out)
+        except NoRoute:
+            self._send(404, "application/json", {"error": "not found"})
+        except ConnectionError:  # the browser left: no error reply on a closed socket
+            raise
+        except (SystemExit, Exception) as e:  # a bad request or a failed action: the server goes on
+            self._send(400, "application/json", {"error": str(e) or type(e).__name__})
+
+    def handle(self):
+        with contextlib.suppress(ConnectionError):  # the browser left before the reply (closed or frozen tab)
+            super().handle()
+
+    def do_GET(self):
+        self._handle("GET")
+
+    def do_POST(self):
+        self._handle("POST")
+
+
+def web_serve(port=None):
+    """Serve the dashboard until the process ends (a thread of the daemon); its port goes to STORE/daemon.web."""
+    try:
+        web_token()  # made now: the web command reads it once the port is up
+        try:
+            srv = _WebServer(("127.0.0.1", WEB_PORT if port is None else port), _WebHandler)
+        except OSError:  # taken: any free port (the web command reads it from the file)
+            srv = _WebServer(("127.0.0.1", 0), _WebHandler)
+        p = srv.server_address[1]
+        srv.hosts = {f"127.0.0.1:{p}", f"localhost:{p}"}
+        _web_write(_daemon_file("web"), json.dumps({"port": p, "pid": os.getpid()}))
+        srv.serve_forever()
+    except Exception as e:  # the dashboard down must not take the daemon's own work with it
+        print(f"{time.strftime('%H:%M:%S')} web: {e}", file=sys.stderr, flush=True)
+
+
+def web(open_browser=True, project=None):
+    """Start the daemon if needed, then open its dashboard in the browser; returns the URL (token included)."""
+    if project:
+        check_project(project)
+    if not daemon_alive():
+        daemon("start")
+    end = time.time() + 20
+    while True:
+        try:
+            with open(_daemon_file("web")) as f:
+                w = json.load(f)
+            with open(_daemon_file("beat")) as f:
+                if int(f.read().split()[1]) != w["pid"]:  # left by an earlier daemon
+                    raise ValueError("stale")
+            socket.create_connection(("127.0.0.1", w["port"]), 1).close()
+            break
+        except (OSError, ValueError, KeyError, IndexError):
+            if time.time() > end:
+                raise SystemExit(f"the daemon serves no dashboard (started by an older version?): "
+                                 f"{TOOL} daemon stop, then {TOOL} web") from None
+            time.sleep(0.3)
+    url = f"http://127.0.0.1:{w['port']}/#t={web_token()}" + (f"&p={urllib.parse.quote(project)}" if project else "")
+    if open_browser:
+        with contextlib.suppress(OSError):
+            if in_wsl():  # the Windows browser: WSL forwards its 127.0.0.1 ports to Windows
+                subprocess.Popen(["rundll32.exe", "url.dll,FileProtocolHandler", url],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                webbrowser.open(url)
+    return {"url": url, "port": w["port"]}
+
+
+WEB_PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Terminal dashboard</title>
+<style>
+:root{--bg:#f6f7f9;--panel:#fff;--fg:#1d2330;--mute:#6b7385;--line:#e2e5ea;--acc:#2f6fdb;--ok:#1f9d55;--warn:#c98a00;--bad:#d64545;--cpu:#2f6fdb;--mem:#8a4fd8}
+@media (prefers-color-scheme:dark){:root{--bg:#12151b;--panel:#1a1f27;--fg:#e4e8ef;--mute:#8e97a8;--line:#2a313c;--acc:#6aa0ff;--ok:#3cc47c;--warn:#e0b040;--bad:#ff6b6b;--cpu:#6aa0ff;--mem:#b68cff}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,sans-serif}
+header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:2}
+header h1{font-size:16px;margin:0}.chip{padding:2px 8px;border:1px solid var(--line);border-radius:10px;color:var(--mute);font-size:12px}
+main{padding:12px 16px;display:grid;gap:14px}section{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px 12px;overflow-x:auto}
+h2{font-size:14px;margin:0 0 8px;color:var(--mute);text-transform:uppercase;letter-spacing:.04em}
+table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:4px 8px;border-bottom:1px solid var(--line);white-space:nowrap}th{color:var(--mute);font-weight:500;font-size:12px}
+.running,.ok{color:var(--ok)}.created,.paused,.failing{color:var(--warn)}.exited,.unhealthy,.dead{color:var(--bad)}
+button{font:inherit;font-size:12px;padding:2px 8px;border:1px solid var(--line);border-radius:5px;background:var(--bg);color:var(--fg);cursor:pointer;margin-right:3px}
+button:hover{border-color:var(--acc)}button.danger:hover{border-color:var(--bad);color:var(--bad)}button:disabled{opacity:.5;cursor:wait}
+.shots{display:flex;flex-wrap:wrap;gap:10px}.shot{width:240px;cursor:pointer}.shot img{width:100%;aspect-ratio:16/10;object-fit:contain;background:#000;border-radius:5px;display:block}
+.shot div{font-size:12px;color:var(--mute);margin-top:3px}canvas{vertical-align:middle;margin-right:4px}
+#msg{color:var(--mute);font-size:12px;min-height:1em}#msg.err{color:var(--bad)}
+textarea{width:100%;min-height:180px;font:12px ui-monospace,monospace;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:5px;padding:6px}
+.ev{font:12px ui-monospace,monospace;white-space:pre-wrap;max-height:220px;overflow:auto;margin:0}
+dialog{width:min(1100px,96vw);max-height:92vh;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--fg);padding:10px}
+dialog img{max-width:100%;max-height:78vh;display:block;margin:auto}dialog pre{max-height:76vh;overflow:auto;font:12px ui-monospace,monospace;white-space:pre-wrap}
+select{font:inherit;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:5px}.mute{color:var(--mute)}
+</style></head><body>
+<header><h1 id="tool">terminal</h1><span id="engine" class="chip">…</span><span id="daemon" class="chip">daemon …</span>
+<label class="mute">project <select id="project"><option value="">all</option></select></label><span id="quota" class="mute"></span>
+<span id="msg"></span></header>
+<main>
+<section><h2>Screens</h2><div id="shots" class="shots"><span class="mute">no running desktop</span></div></section>
+<section><h2>Containers</h2><table><thead><tr><th>name</th><th>status</th><th>health</th><th>project</th><th>stack</th><th>CPU</th><th>memory</th><th>age</th><th>restarts</th><th>flags</th><th></th></tr></thead><tbody id="cts"></tbody></table><div id="ctnote" class="mute"></div></section>
+<section><h2>VMs (terminal-vm)</h2><table><thead><tr><th>name</th><th>os</th><th>status</th><th>project</th><th>CPU</th><th>memory</th><th></th></tr></thead><tbody id="vms"></tbody></table><div id="vmnote" class="mute"></div></section>
+<section><h2>Stacks</h2><table><thead><tr><th>stack</th><th>project</th><th>services (running / wanted)</th><th></th></tr></thead><tbody id="stacks"></tbody></table>
+<p><button id="new">new stack</button></p><div id="editor" hidden><textarea id="spec" spellcheck="false"></textarea><p><button id="apply">apply</button><button id="close">close</button></p></div></section>
+<section><h2>Events</h2><pre id="events" class="ev"></pre></section>
+</main>
+<dialog id="dlg"><p><b id="dlgtitle"></b> <button id="dlgclose" style="float:right">close</button></p><div id="dlgbody"></div></dialog>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const h = (tag, props, ...kids) => { const e = document.createElement(tag); Object.assign(e, props || {});
+  for (const k of kids) if (k != null) e.append(k instanceof Node ? k : String(k)); return e; };
+let token = sessionStorage.getItem("tct-token") || "";
+const frag = new URLSearchParams(location.hash.slice(1));
+if (frag.get("t")) { token = frag.get("t"); sessionStorage.setItem("tct-token", token); }
+if (frag.get("p")) sessionStorage.setItem("tct-project", frag.get("p"));
+history.replaceState(null, "", location.pathname);  // the token out of the address bar
+const hist = {}, HIST = 60; let last = null, shotTimer = 0, quotaBusy = false;
+const project = () => $("project").value;
+function msg(t, err) { $("msg").textContent = t; $("msg").className = err ? "err" : ""; }
+async function api(path, opts) {
+  const r = await fetch(path, Object.assign({headers: {"X-Token": token, "Content-Type": "application/json"}}, opts || {}));
+  if (!r.ok) { let e = r.status + ""; try { e = (await r.json()).error; } catch (_) {} throw new Error(e); }
+  return r;
+}
+const q = o => new URLSearchParams(Object.fromEntries(Object.entries(o).filter(([, v]) => v !== "" && v != null)));
+async function act(body, button, confirmText) {
+  if (confirmText && !confirm(confirmText)) return;
+  if (button) button.disabled = true;
+  const what = (body.op || "") + " " + (body.name || (body.stack && typeof body.stack === "object" ? body.stack.stack : body.stack) || "");
+  msg(what + " …");
+  try { const r = await (await api("/api/do", {method: "POST", body: JSON.stringify(body)})).json();
+    msg(what + ": done" + (r && r.desktop_ready != null ? " (desktop ready in " + r.desktop_ready + " s)" : "")); return r; }
+  catch (e) { msg(e.message, true); } finally { if (button) button.disabled = false; refresh(); }
+}
+function spark(values, max, colour) {
+  const c = h("canvas", {width: 70, height: 18}), x = c.getContext("2d");
+  x.strokeStyle = colour; x.lineWidth = 1.5; x.beginPath();
+  values.forEach((v, i) => { const px = i * 70 / (HIST - 1), py = 17 - Math.min(1, (v || 0) / (max || 1)) * 16;
+    i ? x.lineTo(px, py) : x.moveTo(px, py); });
+  x.stroke(); return c;
+}
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const age = s => s == null ? "-" : s < 120 ? Math.round(s) + "s" : s < 7200 ? Math.round(s / 60) + "m" : s < 172800 ? Math.round(s / 3600) + "h" : Math.round(s / 86400) + "d";
+function button(label, body, confirmText, cls) {
+  const b = h("button", {textContent: label, className: cls || ""}); b.onclick = () => act(body, b, confirmText); return b;
+}
+// the cells of buttons survive the refresh while their state is the same: rebuilt every 2 s, the button under the
+// pointer was replaced, and a click landing on the swap was lost
+function kept(tb) { const m = new Map(); for (const tr of tb.children) if (tr.cells_) m.set(tr.dataset.key, tr.cells_); return m; }
+function cell(prev, key, sig, make) {
+  const old = (prev.get(key) || {})[sig.split("|")[0]];
+  if (old && old.sig === sig) return old;
+  const td = h("td", null, ...make()); td.sig = sig; return td;
+}
+function keyed(key, cells, ...tds) { const tr = h("tr", null, ...tds); tr.dataset.key = key; tr.cells_ = cells; return tr; }
+function renderCts(d) {
+  const tb = $("cts"), prev = kept(tb); tb.replaceChildren();
+  for (const r of d.rows) {
+    const hh = hist[r.name] = hist[r.name] || {cpu: [], mem: []};
+    hh.cpu.push(r.cpu_percent); hh.mem.push(r.used_memory_gb);
+    const memMax = typeof r.memory_gb === "number" ? r.memory_gb : Math.max(1, ...hh.mem.filter(v => v != null));
+    const cpuMax = 100 * (typeof r.cpus === "number" ? r.cpus : 1);
+    if (hh.cpu.length > HIST) { hh.cpu.shift(); hh.mem.shift(); }
+    const run = r.status === "running";
+    const acts = cell(prev, r.name, "acts|" + r.status + "|" + r.flags + "|" + r.stack, () => [
+        run ? button("stop", {op: "stop", name: r.name}) : button("start", {op: "start", name: r.name}),
+        button("restart", {op: "restart", name: r.name}), logsButton(r.name),
+        r.flags.includes("D") && run ? shotButton("ct", r.name) : null,
+        button("rm", {op: "rm", name: r.name}, "Remove " + r.name + " and its /data?" + (r.stack ? " (a stack replica: the daemon makes it again, with an empty /data)" : ""), "danger")]);
+    tb.append(keyed(r.name, {acts}, h("td", null, h("b", {textContent: r.name})), h("td", {className: r.status, textContent: r.status}),
+      h("td", {className: r.health.split(" ")[0], textContent: r.health}), h("td", {textContent: r.project}), h("td", {textContent: r.stack || "-"}),
+      h("td", null, spark(hh.cpu, Math.max(100, cpuMax), css("--cpu")), r.cpu_percent == null ? "-" : r.cpu_percent + "%"),
+      h("td", null, spark(hh.mem, memMax, css("--mem")), (r.used_memory_gb == null ? "-" : r.used_memory_gb) + " / " + (r.memory_gb || "-") + " GiB"),
+      h("td", {textContent: age(r.age)}), h("td", {textContent: r.restarts}), h("td", {textContent: r.flags, title: "D desktop, S sandbox, I internet, A agent's"}),
+      acts));
+  }
+  for (const k of Object.keys(hist)) if (!d.rows.some(r => r.name === k)) delete hist[k];
+  if (!d.rows.length) tb.append(h("tr", null, h("td", {colSpan: 11, className: "mute", textContent: "no container"})));
+}
+function logsButton(name) {
+  const b = h("button", {textContent: "logs"});
+  b.onclick = async () => { const pre = h("pre"); openDlg("logs " + name, pre);
+    try { pre.textContent = await (await api("/api/logs?" + q({name, n: 300}))).text(); pre.scrollTop = 1e9; } catch (e) { pre.textContent = e.message; } };
+  return b;
+}
+function shotButton(kind, name) { const b = h("button", {textContent: "screen"}); b.onclick = () => bigShot(kind, name); return b; }
+let dlgTimer = 0, dlgGen = 0;  // dlgGen: a refresh loop of an earlier view stops by itself
+function openDlg(title, body) { dlgGen++; clearTimeout(dlgTimer); $("dlgtitle").textContent = title; $("dlgbody").replaceChildren(body); $("dlg").showModal(); }
+$("dlgclose").onclick = () => $("dlg").close();
+$("dlg").onclose = () => { dlgGen++; clearTimeout(dlgTimer);
+  $("dlgbody").querySelectorAll("img").forEach(i => { if (i.src.startsWith("blob:")) URL.revokeObjectURL(i.src); }); };
+async function loadShot(img, kind, name) {
+  if (img.busy) return; img.busy = true;  // a slow capture (a VM: seconds): never two at once for one image
+  try { const r = await api("/api/shot?" + q({kind, name})), url = URL.createObjectURL(await r.blob());
+    const old = img.src; img.src = url; if (old.startsWith("blob:")) URL.revokeObjectURL(old); }
+  finally { img.busy = false; }
+}
+function bigShot(kind, name) {
+  const img = h("img", {alt: name}); openDlg((kind === "vm" ? "VM " : "") + name, img);
+  const gen = dlgGen;
+  const tick = async () => { try { if (!document.hidden) await loadShot(img, kind, name); } catch (e) { msg(e.message, true); }
+    if ($("dlg").open && gen === dlgGen) dlgTimer = setTimeout(tick, kind === "vm" ? 2000 : 1000); };
+  tick();
+}
+const shotEls = {};
+async function renderShots(d, vms) {
+  const want = d.rows.filter(r => r.flags.includes("D") && r.status === "running").map(r => ["ct", r.name])
+    .concat(vms.filter(v => v.status && v.status !== "stopped").map(v => ["vm", v.name]));
+  const box = $("shots"), keys = want.map(w => w.join(":"));
+  for (const k of Object.keys(shotEls)) if (!keys.includes(k)) { const s = shotEls[k].img.src;
+    if (s.startsWith("blob:")) URL.revokeObjectURL(s); shotEls[k].remove(); delete shotEls[k]; }
+  for (const [kind, name] of want) {
+    const k = kind + ":" + name;
+    if (!shotEls[k]) { const img = h("img", {alt: name}); shotEls[k] = h("div", {className: "shot", onclick: () => bigShot(kind, name)}, img,
+        h("div", {textContent: (kind === "vm" ? "VM " : "") + name})); shotEls[k].img = img; box.append(shotEls[k]); }
+  }
+  if (!want.length) box.replaceChildren(h("span", {className: "mute", textContent: "no running desktop"}));
+  else box.querySelectorAll(":scope > span").forEach(e => e.remove());
+  if (Date.now() - shotTimer > 5000 && !document.hidden) { shotTimer = Date.now();
+    for (const [kind, name] of want) loadShot(shotEls[kind + ":" + name].img, kind, name).catch(() => {}); }
+}
+function renderVms(v) {
+  const tb = $("vms"), prev = kept(tb); tb.replaceChildren(); $("vmnote").textContent = v.note || "";
+  for (const m of v.vms) {
+    const run = m.status && m.status !== "stopped";
+    const acts = cell(prev, m.name, "acts|" + run + "|" + (m.engine || ""), () => [
+      m.engine ? null : run ? button("stop", {kind: "vm", op: "stop", name: m.name}, "Stop VM " + m.name + "?")
+        : button("start", {kind: "vm", op: "start", name: m.name}), run ? shotButton("vm", m.name) : null,
+      run && !m.engine ? button("force stop", {kind: "vm", op: "force_stop", name: m.name}, "Power off VM " + m.name + " at once (like pulling the plug)?", "danger") : null]);
+    tb.append(keyed(m.name, {acts}, h("td", null, h("b", {textContent: m.name})), h("td", {textContent: m.os || "-"}),
+      h("td", {className: run ? "running" : "exited", textContent: m.status || "-"}), h("td", {textContent: m.project || "-"}),
+      h("td", {textContent: m.cpu_percent == null ? "-" : m.cpu_percent + "%"}),
+      h("td", {textContent: (m.host_memory_gb == null ? "-" : m.host_memory_gb) + " / " + (m.memory_gb || "-") + " GiB"}),
+      acts));
+  }
+  if (!v.vms.length) tb.append(h("tr", null, h("td", {colSpan: 7, className: "mute", textContent: "no VM"})));
+}
+function renderStacks(d) {
+  const tb = $("stacks"), prev = kept(tb); tb.replaceChildren();
+  for (const s of d.stacks) {
+    const counts = Object.entries(s.services).map(([svc, c]) => [svc, c.replicas,
+      d.rows.filter(r => r.stack.startsWith(s.stack + "/" + svc + "/") && r.status === "running").length]);
+    const svcs = cell(prev, s.stack, "svcs|" + JSON.stringify(counts), () => counts.flatMap(([svc, want, runningN]) => {
+      const sc = n => button(n > want ? "+" : "−", {op: "scale", stack: s.stack, service: svc, replicas: n});
+      return [h("span", {textContent: svc + " " + runningN + "/" + want + " "}), want > 0 ? sc(want - 1) : null, sc(want + 1), " "];
+    }));
+    const acts = cell(prev, s.stack, "acts|", () => { const edit = h("button", {textContent: "edit"}); edit.onclick = () => editStack(s.stack);
+      return [edit, button("rm", {op: "stack_rm", stack: s.stack}, "Remove stack " + s.stack + ", its containers and their /data?", "danger")]; });
+    tb.append(keyed(s.stack, {svcs, acts}, h("td", null, h("b", {textContent: s.stack})), h("td", {textContent: s.project}), svcs, acts));
+  }
+  if (!d.stacks.length) tb.append(h("tr", null, h("td", {colSpan: 4, className: "mute", textContent: "no stack"})));
+}
+async function editStack(name) {
+  try { const r = await (await api("/api/stack?" + q({name}))).json(); $("spec").value = JSON.stringify(r.desired, null, 1); $("editor").hidden = false; }
+  catch (e) { msg(e.message, true); }
+}
+$("new").onclick = () => { $("spec").value = JSON.stringify({stack: "web", project: project() || undefined,
+  services: {app: {image: "nginx", replicas: 2, cpus: 0.5, memory_gb: 0.5, restart: "always"}}}, null, 1); $("editor").hidden = false; };
+$("close").onclick = () => { $("editor").hidden = true; };
+$("apply").onclick = async () => { let s; try { s = JSON.parse($("spec").value); } catch (e) { return msg("JSON: " + e.message, true); }
+  if (await act({op: "apply", stack: s}, $("apply"))) $("editor").hidden = true; };
+function renderTop(d, v) {
+  if (d.tool) {  // a state reply (the quota refresh passes only the quota)
+  $("tool").textContent = d.tool; $("ctnote").textContent = d.note || "";
+  $("engine").textContent = d.engine || "no container engine"; $("daemon").textContent = "daemon " + (d.daemon ? "running" : "stopped");
+  $("daemon").style.color = d.daemon ? css("--ok") : css("--bad");
+  const evs = (d.events || []).concat((v && v.events) || []).sort((a, b) => (a.time < b.time ? 1 : a.time > b.time ? -1 : 0)).slice(0, 12);
+  $("events").textContent = evs.map(e => [e.time, e.event, e.stack, e.service, e.container, e.vm && "VM " + e.vm, e.detail].filter(Boolean).join("  ")).join("\n") || "no event";
+  }
+  if (d.quota) last = d.quota;
+  if (last) $("quota").textContent = Object.entries(last).map(([k, v]) => k.replace("_gb", "") + " " + (v.used ?? "?") + "/" + (v.limit ?? "∞")).join(" · ");
+  const sel = $("project"), cur = sel.value, names = [...new Set((d.projects || []).concat(cur ? [cur] : []))].sort();
+  if (d.projects && names.join("\n") !== [...sel.options].slice(1).map(o => o.value).join("\n")) {  // rebuilt only when it changed: an open list stays open
+    sel.replaceChildren(h("option", {value: "", textContent: "all"}), ...names.map(p => h("option", {value: p, textContent: p})));
+    sel.value = cur; }
+}
+let busy = false, again = false;
+async function refresh() {
+  if (busy) { again = true; return; }  // asked meanwhile (an action, another project): once this pass ends
+  if (document.hidden) return; busy = true;  // a forgotten tab costs the engine nothing
+  try {
+    const p = project();
+    const [d, v] = await Promise.all([api("/api/state?" + q({project: p})).then(r => r.json()),
+      api("/api/vms?" + q({project: p})).then(r => r.json()).catch(e => ({vms: [], note: e.message}))]);
+    if (p !== project()) return;  // the project changed meanwhile: the next pass shows it
+    renderTop(d, v); renderCts(d); renderVms(v); renderStacks(d); renderShots(d, v.vms);
+    if ($("msg").className === "err" && $("msg").textContent.startsWith("dashboard:")) msg("");
+  } catch (e) { msg("dashboard: " + e.message, true); }
+  finally { busy = false; if (again) { again = false; refresh(); } }
+}
+async function refreshQuota() {  // apart: measuring the disk takes seconds, the table must not wait for it
+  if (quotaBusy || document.hidden) return; quotaBusy = true;
+  try { const p = project(), r = await (await api("/api/quota?" + q({project: p}))).json();
+    if (p === project()) renderTop({quota: r.quota, projects: r.projects}); }
+  catch (e) { msg("quota: " + e.message, true); } finally { quotaBusy = false; }
+}
+$("project").onchange = () => { sessionStorage.setItem("tct-project", project()); last = null; $("quota").textContent = ""; refresh(); refreshQuota(); };
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { refresh(); refreshQuota(); } });
+const saved = sessionStorage.getItem("tct-project");
+if (saved) $("project").append(h("option", {value: saved, textContent: saved})), $("project").value = saved;
+if (!token) msg("no token: open the dashboard with the web command (terminal-ct web, terminal-vm web)", true); else { refresh(); refreshQuota(); setInterval(refresh, 2000); setInterval(refreshQuota, 15000); }
+</script></body></html>
+"""
+# ===== end of shared web dashboard =====
 
 
 # ---------- networks ----------
@@ -1931,6 +2535,10 @@ def quota(set_=None):
 
 
 def ls():
+    print(json.dumps(vm_list() + mac_machines(), indent=1))
+
+
+def vm_list():
     out = []
     if os.path.isdir(STORE):
         for n in sorted(os.listdir(STORE)):
@@ -1940,7 +2548,7 @@ def ls():
                             "cpus": m["cpus"], "memory_gb": m["memory_mb"] // 1024,
                             "display": f"{m.get('width', 1280)}x{m.get('height', 800)}", "layout": m.get("layout", "us"),
                             **({"base": m["base"]} if m.get("base") else {}), **({"sandbox": True} if m.get("sandbox") else {})})
-    print(json.dumps(out + mac_machines(), indent=1))
+    return out
 
 
 def resume_all(stay=False):
@@ -3031,7 +3639,7 @@ def managed(name):
 def quiet(f, *a, **k):
     """Call a CLI function that prints its JSON result (stdout is the MCP channel) and return that result."""
     buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
+    with captured(buf):
         r = f(*a, **k)
     if r is not None:
         return r
@@ -3481,6 +4089,7 @@ def main(argv=None):
     su = sub.add_parser("supervise"); su.add_argument("name"); su.add_argument("--restart", choices=["always", "never"])
     su.add_argument("--idle-pause", type=int, help="minutes unused (and under 20%% CPU) before the daemon pauses it (0: never)")
     ev = sub.add_parser("events"); ev.add_argument("-n", type=int, default=50); ev.add_argument("--vm")
+    wb = sub.add_parser("web"); wb.add_argument("--project"); wb.add_argument("--no-open", action="store_true")
     ne = sub.add_parser("net"); nsub = ne.add_subparsers(dest="net_cmd", required=True)
     nsub.add_parser("create").add_argument("net"); nsub.add_parser("rm").add_argument("net")
     nsub.choices["create"].add_argument("--project")
@@ -3538,6 +4147,7 @@ def main(argv=None):
             r = daemon(o.daemon_cmd)
             return None if o.daemon_cmd == "run" else print(json.dumps(r, indent=1))
         if o.cmd == "supervise": return print(json.dumps(supervise(o.name, o.restart, o.idle_pause)))
+        if o.cmd == "web": return print(json.dumps(web(not o.no_open, o.project), indent=1))
         if o.cmd == "events":
             for e in events(o.n, o.vm):
                 print(json.dumps(e))

@@ -43,6 +43,7 @@ or install this folder as a Claude Code plugin (`.claude-plugin/`).
 |---|---|
 | `ls`, `status NAME`, `doctor`, `help`, `version` | list VMs, state + screen + logged-in users, host checks |
 | `start NAME [--window]`, `pause`, `resume` | lifecycle |
+| `web [--project P] [--no-open]` | web dashboard of the VMs and, when installed, terminal-ct's containers (see [Web dashboard](#web-dashboard)) |
 | `daemon run\|start\|stop\|status`, `supervise NAME [--restart always\|never] [--idle-pause MIN]`, `events [-n 50] [--vm V]` | supervision: restarts, health, idle pause, events (see [Supervision](#supervision)) |
 | `resume [--stay]`, `autostart [on\|off]` | start again the VMs that were running before a restart; at each logon (see [Restarts](#restarts)) |
 | `project ls`, `project show [P]`, `project notes [P [TEXT]]`, `project move NAME P`; `create --project P` | projects (see [Projects](#projects)) |
@@ -198,6 +199,22 @@ terminal-ct's line format (`vm` where it has `container`). Linux guests also
 give unused memory back to the host while they run (virtio-balloon with free page reporting). Measured (WSL,
 TinyCore): QEMU killed -> running again in 3 s; idle pause and wake by a screenshot as described.
 `TERMINAL_VM_DAEMON=0` turns supervision off.
+
+## Web dashboard
+
+`terminal-vm web [--project P] [--no-open]` starts the daemon if needed and opens its dashboard in the browser
+(from WSL, the Windows one): VMs (state, project, CPU and memory, start, stop, force stop, screen thumbnails and a
+larger refreshed view), the quota, the events, and [terminal-ct](https://github.com/superkaliiii/terminal-conteneur)'s
+containers and stacks when it is installed (on the PATH, or `TERMINAL_CT="python3 /path/terminal_ct.py"`): its
+`dash --json`, logs, start, stop, restart, remove, scale, the stack editor and its screenshots, all through its
+command line. It is the same dashboard as `terminal-ct web` (one block of code, identical in both tools).
+
+- Served by the supervision daemon on 127.0.0.1 only, port `TERMINAL_VM_WEB_PORT` (default 7172; terminal-ct uses
+  7171, so both run side by side). The daemon stays up while a dashboard is open.
+- Every API call needs the token of `STORE/web.token` (owner only, kept across restarts), passed by `web` in the URL
+  fragment; other Host names are refused.
+- Thumbnails are not a use: watching a VM does not keep it from its idle pause; its larger view neither. Use `view`
+  or `show` to work with it.
 
 ## Projects
 
