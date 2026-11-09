@@ -1925,12 +1925,13 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
         try:
             body = None
             if method == "POST":
-                if self.headers.get_content_type() != "application/json":  # no cross-site "simple" request
-                    raise ValueError("Content-Type must be application/json")
                 n = int(self.headers.get("Content-Length") or 0)
                 if not 0 <= n <= 2 ** 20:
                     raise ValueError("body too large")
-                body = json.loads(self.rfile.read(n) or b"null")
+                raw = self.rfile.read(n)  # read even when refused: unread data makes Windows reset the connection
+                if self.headers.get_content_type() != "application/json":  # no cross-site "simple" request
+                    raise ValueError("Content-Type must be application/json")
+                body = json.loads(raw or b"null")
             ctype, out = web_api(method, u.path, dict(urllib.parse.parse_qsl(u.query)), body)
             self._send(200, ctype, out)
         except NoRoute:
@@ -2098,7 +2099,8 @@ function renderCts(d) {
         button("restart", {op: "restart", name: r.name}), logsButton(r.name),
         r.flags.includes("D") && run ? shotButton("ct", r.name) : null,
         button("rm", {op: "rm", name: r.name}, "Remove " + r.name + " and its /data?" + (r.stack ? " (a stack replica: the daemon makes it again, with an empty /data)" : ""), "danger")]);
-    tb.append(keyed(r.name, {acts}, h("td", null, h("b", {textContent: r.name})), h("td", {className: r.status, textContent: r.status}),
+    tb.append(keyed(r.name, {acts}, h("td", null, h("b", {textContent: r.name}),
+      r.node ? h("span", {className: "mute", textContent: " @" + r.node, title: "in node " + r.node}) : null), h("td", {className: r.status, textContent: r.status}),
       h("td", {className: r.health.split(" ")[0], textContent: r.health}), h("td", {textContent: r.project}), h("td", {textContent: r.stack || "-"}),
       h("td", null, spark(hh.cpu, Math.max(100, cpuMax), css("--cpu")), r.cpu_percent == null ? "-" : r.cpu_percent + "%"),
       h("td", null, spark(hh.mem, memMax, css("--mem")), (r.used_memory_gb == null ? "-" : r.used_memory_gb) + " / " + (r.memory_gb || "-") + " GiB"),
