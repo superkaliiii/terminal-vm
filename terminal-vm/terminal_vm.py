@@ -1458,6 +1458,7 @@ def reset(name):
     _gc_bases()
     m = load(name)
     m.pop("installed", None)
+    m.pop("base", None)  # a blank disk of its own: no longer built on the VM it was cloned from
     answers = os.path.join(vm_dir(name), "answers")
     if PROFILES[m.get("os", "linux")]["family"] == "windows" and os.path.isdir(answers):
         # rewrite the answers with this version (fixes and guest tools added since creation), same

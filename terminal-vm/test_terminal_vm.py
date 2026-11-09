@@ -531,7 +531,9 @@ class StoppedVm(unittest.TestCase):
         return json.loads(buf.getvalue())
 
     def test_reset_keeps_size_and_config(self):
+        tl.save("v", dict(tl.load("v"), base="src"))  # a clone: reset gives it a blank disk of its own
         self.quiet(tl.reset, "v")
+        self.assertNotIn("base", tl.load("v"))
         create = next(c for c in self.calls if c[1] == "create")
         self.assertEqual(create[1:4] + create[5:], ["create", "-f", "qcow2", "68719476736"])
         with open(os.path.join(self.d, "disk.qcow2")) as f:
