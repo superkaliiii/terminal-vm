@@ -256,18 +256,21 @@ def _kv(text):
     return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
 
 
-def guest_exec(name, path, args, timeout=120):
-    """Run a program in the guest through qemu-guest-agent (root, or SYSTEM on Windows): exit code, stdout, stderr."""
+def guest_exec(name, path, args, timeout=120, stdin=None):
+    """Run a program in the guest through qemu-guest-agent (root, or SYSTEM on Windows): exit code, stdout, stderr.
+    stdin: bytes given to it."""
     g = QGA(name, timeout=5)
     try:
-        pid = g.call("guest-exec", path=path, arg=args, **{"capture-output": True})["pid"]
-        end = time.time() + timeout
+        pid = g.call("guest-exec", path=path, arg=args, **{"capture-output": True},
+                     **({"input-data": base64.b64encode(stdin).decode()} if stdin is not None else {}))["pid"]
+        end, wait = time.time() + timeout, 0.01
         while time.time() < end:
             st = g.call("guest-exec-status", pid=pid)
             if st.get("exited"):
                 dec = lambda k: base64.b64decode(st.get(k, "")).decode("utf-8", "replace")
                 return {"exit": st.get("exitcode", 1), "stdout": dec("out-data"), "stderr": dec("err-data")}
-            time.sleep(0.2)
+            time.sleep(wait)
+            wait = min(0.2, wait * 2)  # short commands (an engine call in a node) answer in tens of ms
         raise OSError(f"guest command timed out ({timeout} s)")
     finally:
         g.sock.close()
@@ -282,23 +285,27 @@ def guest_ps(name, script, timeout=120):
 
 def guest_shell(name, command, timeout=60):
     """A shell command in the guest: sh -c on Linux, PowerShell on Windows (no guest agent in a sandbox)."""
+    if PROFILES[load(name).get("os", "linux")]["family"] == "windows":
+        enc = base64.b64encode(command.encode("utf-16-le")).decode()
+        return guest_run(name, ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", enc], timeout)
+    return guest_run(name, ["/bin/sh", "-c", command], timeout)
+
+
+def guest_run(name, argv, timeout=60, stdin=None):
+    """A program in the guest with its arguments, no shell (the exec command; terminal-ct's engine calls in a
+    node): {exit, stdout, stderr}."""
     m = load(name)
     if m.get("sandbox"):
         raise SystemExit(f"{name} is a sandbox: no guest agent to run commands through (use the screen tools)")
     if state(name) == "stopped":
         raise SystemExit(f"{name} is not running; start it: terminal-vm start {name}")
     with in_use(name):  # a long command is a use until it ends
-        return _guest_shell(name, m, command, timeout)
-
-
-def _guest_shell(name, m, command, timeout):
-    try:
-        if PROFILES[m.get("os", "linux")]["family"] == "windows":
-            enc = base64.b64encode(command.encode("utf-16-le")).decode()
-            return guest_exec(name, "powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", enc], timeout)
-        return guest_exec(name, "/bin/sh", ["-c", command], timeout)
-    except OSError as e:
-        raise SystemExit(f"{name}: no guest agent answered ({e}); install qemu-guest-agent in the guest") from None
+        try:
+            return guest_exec(name, argv[0], argv[1:], timeout, stdin)
+        except OSError as e:
+            if "timed out" in str(e):
+                raise SystemExit(f"{name}: {e}; the command may still be running in the guest") from None
+            raise SystemExit(f"{name}: no guest agent answered ({e}); install qemu-guest-agent in the guest") from None
 
 
 # ---------- projects ----------
@@ -973,7 +980,9 @@ def qemu_args(name, m, window, vnc_port=None):
             # a host crash then loses the install, never a finished VM.
             "-drive", f"file={os.path.join(d, 'disk.qcow2')},if={p['disk_bus']}" + (",cache=unsafe" if setup else "")
             + (",snapshot=on" if sandbox and not setup else ""),
-            "-cdrom", m["iso"], "-boot", "order=cd", "-device", vga,
+            *(["-cdrom", m["iso"], "-boot", "order=cd"] if m.get("iso") else []), "-device", vga,
+            *(["-drive", f"if=virtio,driver=vvfat,dir={os.path.join(d, 'cidata').replace(',', ',,')},label=cidata,rw=off"]
+              if m.get("cloud") else []),
             *(["-usb"] if p["usb"] == "uhci" else ["-device", p["usb"]]), "-device", "usb-tablet",
             "-nic", "none" if m.get("offline") or (sandbox and not m.get("internet")) else f"user,model={p['nic']}",
             *net_args(m, p["nic"]),
@@ -1001,7 +1010,9 @@ def qemu_args(name, m, window, vnc_port=None):
 
 def create(name, iso, os_name="linux", cpus=None, memory=None, disk=None, width=1280, height=800, layout="us",
            offline=False, product_key=None, ui_language="en-US", sandbox=False, max_cpus=None, max_memory=None,
-           project=None):
+           project=None, image=None, node=False):
+    """A VM installed from an ISO, or (image) one booting an official cloud image, set up by cloud-init at its
+    first start; node: with Docker and Python 3, for terminal-ct."""
     d = vm_dir(name)
     project = check_project(project or DEFAULT_PROJECT)
     p = PROFILES.get(os_name)
@@ -1010,7 +1021,11 @@ def create(name, iso, os_name="linux", cpus=None, memory=None, disk=None, width=
     cpus, memory, disk = cpus or min(p["cpus"], os.cpu_count()), memory or p["memory"], disk or p["disk"]
     if os.path.exists(os.path.join(d, "machine.json")):
         raise SystemExit(f"VM {name!r} already exists in {d}")
-    if not iso or not os.path.isfile(iso):
+    if image and (image not in CLOUD_IMAGES or p["family"] != "linux" or sandbox):
+        raise SystemExit(f"--image: one of {', '.join(CLOUD_IMAGES)}, for a Linux VM (not a sandbox)")
+    if node and not image:
+        raise SystemExit("--node needs --image (debian or alpine)")
+    if not image and (not iso or not os.path.isfile(iso)):
         raise SystemExit(f"ISO not found: {iso}")
     if layout not in LAYOUTS:
         raise SystemExit(f"unknown layout {layout!r}; choose from {', '.join(LAYOUTS)}")
@@ -1034,14 +1049,17 @@ def create(name, iso, os_name="linux", cpus=None, memory=None, disk=None, width=
     if cpus > lim["cpus"] or top[1] > lim["memory_gb"]:
         raise SystemExit(f"this VM could never start within the quota ({lim['cpus']} CPUs, {lim['memory_gb']} GiB "
                          f"for its memory ceiling of {top[1]}): lower --cpus/--max-memory, or raise the quota")
+    base = cloud_image(image) if image else None  # before the folder exists: a failed download leaves nothing
     with quota_lock():
         quota_check({"disk_gb": disk})
         os.makedirs(d, mode=0o700, exist_ok=True)  # under the lock: the disk now counts for the next check
         with open(os.path.join(d, "machine.json"), "w") as f:
             json.dump({"os": os_name, "memory_mb": memory * 1024, "cpus": cpus, "disk_gb": disk}, f)
-    subprocess.run([qemu_bin("qemu-img"), "create", "-f", "qcow2", os.path.join(d, "disk.qcow2"), f"{disk}G"],
-                   check=True, stdout=subprocess.DEVNULL)
-    m = {"os": os_name, "iso": os.path.abspath(iso), "memory_mb": memory * 1024, "cpus": cpus, "width": width,
+    subprocess.run([qemu_bin("qemu-img"), "create", "-f", "qcow2", *(["-F", "qcow2", "-b", base] if base else []),
+                    os.path.join(d, "disk.qcow2"), f"{disk}G"], check=True, stdout=subprocess.DEVNULL)
+    m = {"os": os_name, **({"iso": os.path.abspath(iso)} if not image else
+                           {"image": image, "cloud": True, "installed": True, **({"node": True} if node else {})}),
+         "memory_mb": memory * 1024, "cpus": cpus, "width": width,
          "height": height, "layout": layout, "offline": offline or sandbox, **({"sandbox": True} if sandbox else {}),
          "max_cpus": top[0], "max_memory_mb": top[1] * 1024, "disk_gb": disk, "project": project,
          **({"balloon": True} if p["family"] == "linux" else {})}
@@ -1051,9 +1069,16 @@ def create(name, iso, os_name="linux", cpus=None, memory=None, disk=None, width=
         m.update(user="Administrator" if p["unattend"] == "sif" else "user",
                  password=secrets.token_urlsafe(6) + "-Aa1")
         write_answers(d, m, key, ui_language)
+    if image:  # the account cloud-init makes; the guest agent is how terminal-vm and terminal-ct reach it
+        m.update(user="user", password=secrets.token_urlsafe(9))
+        cloud_seed(name, m)
     with open(os.path.join(d, "machine.json"), "w") as f:
         json.dump(m, f)
     out = {"created": name, "os": os_name, "path": d, "project": project}
+    if image:
+        out.update(image=image, user=m["user"], password=m["password"], ready_file=m["ready_file"],
+                   note="set up by cloud-init at its first start (1-5 min, needs the internet); ready when "
+                        "ready_file exists in the guest")
     if p["family"] == "windows":
         out.update(user=m["user"], password=m["password"], note="Windows installs unattended on first start (10-40 min)")
     print(json.dumps(out))
@@ -2750,6 +2775,8 @@ def clone(src, new):
     if os.path.isdir(os.path.join(vm_dir(src), "answers")):  # but reset reinstalls unattended, as for SRC
         shutil.copytree(os.path.join(vm_dir(src), "answers"), os.path.join(d, "answers"))
     m.pop("networks", None)  # each NIC's MAC is per VM: attach the clone again
+    if m.get("cloud"):
+        cloud_seed(new, m)
     if m.get("os") in GUEST_TOOLS_OS and not m.get("sandbox"):  # renamed at its first start (sandbox: no agent)
         m["rename"] = computer_name(new)
     save(new, m)
@@ -2771,13 +2798,18 @@ def reset(name):
     _stopped(name)
     disk = os.path.join(vm_dir(name), "disk.qcow2")
     info = subprocess.run([qemu_bin("qemu-img"), "info", "--output=json", disk], check=True, capture_output=True, text=True)
-    subprocess.run([qemu_bin("qemu-img"), "create", "-f", "qcow2", disk + ".new", str(json.loads(info.stdout)["virtual-size"])],
+    base = cloud_image(load(name)["image"]) if load(name).get("cloud") else None
+    subprocess.run([qemu_bin("qemu-img"), "create", "-f", "qcow2", *(["-F", "qcow2", "-b", base] if base else []),
+                    disk + ".new", str(json.loads(info.stdout)["virtual-size"])],
                    check=True, stdout=subprocess.DEVNULL)
     os.replace(disk + ".new", disk)  # the old disk survives a failed create
     _gc_bases()
     m = load(name)
     m.pop("installed", None)
     m.pop("base", None)  # a blank disk of its own: no longer built on the VM it was cloned from
+    if m.get("cloud"):  # its image again, nothing to install
+        m["installed"] = True
+        cloud_seed(name, m)
     answers = os.path.join(vm_dir(name), "answers")
     if PROFILES[m.get("os", "linux")]["family"] == "windows" and os.path.isdir(answers):
         # rewrite the answers with this version (fixes and guest tools added since creation), same
@@ -3472,25 +3504,146 @@ def default_image(plan=False, os_name="linux"):
     return download(IMAGE_INDEX + iso, dest, expected)
 
 
-def download(url, dest, sha256):
-    """HTTPS download to dest, kept only if its SHA-256 matches."""
+def download(url, dest, sha256, algo="sha256"):
+    """HTTPS download to dest, kept only if its digest (SHA-256 by default) matches."""
     os.makedirs(os.path.dirname(dest), exist_ok=True)
-    digest, part, label = hashlib.sha256(), dest + ".part", os.path.basename(dest)
-    with urllib.request.urlopen(url, timeout=60) as r:
-        if urllib.parse.urlsplit(r.geturl()).scheme != "https":  # checked before any file is written
-            raise SystemExit(f"{url} redirected off HTTPS ({r.geturl()}); aborting")
-        with open(part, "wb") as f:
-            total, done = int(r.headers.get("Content-Length", 0)), 0
-            while chunk := r.read(1 << 20):
-                f.write(chunk); digest.update(chunk); done += len(chunk)
-                if total:
-                    print(f"\rdownloading {label}: {done * 100 // total}%", end="", file=sys.stderr)
-    print(file=sys.stderr)
-    if digest.hexdigest() != sha256:
-        os.unlink(part)
-        raise SystemExit(f"checksum mismatch for {label}; download discarded")
-    os.rename(part, dest)
+    # one .part per process: two creates fetching the same image never write the same file
+    digest, part, label = hashlib.new(algo), f"{dest}.{os.getpid()}.part", os.path.basename(dest)
+    try:
+        with urllib.request.urlopen(url, timeout=60) as r:
+            if urllib.parse.urlsplit(r.geturl()).scheme != "https":  # checked before any file is written
+                raise SystemExit(f"{url} redirected off HTTPS ({r.geturl()}); aborting")
+            with open(part, "wb") as f:
+                total, done, shown = int(r.headers.get("Content-Length", 0)), 0, -1
+                while chunk := r.read(1 << 20):
+                    f.write(chunk); digest.update(chunk); done += len(chunk)
+                    if total and done * 100 // total != shown:  # once per percent: a log keeps 100 lines
+                        shown = done * 100 // total
+                        print(f"\rdownloading {label}: {shown}%", end="", file=sys.stderr)
+        print(file=sys.stderr)
+        if digest.hexdigest() != sha256:
+            raise SystemExit(f"checksum mismatch for {label}; download discarded")
+        if not os.path.exists(dest):  # else another process got there first, with the same verified content
+            os.replace(part, dest)
+        return dest
+    finally:  # interrupted, refused, or not needed: never hundreds of MB left behind
+        with contextlib.suppress(OSError):
+            os.remove(part)
+
+
+# Official cloud images (already installed systems, set up at first boot by cloud-init), verified by the
+# SHA-512 lists their projects publish next to them.
+CLOUD_IMAGES = {
+    "debian": "https://cloud.debian.org/images/cloud/trixie/latest/",
+    "alpine": "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/cloud/",
+}
+
+
+def cloud_image(kind):
+    """The newest cloud image of that kind, cached in STORE/images (its name carries its digest); offline, the
+    newest one cached."""
+    folder = os.path.join(STORE, "images")
+    try:
+        index = CLOUD_IMAGES[kind]
+        if kind == "debian":
+            name = "debian-13-genericcloud-amd64.qcow2"
+            sums = urllib.request.urlopen(index + "SHA512SUMS", timeout=30).read().decode()
+            found = re.search(r"([0-9a-f]{128})\s+" + re.escape(name), sums)
+            if not found:
+                raise SystemExit(f"{name} is not in {index}SHA512SUMS")
+            digest = found[1]
+        else:
+            listing = urllib.request.urlopen(index, timeout=30).read().decode()
+            names = set(re.findall(r'href="(generic_alpine-([\d.]+)-x86_64-bios-cloudinit-r(\d+)\.qcow2)"', listing))
+            if not names:
+                raise SystemExit(f"no Alpine cloud image listed at {index}")
+            name = max(names, key=lambda n: ([int(x) for x in n[1].split(".")], int(n[2])))[0]
+            digest = urllib.request.urlopen(index + name + ".sha512", timeout=30).read().decode().split()[0]
+            if not re.fullmatch(r"[0-9a-f]{128}", digest):
+                raise SystemExit(f"unexpected checksum file for {name}")
+    except OSError as e:  # no network: the newest cached image of that kind
+        prefix = "debian-13-genericcloud" if kind == "debian" else "generic_alpine-"
+        cached = sorted((f for f in os.listdir(folder) if f.startswith(prefix) and f.endswith(".qcow2")),
+                        key=lambda f: os.path.getmtime(os.path.join(folder, f)), reverse=True) \
+            if os.path.isdir(folder) else []
+        if not cached:
+            raise SystemExit(f"cannot fetch the {kind} cloud image ({e}) and none is cached") from None
+        print(f"cannot check for a newer {kind} cloud image ({e}); using the cached {cached[0]}", file=sys.stderr)
+        return _in_use_now(os.path.join(folder, cached[0]))
+    dest = os.path.join(folder, f"{name[:-6]}-{digest[:12]}.qcow2")
+    if os.path.exists(dest):
+        return _in_use_now(dest)
+    download(CLOUD_IMAGES[kind] + name, dest, digest, "sha512")
+    os.chmod(dest, 0o444)  # the base of every VM made from it: never written
+    _gc_cloud_images(dest)
     return dest
+
+
+def _in_use_now(image):
+    """Mark a cloud image as just handed out: a create is about to build on it (see _gc_cloud_images)."""
+    with contextlib.suppress(OSError):  # shortcut: a read-only file's time cannot change on Windows; rare race left
+        os.utime(image)
+    return image
+
+
+def _gc_cloud_images(keep):
+    """Older cloud images no VM disk (or base) is built on any more: ~350 MB each, and Debian's latest changes often.
+    Not one handed out in the last 10 minutes (its VM's disk may not exist yet), and nothing when a disk's backing
+    cannot be read (an image in use would look free)."""
+    folder = os.path.dirname(keep)
+    disks = [os.path.join(STORE, n, "disk.qcow2") for n in os.listdir(STORE)]
+    if os.path.isdir(os.path.join(STORE, ".bases")):
+        disks += [os.path.join(STORE, ".bases", f) for f in os.listdir(os.path.join(STORE, ".bases"))]
+    used = set()
+    for disk in filter(os.path.isfile, disks):
+        r = subprocess.run([qemu_bin("qemu-img"), "info", "-U", "--output=json", disk], capture_output=True, text=True)
+        if r.returncode:
+            return
+        try:
+            backing = json.loads(r.stdout).get("backing-filename")
+        except ValueError:
+            return
+        if backing:
+            used.add(os.path.normcase(os.path.abspath(backing)))
+    for f in os.listdir(folder):
+        path = os.path.normcase(os.path.abspath(os.path.join(folder, f)))
+        if (f.startswith(("debian-13-genericcloud", "generic_alpine-")) and f.endswith(".qcow2")
+                and path != os.path.normcase(os.path.abspath(keep)) and path not in used
+                and time.time() - os.path.getmtime(path) > 600):
+            with contextlib.suppress(OSError):
+                os.chmod(path, 0o600)
+                os.remove(path)
+
+
+def cloud_seed(name, m):
+    """cloud-init's NoCloud seed of a cloud VM: a folder QEMU shows as a FAT disk labelled cidata. Its account,
+    the guest agent, and for a node Docker and Python 3. A new instance id (clone, reset) makes cloud-init run
+    again. The last step leaves m["ready_file"], named after this instance: a clone's disk holds its source's, not
+    its own; and only once the agent (and for a node Docker) answers."""
+    d, alpine = os.path.join(vm_dir(name), "cidata"), m["image"] == "alpine"
+    host = name.replace("_", "-").strip("-") or "vm"
+    m["instance_id"] = f"{host}-{secrets.token_hex(4)}"
+    m["ready_file"] = f"/var/lib/terminal-vm/ready-{m['instance_id']}"
+    packages = ["qemu-guest-agent"] + (["docker" if alpine else "docker.io", "python3"] if m.get("node") else [])
+    services = ["qemu-guest-agent"] + (["docker"] if m.get("node") else [])
+    start = [f"rc-update add {s} default && rc-service {s} start" if alpine else f"systemctl enable --now {s} || "
+             f"systemctl start {s}" for s in services]
+    if m.get("node"):
+        if alpine:  # cloud-init runs before OpenRC started cgroups: Docker would refuse to start
+            start.insert(1, "rc-service cgroups start || true")
+        start.append("for i in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 1; done")  # ready = answers
+    user = {"name": m["user"], "shell": "/bin/ash" if alpine else "/bin/bash", "lock_passwd": False}
+    if not alpine:  # Alpine's cloud image has doas, not sudo
+        user["sudo"] = "ALL=(ALL) NOPASSWD:ALL"
+    config = {"hostname": host, "users": [user], "ssh_pwauth": False, "package_update": True, "packages": packages,
+              "chpasswd": {"expire": False, "users": [{"name": m["user"], "password": m["password"], "type": "text"}]},
+              "runcmd": start + [("docker info >/dev/null 2>&1 && " if m.get("node") else "")
+                                 + f"mkdir -p /var/lib/terminal-vm && touch {m['ready_file']}"]}
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    with open(os.path.join(d, "meta-data"), "w", newline="\n") as f:  # quoted: a name of digits stays a string
+        f.write(f'instance-id: "{m["instance_id"]}"\nlocal-hostname: "{host}"\n')
+    with open(os.path.join(d, "user-data"), "w", newline="\n") as f:
+        f.write("#cloud-config\n" + json.dumps(config, indent=1) + "\n")  # JSON is YAML: no quoting to get wrong
 
 
 def guest_tools():
@@ -4120,6 +4273,8 @@ def main(argv=None):
     u = sub.add_parser("up"); u.add_argument("name", nargs="?", default="default"); u.add_argument("--iso")
     u.add_argument("--no-view", action="store_true"); u.add_argument("--plan", action="store_true"); sizes(u)
     c = sub.add_parser("create"); c.add_argument("name"); c.add_argument("--iso"); sizes(c)
+    c.add_argument("--image", choices=["debian", "alpine"], help="an official cloud image instead of an ISO")
+    c.add_argument("--node", action="store_true", help="with --image: Docker and Python 3, a node for terminal-ct")
     s = sub.add_parser("start"); s.add_argument("name"); s.add_argument("--window", action="store_true")
     t = sub.add_parser("stop"); t.add_argument("name"); t.add_argument("--force", action="store_true")
     t.add_argument("--timeout", type=int, default=60)
@@ -4158,6 +4313,10 @@ def main(argv=None):
     ev = sub.add_parser("events"); ev.add_argument("-n", type=int, default=50); ev.add_argument("--vm")
     wb = sub.add_parser("web"); wb.add_argument("--project"); wb.add_argument("--no-open", action="store_true")
     bn = sub.add_parser("bench"); bn.add_argument("--runs", type=int, default=10); bn.add_argument("--from", dest="src")
+    ex = sub.add_parser("exec", help="NAME [--timeout S] [--stdin FILE] -- PROGRAM ARGS: run it in the guest (agent)")
+    ex.add_argument("name"); ex.add_argument("--timeout", type=float, default=60)
+    ex.add_argument("--stdin", help="file given to the program as its standard input")
+    ex.add_argument("argv", nargs="*")  # after --: options of the program, not of exec
     ne = sub.add_parser("net"); nsub = ne.add_subparsers(dest="net_cmd", required=True)
     nsub.add_parser("create").add_argument("net"); nsub.add_parser("rm").add_argument("net")
     nsub.choices["create"].add_argument("--project")
@@ -4179,7 +4338,9 @@ def main(argv=None):
             if o.cmd in ("up", "create") else {})
     try:
         if o.cmd == "up": return up(o.name, o.iso, o.no_view, o.plan, **opts)
-        if o.cmd == "create": return create(o.name, o.iso or default_image(os_name=o.os_name), **opts)
+        if o.cmd == "create":
+            return create(o.name, None if o.image else o.iso or default_image(os_name=o.os_name), image=o.image,
+                          node=o.node, **opts)
         if o.cmd == "start": return start(o.name, o.window)
         if o.cmd == "stop": return stop(o.name, o.force, o.timeout)
         if o.cmd == "resume" and not o.name: return resume_all(o.stay)
@@ -4217,6 +4378,16 @@ def main(argv=None):
         if o.cmd == "supervise": return print(json.dumps(supervise(o.name, o.restart, o.idle_pause)))
         if o.cmd == "web": return print(json.dumps(web(not o.no_open, o.project), indent=1))
         if o.cmd == "bench": return print(json.dumps(bench(max(1, o.runs), o.src), indent=1))
+        if o.cmd == "exec":
+            argv = o.argv  # argparse has dropped the -- itself
+            if not argv:
+                raise SystemExit("exec NAME -- PROGRAM [ARGS]")
+            data = None
+            if o.stdin:
+                with open(o.stdin, "rb") as f:
+                    data = f.read()
+            # the guest's exit code is in the reply: a failing program is not a failing exec
+            return print(json.dumps(guest_run(o.name, argv, max(1.0, min(o.timeout, 3600)), data)))
         if o.cmd == "events":
             for e in events(o.n, o.vm):
                 print(json.dumps(e))

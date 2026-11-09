@@ -43,6 +43,8 @@ or install this folder as a Claude Code plugin (`.claude-plugin/`).
 |---|---|
 | `ls`, `status NAME`, `doctor`, `help`, `version` | list VMs, state + screen + logged-in users, host checks |
 | `start NAME [--window]`, `pause`, `resume` | lifecycle |
+| `create NAME --image debian\|alpine [--node]` | a Linux VM from an official cloud image instead of an ISO, set up unattended at its first start (see [Cloud images](#cloud-images)); `--node`: with Docker, a node for terminal-ct |
+| `exec NAME [--timeout 60] [--stdin FILE] -- PROGRAM ARGS` | run a program in the guest through its agent (no shell); JSON reply `{exit, stdout, stderr}` |
 | `web [--project P] [--no-open]` | web dashboard of the VMs and, when installed, terminal-ct's containers (see [Web dashboard](#web-dashboard)) |
 | `bench [--runs 10] [--from VM]` | timings of terminal-vm's own operations on a clone (see [Measurements](#measurements)) |
 | `daemon run\|start\|stop\|status`, `supervise NAME [--restart always\|never] [--idle-pause MIN]`, `events [-n 50] [--vm V]` | supervision: restarts, health, idle pause, events (see [Supervision](#supervision)) |
@@ -65,6 +67,19 @@ or install this folder as a Claude Code plugin (`.claude-plugin/`).
 The viewer has its own QMP monitor, so agents keep working while someone watches.
 
 Under WSL, the distribution can be stopped when no WSL terminal is open, which kills its VMs (a Windows install cut short leaves an unbootable disk: `reset NAME`, then `start NAME`). Keep one open, e.g. `wsl -d Debian -- sleep infinity`; `doctor` warns about it. The WSL disk grows inside the Windows drive while `df` in WSL shows its virtual size: keep ~20 GB free on the Windows drive per Windows guest, or the distribution fails with I/O errors. 
+
+## Cloud images
+
+`create NAME --image debian|alpine [--node]` boots an official cloud image (Debian 13 `genericcloud`, or Alpine's
+`bios-cloudinit` image), already installed: no ISO, no setup screens.
+- The image is downloaded once into `images/` of the store and checked against the SHA-512 list its project
+  publishes; the VM's disk is an overlay on it, grown to `--disk`. Offline, the newest cached image is used.
+- cloud-init sets it up at the first start from a FAT disk labelled `cidata` (QEMU's `vvfat`, so Windows hosts need
+  nothing more): host name = VM name, a `user` account (password in the reply and in `machine.json`), the guest
+  agent; `--node` adds Docker and Python 3. It needs the internet for those packages.
+- It is ready when `/var/lib/terminal-vm/ready` exists in the guest (with `--node`, once Docker answers). In WSL
+  with KVM: Alpine node ready in about 60 s, Debian in about 120 s (first start; later starts skip the setup).
+- `clone` and `reset` set the copy up again (new instance id); `reset` starts from the image.
 
 ## Windows guests
 

@@ -1309,6 +1309,165 @@ class Bench(unittest.TestCase):
         self.assertEqual(tl._summary([3, 1, 2, 10]), {"median_ms": 2.5, "min_ms": 1, "max_ms": 10, "runs": 4})
 
 
+class CloudImages(unittest.TestCase):
+    """create --image: an official cloud image under an overlay, set up by cloud-init from a cidata FAT disk."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.calls = []
+        base = os.path.join(self.tmp, "images", "debian-13-genericcloud-amd64-0123456789ab.qcow2")
+        self.patches = [mock.patch.object(tl, "STORE", self.tmp), mock.patch.object(tl, "qemu_bin", lambda t: t),
+                        mock.patch.object(tl.subprocess, "run", lambda cmd, **k: self.calls.append(cmd)),
+                        mock.patch.object(tl, "cloud_image", lambda kind: base)]
+        for p in self.patches: p.start()
+        with open(os.path.join(self.tmp, "quota.json"), "w") as f:
+            json.dump({"disk_gb": 1000, "memory_gb": 64, "cpus": 64}, f)
+
+    def tearDown(self):
+        for p in self.patches: p.stop()
+
+    def seed(self, name):
+        d = os.path.join(self.tmp, name, "cidata")
+        with open(os.path.join(d, "user-data")) as f:
+            head, body = f.read().split("\n", 1)
+        with open(os.path.join(d, "meta-data")) as f:
+            return head, json.loads(body), f.read()
+
+    def test_debian_node(self):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            tl.create("n1", None, cpus=2, memory=2, disk=10, image="debian", node=True)
+        reply = json.loads(out.getvalue())
+        m = tl.load("n1")
+        self.assertNotIn("iso", m)
+        self.assertEqual((m["image"], m["cloud"], m["node"], m["user"]), ("debian", True, True, "user"))
+        self.assertEqual(reply["password"], m["password"])
+        self.assertIn("-b", self.calls[-1]); self.assertIn("10G", self.calls[-1])    # an overlay on the image
+        head, cfg, meta = self.seed("n1")
+        self.assertEqual(head, "#cloud-config")
+        self.assertEqual(cfg["packages"], ["qemu-guest-agent", "docker.io", "python3"])
+        self.assertEqual(reply["ready_file"], m["ready_file"])
+        self.assertTrue(m["ready_file"].endswith(m["instance_id"]))                    # per instance: a clone's own
+        self.assertTrue(cfg["runcmd"][-1].startswith("docker info >/dev/null 2>&1 && "))  # only once Docker answers
+        self.assertTrue(cfg["runcmd"][-1].endswith("touch " + m["ready_file"]))
+        self.assertEqual(cfg["chpasswd"]["users"][0]["password"], m["password"])
+        self.assertIn('local-hostname: "n1"', meta)
+        self.assertIn(f'instance-id: "{m["instance_id"]}"', meta)
+        args = " ".join(tl.qemu_args("n1", m, False))
+        self.assertNotIn("-cdrom", args)
+        self.assertIn("driver=vvfat,dir=" + os.path.join(self.tmp, "n1", "cidata") + ",label=cidata,rw=off", args)
+
+    def test_alpine_and_plain(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            tl.create("a_1", None, cpus=1, memory=1, disk=4, image="alpine", node=True)
+            tl.create("plain", None, cpus=1, memory=1, disk=4, image="debian")
+        _, cfg, meta = self.seed("a_1")
+        self.assertEqual(cfg["packages"], ["qemu-guest-agent", "docker", "python3"])
+        rc = cfg["runcmd"]
+        self.assertEqual([c.split()[0] for c in rc], ["rc-update", "rc-service", "rc-update", "for", "docker"])
+        self.assertIn("cgroups", rc[1]); self.assertIn("docker", rc[2])                # cgroups up before Docker
+        self.assertIn("docker info", rc[3])                                             # ready once Docker answers
+        self.assertNotIn("sudo", cfg["users"][0])                                     # Alpine has doas
+        self.assertIn('local-hostname: "a-1"', meta)                                   # no _ in host names
+        plain = self.seed("plain")[1]
+        self.assertEqual(plain["packages"], ["qemu-guest-agent"])                      # not a node: just the agent
+        self.assertTrue(plain["runcmd"][-1].startswith("mkdir"))                       # no Docker to wait for
+
+    def test_new_instance_each_seed(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            tl.create("n1", None, cpus=1, memory=1, disk=4, image="debian")
+        first = self.seed("n1")[2]
+        tl.cloud_seed("n1", tl.load("n1"))                                             # clone or reset: set up again
+        self.assertNotEqual(first, self.seed("n1")[2])
+
+    def test_refused(self):
+        for k in ({"node": True}, {"image": "debian", "os_name": "win11"}, {"image": "debian", "sandbox": True},
+                  {"image": "fedora"}):
+            with self.assertRaises(SystemExit), contextlib.redirect_stdout(io.StringIO()):
+                tl.create("x", None, cpus=1, memory=1, disk=4, **k)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "x")))
+
+
+class ExecCli(unittest.TestCase):
+    def test_options_before_dash_dash_program_options_after(self):
+        got, tmp = [], tempfile.mkdtemp()
+        f = os.path.join(tmp, "in")
+        with open(f, "wb") as out:
+            out.write(b"data")
+        with mock.patch.object(tl, "guest_run", lambda n, argv, t, data: got.append((n, argv, t, data)) or {"exit": 0}), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            tl.main(["exec", "n1", "--stdin", f, "--timeout", "5", "--", "docker", "ps", "--format", "{{.Names}}"])
+            tl.main(["exec", "n1", "--", "sh", "-c", "exit 3"])
+        self.assertEqual(got, [("n1", ["docker", "ps", "--format", "{{.Names}}"], 5.0, b"data"),
+                               ("n1", ["sh", "-c", "exit 3"], 60.0, None)])
+        self.assertEqual(out.getvalue().splitlines()[0], '{"exit": 0}')
+        with self.assertRaisesRegex(SystemExit, "PROGRAM"):
+            tl.main(["exec", "n1"])
+
+
+class CloudImageDownload(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.got = []
+
+    def run_with(self, pages, kind, backing=None, unreadable=False):
+        def urlopen(url, timeout=30):
+            if url not in pages:
+                raise OSError("offline")
+            return io.BytesIO(pages[url].encode())
+
+        def download(url, dest, digest, algo):
+            self.got.append((url, dest, digest, algo))
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            open(dest, "w").close()
+        with mock.patch.object(tl, "STORE", self.tmp), mock.patch.object(tl.urllib.request, "urlopen", urlopen), \
+                mock.patch.object(tl, "download", download), mock.patch.object(tl.os, "chmod", lambda *a: None), \
+                mock.patch.object(tl, "qemu_bin", lambda t: t), \
+                mock.patch.object(tl.subprocess, "run", lambda cmd, **k: tl.subprocess.CompletedProcess(
+                    cmd, 1 if unreadable else 0, json.dumps({"backing-filename": (backing or {}).get(cmd[-1])}), "")), \
+                contextlib.redirect_stderr(io.StringIO()):
+            return tl.cloud_image(kind)
+
+    def test_older_unused_images_removed(self):
+        idx, img = tl.CLOUD_IMAGES["debian"], os.path.join(self.tmp, "images")
+        os.makedirs(img); os.makedirs(os.path.join(self.tmp, "vm1"))
+        old_used, old_free = (os.path.join(img, f"debian-13-genericcloud-amd64-{h}.qcow2") for h in ("aaaa", "bbbb"))
+        recent = os.path.join(img, "debian-13-genericcloud-amd64-cccc.qcow2")          # handed out to a create now
+        for f in (old_used, old_free, recent, os.path.join(img, "debian-live.iso"),
+                  os.path.join(self.tmp, "vm1", "disk.qcow2")):
+            open(f, "w").close()
+            if f != recent:
+                os.utime(f, (1, 1))
+        sums = {idx + "SHA512SUMS": f"{'cd' * 64}  debian-13-genericcloud-amd64.qcow2\n"}
+        uses = {os.path.join(self.tmp, "vm1", "disk.qcow2"): old_used}
+        self.run_with(sums, "debian", backing=uses, unreadable=True)               # a disk unreadable: nothing goes
+        self.assertIn(os.path.basename(old_free), os.listdir(img))
+        os.remove(self.got[-1][1])
+        dest = self.run_with(sums, "debian", backing=uses)
+        self.assertEqual(sorted(os.listdir(img)),
+                         sorted(os.path.basename(f) for f in (dest, old_used, recent, "debian-live.iso")))
+        with self.assertRaisesRegex(SystemExit, "not in"):
+            self.run_with({idx + "SHA512SUMS": "nothing here\n"}, "debian")
+
+    def test_newest_alpine_verified_by_sha512(self):
+        idx, digest = tl.CLOUD_IMAGES["alpine"], "ab" * 64
+        listing = "".join(f'<a href="generic_alpine-{v}-x86_64-bios-cloudinit-r0.qcow2">' for v in ("3.9.2", "3.24.1", "3.24.0"))
+        dest = self.run_with({idx: listing, idx + "generic_alpine-3.24.1-x86_64-bios-cloudinit-r0.qcow2.sha512":
+                              digest + "  generic_alpine-3.24.1-x86_64-bios-cloudinit-r0.qcow2\n"}, "alpine")
+        self.assertEqual(self.got, [(idx + "generic_alpine-3.24.1-x86_64-bios-cloudinit-r0.qcow2", dest, digest, "sha512")])
+        self.assertTrue(dest.endswith("generic_alpine-3.24.1-x86_64-bios-cloudinit-r0-abababababab.qcow2"))
+
+    def test_debian_and_offline(self):
+        idx, digest = tl.CLOUD_IMAGES["debian"], "cd" * 64
+        dest = self.run_with({idx + "SHA512SUMS": f"{digest}  debian-13-genericcloud-amd64.qcow2\n"}, "debian")
+        self.assertEqual(self.got[0][3], "sha512")
+        self.assertTrue(os.path.exists(dest))
+        os.remove(dest)
+        with self.assertRaisesRegex(SystemExit, "none is cached"):
+            self.run_with({}, "debian")
+        open(dest, "w").close(); open(dest + ".123.part", "w").close()
+        self.assertEqual(self.run_with({}, "debian"), dest)                              # offline: the cached one
+
+
 class SettledScreenshot(unittest.TestCase):
     def test_waits_for_the_input_to_show(self):
         frames = iter([b"old", b"old", b"new"])  # a loaded guest draws the keystroke late
