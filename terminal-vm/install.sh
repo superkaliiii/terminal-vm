@@ -56,7 +56,7 @@ pkg_install() {  # pkg_install PACKAGES...: with this system's package manager
   elif command -v dnf >/dev/null 2>&1; then sudo_ dnf install -y "$@"
   elif command -v zypper >/dev/null 2>&1; then sudo_ zypper install -y "$@"
   elif command -v pacman >/dev/null 2>&1; then sudo_ pacman -S --noconfirm "$@"
-  elif command -v apk >/dev/null 2>&1; then sudo_ apk add "$@"
+  elif command -v apk >/dev/null 2>&1; then sudo_ apk add --no-cache "$@"  # a fresh Alpine has no index yet
   elif command -v brew >/dev/null 2>&1; then brew install "$@"
   else say "no package manager found: install $* yourself"; return 1
   fi
