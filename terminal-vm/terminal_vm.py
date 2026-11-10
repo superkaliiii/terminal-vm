@@ -1777,6 +1777,21 @@ def ct_dash(project=None, max_age=2):
     return dict(d)
 
 
+_VMS_CACHE, _VMS_LOCK = {}, threading.Lock()  # project: (time, reply); emptied by every action
+
+
+def vms_state(project=None, max_age=2):
+    """/api/vms: tabs and users polling at once share one computation every max_age s (each one sampled CPU use
+    for 0.5 s: 50 at once took a median 1.9 s)."""
+    with _VMS_LOCK:  # one round at a time: the others wait for it and take its answer
+        hit = _VMS_CACHE.get(project)
+        if hit and time.time() - hit[0] < max_age:
+            return hit[1]
+        d = {"vms": _vm_rows(project), "events": events(8, project=project)}
+        _VMS_CACHE[project] = (time.time(), d)
+        return d
+
+
 def web_api(method, path, q, body=None):
     """One dashboard call: (content type, bytes or a JSON-able value). Raises on a bad request."""
     project = q.get("project") or None
@@ -1796,7 +1811,7 @@ def web_api(method, path, q, body=None):
         d["tool"], d["daemon"] = TOOL, daemon_alive()  # the header shows the daemon serving this page
         return "application/json", d
     if method == "GET" and path == "/api/vms":
-        return "application/json", {"vms": _vm_rows(project), "events": events(8, project=project)}
+        return "application/json", vms_state(project)
     if method == "GET" and path == "/api/quota":
         return "application/json", {"quota": quota(), "projects": [p["project"] for p in projects()]}
     if method == "GET" and path == "/api/shot":
@@ -1826,6 +1841,7 @@ def web_api(method, path, q, body=None):
         return "application/json", {"desired": {"stack": st["stack"], "project": st.get("project"), "services": services},
                                     "status": st}
     if method == "POST" and path == "/api/do":
+        _VMS_CACHE.clear()  # an action shows at the next refresh, not after the cache's 2 s
         if not isinstance(body, dict):
             raise ValueError("a JSON object")
         op, name = body.get("op"), body.get("name") or ""
