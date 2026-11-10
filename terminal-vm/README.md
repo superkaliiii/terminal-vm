@@ -102,9 +102,32 @@ Under WSL, the distribution can be stopped when no WSL terminal is open, which k
 - cloud-init sets it up at the first start from a FAT disk labelled `cidata` (QEMU's `vvfat`, so Windows hosts need
   nothing more): host name = VM name, a `user` account (password in the reply and in `machine.json`), the guest
   agent; `--node` adds Docker and Python 3. It needs the internet for those packages.
-- It is ready when `/var/lib/terminal-vm/ready` exists in the guest (with `--node`, once Docker answers). In WSL
-  with KVM: Alpine node ready in about 60 s, Debian in about 120 s (first start; later starts skip the setup).
+- It is ready when its `ready_file` (in the reply) exists in the guest (with `--node`, once Docker answers).
 - `clone` and `reset` set the copy up again (new instance id); `reset` starts from the image.
+
+### Nodes in seconds
+
+A node (`--node`) is not set up by cloud-init each time: terminal-vm builds a **node template** once per kind and
+cloud image (`images/node-...-t1.qcow2`, read only; Alpine 436 MB, about 2 min, Debian about 4 min, with the
+internet), then every node is an overlay on it.
+- The template is the cloud image set up once (Docker, Python 3, the guest agent), then slimmed: cloud-init and the
+  NTP daemon off (terminal-vm sets the clock), DHCP without its ARP probe and IPv6 wait, no boot menu delay,
+  services started in parallel; its account, SSH host keys and machine ids removed.
+- A node's own identity is set by the guest agent at its first start: host name, `user` account and password (sent
+  on stdin, never in the guest's process list), root file system grown to `--disk`, new SSH host keys; then its
+  ready file, once it has a route and Docker answers. `clone` and `reset` do it again.
+- A newer cloud image (or a new template version) builds a new template; older ones go when no VM is built on them.
+
+| WSL with nested KVM | from the cloud image | node template |
+|---|---:|---:|
+| Alpine node, first start to ready | 91 s | **9.6 s** |
+| Alpine, later start to Docker answering | 66 s | **5 s** |
+| Debian node, first start to ready | ~120 s | **9.1 s** |
+| Debian, later start to Docker answering | — | 11 s |
+| clone of a node, start to ready under its own name | — | 10-12 s |
+
+Where the time went before: the boot menu waited 10 s, cloud-init ran at every boot (~35 s), DHCP probed the
+address and waited for IPv6 (~6 s).
 
 ## Windows guests
 
@@ -231,11 +254,14 @@ itself 10 minutes after the last VM that should run). Every 5 s it:
 - pauses a VM nobody used for its `supervise NAME --idle-pause MINUTES` (no screen action, `exec`, file copy,
   open `view`, or VNC client such as `show`) that is not computing either (QEMU under 20 % of a core; an idle guest
   costs it 4-12 %). The next use wakes it at once (`stop` too); a pause by the user (`pause`) stays. Off by
-  default (`--idle-pause 0`). A guest paused for long may find its clock behind when it wakes (Windows syncs it
-  later; Linux with an NTP client).
+  default (`--idle-pause 0`).
+- keeps guest clocks on the host's: a guest's clock stops while QEMU is paused and while the host sleeps, and a
+  guest hours behind refuses TLS, `apt` and image pulls. Through the guest agent, the clock is set again after a
+  wake or `resume`, and checked once a minute (which catches a host that slept); stepped only when more than
+  0.25 s off (`clock_set` events). Measured: 20 s paused, back to 0 s off at once.
 
 What it does goes to `STORE/events.log` (`events [-n 50] [--vm V]`: `restarted`, `restart_failed`, `unhealthy`,
-`healthy`, `idle_paused`, `woken`, `window_closed`, `supervise_failed`, `daemon_started`/`stopped`), in
+`healthy`, `idle_paused`, `woken`, `clock_set`, `window_closed`, `supervise_failed`, `daemon_started`/`stopped`), in
 terminal-ct's line format (`vm` where it has `container`). Linux guests also
 give unused memory back to the host while they run (virtio-balloon with free page reporting). Measured (WSL,
 TinyCore): QEMU killed -> running again in 3 s; idle pause and wake by a screenshot as described.
