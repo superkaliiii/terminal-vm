@@ -1,6 +1,30 @@
+<div align="center">
+
 # terminal-vm
 
-One command and one MCP server for computer-use agents: a separate desktop VM, viewed and controlled from a terminal, with the same tools everywhere (`screenshot`, `click`, `move`, `drag`, `scroll`, `type`, `key`, `status`).
+**A separate desktop VM for computer-use agents, viewed and driven from a terminal.**
+
+[![CI](https://github.com/superkaliiii/terminal-mac-inspection/actions/workflows/ci.yml/badge.svg?branch=unified)](https://github.com/superkaliiii/terminal-mac-inspection/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.8%2B-3776ab?logo=python&logoColor=white)
+![Dependencies](https://img.shields.io/badge/dependencies-QEMU%20only-brightgreen)
+![Guests](https://img.shields.io/badge/guests-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey)
+
+[Install](#install-and-run) · [Agents](#use-with-agents) · [Commands](#commands) · [Cloud images](#cloud-images) ·
+[Windows guests](#windows-guests) · [Supervision](#supervision) · [Web dashboard](#web-dashboard) · [Measurements](#measurements)
+
+</div>
+
+One command and one MCP server: the same tools everywhere (`screenshot`, `click`, `move`, `drag`, `scroll`, `type`, `key`, `status`), and the host desktop is never touched.
+
+## Highlights
+
+- **Any desktop guest**: Linux and Windows on QEMU (KVM or WHPX), macOS through terminal-mac on Apple silicon.
+- **Unattended setup**: Debian live in one command (`up`), Windows answer files, official Debian/Alpine cloud images.
+- **In the terminal**: an interactive viewer (Kitty graphics or Sixel) that leaves agents working while you watch.
+- **Clones in under a second** (copy-on-write), snapshots with memory, file copies through the guest agent.
+- **Supervision**: restarts, health checks, idle pause and wake, events; quota and live resources.
+- **Agents first**: an MCP server with authority rules, projects with notes, an agent skill, a web dashboard shared
+  with read-only or full users, and VMs driven from another PC through [terminal-ct](https://github.com/superkaliiii/terminal-conteneur).
 
 | Host | Linux guests | Windows guests | macOS guests |
 |---|---|---|---|
@@ -46,6 +70,7 @@ or install this folder as a Claude Code plugin (`.claude-plugin/`).
 | `create NAME --image debian\|alpine [--node]` | a Linux VM from an official cloud image instead of an ISO, set up unattended at its first start (see [Cloud images](#cloud-images)); `--node`: with Docker, a node for terminal-ct |
 | `exec NAME [--timeout 60] [--stdin FILE] -- PROGRAM ARGS` | run a program in the guest through its agent (no shell); JSON reply `{exit, stdout, stderr}` |
 | `web [--project P] [--no-open]` | web dashboard of the VMs and, when installed, terminal-ct's containers (see [Web dashboard](#web-dashboard)) |
+| `web user add NAME [--role read\|full]`, `web user ls`, `web user rm NAME`; `web --listen IP\|off [--port N]` | share the dashboard with other people or agents (see [Shared session](#shared-session)) |
 | `bench [--runs 10] [--from VM]` | timings of terminal-vm's own operations on a clone (see [Measurements](#measurements)) |
 | `daemon run\|start\|stop\|status`, `supervise NAME [--restart always\|never] [--idle-pause MIN]`, `events [-n 50] [--vm V]` | supervision: restarts, health, idle pause, events (see [Supervision](#supervision)) |
 | `resume [--stay]`, `autostart [on\|off]` | start again the VMs that were running before a restart; at each logon (see [Restarts](#restarts)) |
@@ -60,7 +85,7 @@ or install this folder as a Claude Code plugin (`.claude-plugin/`).
 | `push NAME LOCAL GUEST` / `pull NAME GUEST LOCAL` | copy files through qemu-guest-agent (must be installed in the guest) |
 | `view NAME [--read-only]` | interactive terminal viewer (keyboard, mouse, wheel): Kitty graphics, else Sixel (adaptive 255-colour palette, text kept legible when shrunk), else the VNC window; centred, follows resizes, redraws only what changed; Ctrl+] exits, Ctrl+O opens the window |
 | `show NAME [--read-only]` / `hide NAME` | native window through VNC (unix socket); `--read-only` needs TigerVNC |
-| `action NAME screenshot\|click\|move\|drag\|scroll\|type\|key\|wait ...` | one action, JSON reply |
+| `action NAME screenshot\|click\|move\|drag\|scroll\|type\|key\|wait ...` | one action, JSON reply; `screenshot --no-wake` only looks (a paused VM stays paused, an idle one keeps counting) |
 | `mcp [NAME] [--project P]` | stdio MCP server (also exposes `wait`: until the screen stops changing; with `screenshot: true` an action returns the screen once it has changed, up to 1.5 s) |
 | `skills get\|path\|install` | agent skill |
 
@@ -231,6 +256,23 @@ command line. It is the same dashboard as `terminal-ct web` (one block of code, 
   fragment; other Host names are refused.
 - Thumbnails are not a use: watching a VM does not keep it from its idle pause; its larger view neither. Use `view`
   or `show` to work with it.
+
+### Shared session
+
+The same block as terminal-ct's (see its README, "Shared session"):
+- `web user add NAME --role read|full` prints NAME's token once (only its SHA-256 is kept, `STORE/web.users.json`,
+  owner only); `read` sees VMs, screens, logs and events but acts on nothing, `full` acts too. `web user ls`,
+  `web user rm NAME`.
+- `web --listen IP [--port N]` also serves the dashboard over HTTPS on that address (default port 7182), with a
+  certificate for that IP whose fingerprint `web user add` prints; `--listen off` stops. Never 0.0.0.0.
+- Who is there shows on the page; actions, refusals and failures go to `STORE/web/actions.log`.
+
+### VMs of another PC
+
+terminal-ct on a central PC drives this PC's VMs through its agent (or SSH) when terminal-vm is on the login PATH
+there, in `~/.local/bin`, or in `TERMINAL_VM`: terminal-ct's dashboard lists them as `VM@PC`, and
+`terminal-ct --host PC vm ARGS` runs any terminal-vm command here. Its thumbnails use `screenshot --no-wake` and
+only for running VMs. This tool's own dashboard (7172) shows this PC's VMs only.
 
 ## Measurements
 
