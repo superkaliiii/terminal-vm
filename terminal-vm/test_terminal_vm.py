@@ -1,4 +1,4 @@
-import contextlib, io, json, os, re, socket, struct, sys, tempfile, threading, time, unittest, zlib
+import contextlib, io, json, os, re, shutil, socket, struct, subprocess, sys, tempfile, threading, time, unittest, zlib
 from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import terminal_vm as tl
@@ -1121,6 +1121,29 @@ class Doctor(unittest.TestCase):
         self.assertNotIn("Pw-secret-42", report)
         self.assertIn("== events.log", report)
         self.assertNotIn(os.path.expanduser("~"), tl.mask(os.path.expanduser("~") + "/x token=abc"))
+
+
+class Installer(unittest.TestCase):
+    """Phase 13.2: install.sh into a throwaway HOME (no packages, no agent), update, uninstall."""
+    SH = os.path.join(os.path.dirname(os.path.abspath(tl.__file__)), "install.sh")
+
+    @unittest.skipIf(tl.WINDOWS or not shutil.which("sh"), "a POSIX shell")
+    def test_install_update_uninstall(self):
+        home = tempfile.mkdtemp()
+        with open(os.path.join(home, ".profile"), "w") as f:
+            f.write("echo mine\n")
+        env = dict(os.environ, HOME=home, PATH="/usr/bin:/bin")
+        run = lambda *a: subprocess.run(["sh", self.SH, *a, "--no-deps", "--no-mcp"], env=env, capture_output=True,
+                                        text=True, stdin=subprocess.DEVNULL, timeout=120)
+        r = run()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        tool = os.path.join(home, ".local", "bin", "terminal-vm")
+        self.assertIn(tl.VERSION, subprocess.run([tool, "version"], capture_output=True, text=True).stdout)
+        self.assertEqual(run("--update").returncode, 0)
+        self.assertEqual(run("--uninstall").returncode, 0)
+        self.assertFalse(os.path.exists(tool))
+        with open(os.path.join(home, ".profile")) as f:
+            self.assertNotIn("terminal-vm", f.read())
 
 
 class Supervision(unittest.TestCase):
