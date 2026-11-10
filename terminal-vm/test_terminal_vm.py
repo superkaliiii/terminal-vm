@@ -1110,6 +1110,28 @@ class StoppedVm(unittest.TestCase):
         self.assertNotIn("cache=unsafe", " ".join(tl.qemu_args("v", m, False)))
 
 
+class QmpBusy(unittest.TestCase):
+    def test_waits_while_another_client_holds_it(self):
+        """QEMU's one waiting place taken (EAGAIN): wait, never 'not running' (state() said stopped; stress run)."""
+        class Sock:
+            def __init__(self): self.out = [b'{"QMP": {}}\n', b'{"return": {}}\n', b'{"return": {"status": "running"}}\n']
+            def sendall(self, data): pass
+            def recv(self, n): return self.out.pop(0)
+            def close(self): pass
+        tries = []
+        def connect(addr, timeout):
+            tries.append(addr)
+            if len(tries) < 3:
+                raise BlockingIOError(11, "Resource temporarily unavailable")
+            return Sock()
+        with mock.patch.object(tl, "connect", connect), mock.patch.object(tl, "endpoint", lambda n, k: "/x"):
+            self.assertEqual(tl.state("v"), "running")
+        self.assertEqual(len(tries), 3)
+        with mock.patch.object(tl, "connect", lambda a, t: (_ for _ in ()).throw(FileNotFoundError(2, "gone"))), \
+                mock.patch.object(tl, "endpoint", lambda n, k: "/x"):
+            self.assertEqual(tl.state("v"), "stopped")                     # no socket at all: stopped
+
+
 class GuestAgent(unittest.TestCase):
     """The guest agent client."""
     def test_agent_resync_after_stale_reply(self):

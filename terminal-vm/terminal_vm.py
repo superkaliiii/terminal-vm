@@ -151,10 +151,17 @@ def load(name):
 
 class QMP:
     def __init__(self, addr):
-        try:
-            self.sock = connect(addr, 10)
-        except OSError as e:
-            raise RuntimeError("VM is not running (cannot reach its QMP socket)") from e
+        end = time.monotonic() + 10
+        while True:
+            try:
+                self.sock = connect(addr, 10)
+                break
+            except BlockingIOError:  # EAGAIN: QEMU's one waiting place is taken; not "stopped" (state() said so)
+                if time.monotonic() > end:
+                    raise RuntimeError("QMP busy (other commands are using this VM)") from None
+                time.sleep(0.05)
+            except OSError as e:
+                raise RuntimeError("VM is not running (cannot reach its QMP socket)") from e
         self.buf = b""
         try:
             self._recv()  # greeting; times out while another client holds QEMU's single QMP connection
