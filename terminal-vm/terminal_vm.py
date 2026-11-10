@@ -4522,10 +4522,13 @@ QEMU_PKGS = {"apt-get": "qemu-system-x86 qemu-utils", "dnf": "qemu-kvm qemu-img"
              "pacman": "qemu-full", "apk": "qemu-system-x86_64 qemu-img", "brew": "qemu"}
 
 
+SUDO = "" if os.name == "nt" or os.geteuid() == 0 else "sudo "  # in suggested commands: root has none to run
+
+
 def _pkg(names=None, qemu=False):
     """The command that installs these packages here (first package manager found), or None."""
-    for exe, cmd in (("apt-get", "sudo apt-get install -y"), ("dnf", "sudo dnf install -y"), ("zypper", "sudo zypper install -y"),
-                     ("pacman", "sudo pacman -S --noconfirm"), ("apk", "sudo apk add"), ("brew", "brew install")):
+    for exe, cmd in (("apt-get", f"{SUDO}apt-get install -y"), ("dnf", f"{SUDO}dnf install -y"), ("zypper", f"{SUDO}zypper install -y"),
+                     ("pacman", f"{SUDO}pacman -S --noconfirm"), ("apk", f"{SUDO}apk add"), ("brew", "brew install")):
         if shutil.which(exe):
             return f"{cmd} {QEMU_PKGS[exe] if qemu else names}"
     return None
@@ -4577,7 +4580,7 @@ def doctor_checks():
         kvm = os.access("/dev/kvm", os.R_OK | os.W_OK)
         check("kvm", kvm, "ok" if kvm else "no access to /dev/kvm: VMs run very slowly" if os.path.exists("/dev/kvm")
               else "no /dev/kvm (virtualization off in the firmware, or nested virtualization unavailable)",
-              "sudo usermod -aG kvm $USER   (then log out and in again)" if os.path.exists("/dev/kvm") else None)
+              f"{SUDO}usermod -aG kvm $USER   (then log out and in again)" if os.path.exists("/dev/kvm") else None)
         if in_wsl():
             check("wsl", False, "WSL stops this distribution when no Windows program uses it, killing its VMs",
                   "terminal-vm autostart on   (a logon task keeps it running while VMs run)", required=False)
