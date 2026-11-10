@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "terminal-vm"
+dynamic = ["version"]
+description = "A separate desktop VM for computer-use agents, viewed and driven from a terminal: a CLI and an MCP server."
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+authors = [{ name = "superkaliiii" }]
+keywords = ["vm", "qemu", "mcp", "agents", "computer-use", "desktop"]
+classifiers = ["Programming Language :: Python :: 3", "Environment :: Console", "Topic :: System :: Emulators"]
+
+[project.urls]
+Homepage = "https://github.com/superkaliiii/terminal-mac-inspection/tree/unified/terminal-vm"
+
+[project.scripts]
+terminal-vm = "terminal_vm:main"
+
+[tool.setuptools]
+py-modules = ["terminal_vm"]
+
+[tool.setuptools.dynamic]
+version = { attr = "terminal_vm.VERSION" }
+
+[tool.setuptools.data-files]  # where the tool looks for its skill when installed by pip, pipx or uvx
+"share/terminal-vm/skills/terminal-vm" = ["skills/terminal-vm/SKILL.md"]

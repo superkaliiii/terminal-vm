@@ -57,7 +57,9 @@ STORE = os.environ.get("TERMINAL_VM_HOME") or os.environ.get("TERMINAL_LINUX_HOM
     (p for p in (os.path.join(_DATA, n) for n in ("terminal-vm", "terminal-linux")) if os.path.isdir(p)),
     os.path.join(_DATA, "terminal-vm"))
 HERE = os.path.dirname(os.path.abspath(__file__))
-SKILL = os.path.join(HERE, "skills", "terminal-vm", "SKILL.md")
+SKILL = next((p for p in (os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills", "terminal-vm", "SKILL.md"),
+                          os.path.join(sys.prefix, "share", "terminal-vm", "skills", "terminal-vm", "SKILL.md"))  # a pip/pipx/uvx install
+              if os.path.isfile(p)), os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills", "terminal-vm", "SKILL.md"))
 ABS_MAX = 0x7FFF  # usb-tablet absolute axis range
 IMAGE_INDEX = "https://cdimage.debian.org/debian-cd/current-live/amd64/iso-hybrid/"
 IMAGE_PATTERN = r"debian-live-[\d.]+-amd64-xfce\.iso"

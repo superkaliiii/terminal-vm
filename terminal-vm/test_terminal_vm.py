@@ -1146,6 +1146,13 @@ class Installer(unittest.TestCase):
             self.assertNotIn("terminal-vm", f.read())
 
 
+    def test_packages_carry_the_tools_version(self):
+        here = os.path.dirname(os.path.abspath(tl.__file__))
+        with open(os.path.join(here, "package.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["version"], tl.VERSION, "set package.json's version to VERSION")
+        with open(os.path.join(here, "pyproject.toml"), encoding="utf-8") as f:
+            self.assertIn('version = { attr = "terminal_vm.VERSION" }', f.read())
+
 class Supervision(unittest.TestCase):
     """The daemon's passes: restart with growing delays, guest agent health, idle pause and wake, events."""
     def setUp(self):

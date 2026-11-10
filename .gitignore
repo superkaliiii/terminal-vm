@@ -10,3 +10,8 @@ dist/
 *.p12
 *.p8
 *.cer
+
+# Python and npm packages of terminal-vm
+*.egg-info/
+terminal-vm/build/
+*.tgz
