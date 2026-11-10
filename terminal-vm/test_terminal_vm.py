@@ -622,7 +622,7 @@ class StoppedVm(unittest.TestCase):
             sys.stdin = old
         msgs = [json.loads(x) for x in out.getvalue().splitlines()]
         self.assertEqual([m["id"] for m in msgs], [1, 2, 3, 4, 5])               # still serving
-        self.assertIn("project_status first", msgs[0]["result"]["instructions"])
+        self.assertIn("Call infra first", msgs[0]["result"]["instructions"])
         self.assertTrue(msgs[1]["result"]["isError"])
         self.assertEqual([v["name"] for v in json.loads(msgs[2]["result"]["content"][0]["text"])["vms"]], ["a"])
         self.assertIn("no VM named 'v'", msgs[3]["result"]["content"][0]["text"])  # v is default's
@@ -933,6 +933,36 @@ class StoppedVm(unittest.TestCase):
             tl.describe("vm", "nope", "z")
         self.quiet(tl.rm, "x"); self.quiet(tl.main, ["net", "rm", "lab"])
         self.assertEqual(tl.descriptions(), {"vm:v": "the docs build box", "project:default": "docs"})
+
+    def test_infra(self):
+        """The map: quota, each VM with its creator, managed, networks and addresses; networks with members;
+        terminal-ct's map when it answers, a note when it does not; a project sees only its own."""
+        yes = lambda m, c: None
+        self.vm("job", project="alpha", created_by="agent", sandbox=True)
+        tl.net_create("lab", "alpha"); tl.describe("net", "lab", "alpha's bench")
+        tl.net_attach("job", "lab")
+        tl.describe("vm", "v", "the user's desktop")
+        ct = {"containers": [{"name": "web", "on": "this PC", "status": "running", "project": "alpha"}]}
+        with mock.patch.object(tl, "ct_call", lambda args, timeout=60, **k: ct):
+            m = tl.infra()
+            text = tl.infra_text(m)
+        vms = {v["name"]: v for v in m["vms"]}
+        self.assertEqual((vms["job"]["managed"], vms["v"]["managed"], vms["v"]["created_by"]), (True, False, "user"))
+        ip = vms["job"]["networks"]["lab"]
+        self.assertTrue(ip.startswith("10.77."))
+        self.assertEqual(m["networks"]["lab"]["members"], {"job": ip})
+        self.assertEqual(m["networks"]["lab"]["description"], "alpha's bench")
+        self.assertIn("free", m["this_pc"]["quota"]["cpus"])
+        self.assertEqual(m["containers"], ct)
+        for s in ("the user's desktop", f"job={ip}", "terminal-ct:", "web"):
+            self.assertIn(s, text)
+        def gone(args, timeout=60, **k):
+            raise RuntimeError("terminal-ct not found: put it on the PATH, or set TERMINAL_CT")
+        with mock.patch.object(tl, "ct_call", gone):
+            scoped = tl.agent_call("infra", {}, yes, project="alpha")
+        self.assertEqual([v["name"] for v in scoped["vms"]], ["job"])          # not the user's v (default)
+        self.assertIn("terminal-ct not found", scoped["containers_note"])
+        self.assertEqual([p["project"] for p in scoped["projects"]], ["alpha"])
 
     def test_agent_authority(self):
         """Agents run sandboxed VMs and their own; the user's VMs are off-limits; risky steps ask the user."""

@@ -3135,6 +3135,78 @@ def describe(kind, name, text):
     return set_description(kind, name, text)
 
 
+INFRA_RULES = ("managed: true marks the VMs the agent runs without asking (sandboxes and its own). Anything else "
+               "needs the user's approval: the user's VMs and networks, internet, a download, a larger memory "
+               "ceiling. VMs on a network reach each other at the addresses listed (no DHCP: set it in the guest).")
+
+
+def infra(project=None):
+    """The map an agent reads first: this PC's quota (limit, used, free), every VM with its state, ceiling and use,
+    networks and addresses, internet, description, project, creator and managed; each network with its subnet and
+    members; the projects; terminal-ct's map when it is installed. project: only that project's objects."""
+    mine = lambda p: under(p or DEFAULT_PROJECT, project)
+    t = top()
+    use = {v["name"]: v for v in t["vms"]}
+    vms = []
+    for v in vm_list() + mac_machines():
+        if not mine(v.get("project")):
+            continue
+        if v.get("engine") is None:  # this store's VM (terminal-mac's: shown as it lists them)
+            m = load(v["name"])
+            v.update(created_by=m.get("created_by", "user"),
+                     managed=bool(m.get("sandbox") or m.get("created_by") == "agent"),
+                     internet=not m.get("offline") and not (m.get("sandbox") and not m.get("internet")),
+                     networks={k: a.get("ip") for k, a in m.get("networks", {}).items()},
+                     **{k: use[v["name"]][k] for k in ("max_cpus", "max_memory_gb", "cpu_percent", "host_memory_gb")
+                        if k in use.get(v["name"], {})})
+        vms.append(v)
+    nets = {n["name"]: {"project": n.get("project", "default"), "created_by": n.get("created_by", "user"),
+                        "subnet": n.get("subnet"), **({"description": n["description"]} if n.get("description") else {}),
+                        "members": {a["vm"]: a.get("ip") for a in n["vms"] if mine(project_of(load(a["vm"])))}}
+            for n in net_ls() if mine(n.get("project", "default"))}
+    names = {DEFAULT_PROJECT} | {v.get("project") or DEFAULT_PROJECT for v in vms} | {n["project"] for n in nets.values()}
+    if os.path.isdir(os.path.join(STORE, ".projects")):  # as projects() finds them
+        names |= {d.replace("+", "/") for d in os.listdir(os.path.join(STORE, ".projects"))}
+    out = {"project": project, "rules": INFRA_RULES, "this_pc": {"quota": t["quota"]}, "vms": vms, "networks": nets,
+           "projects": [{"project": p, **({"description": d} if (d := description("project", p)) else {})}
+                        for p in sorted(names) if mine(p)]}
+    try:  # terminal-ct: its containers, nodes and other PCs
+        out["containers"] = ct_call(["infra", "--json", *(["--project", project] if project else [])], timeout=60)
+    except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as e:
+        out["containers_note"] = str(e)[:200]
+    return out
+
+
+def infra_text(m):
+    """infra for a person: the quota, one line per VM and network, then terminal-ct's map."""
+    q = m["this_pc"]["quota"]
+    out = [f"terminal-vm {VERSION}" + (f"  project {m['project']}" if m.get("project") else ""),
+           "this PC  " + "  ".join(f"{k.replace('_gb', '')} {v['used']:g}/{v['limit']:g}" for k, v in q.items()), ""]
+    for v in m["vms"]:
+        flags = "".join(f for f, on in (("S", v.get("sandbox")), ("I", v.get("internet")), ("M", v.get("managed")))
+                        if on)
+        nets = ",".join(f"{k}={ip}" if ip else k for k, ip in (v.get("networks") or {}).items())
+        out.append(f"  {v['name']:<20} {v.get('status', '-'):<8} {flags:<3} {v.get('os', '-'):<8} "
+                   f"{v.get('project') or '-':<12}" + (f" nets {nets}" if nets else "")
+                   + (f"  — {v['description']}" if v.get("description") else ""))
+    if not m["vms"]:
+        out.append("  (no VMs)")
+    for k, n in sorted(m["networks"].items()):
+        out.append(f"net {k} {n.get('subnet') or ''}: "
+                   + (", ".join(f"{vm}={ip}" if ip else vm for vm, ip in n["members"].items()) or "(empty)")
+                   + (f"  — {n['description']}" if n.get("description") else ""))
+    ct = m.get("containers")
+    if isinstance(ct, dict):
+        out += ["", "terminal-ct:"]
+        for r in ct.get("containers", []):
+            out.append(f"  {r.get('name', '?'):<22} {r.get('on', '-'):<12} {r.get('status', '-'):<8} "
+                       f"{r.get('project', '-')}" + (f"  — {r['description']}" if r.get("description") else ""))
+    elif m.get("containers_note"):
+        out.append(f"terminal-ct: {m['containers_note']}")
+    out.append("flags: S sandbox, I internet, M the agent runs it without asking")
+    return "\n".join(out)
+
+
 def notes_write(project, text, mode="append"):
     path = os.path.join(project_dir(project), "notes.md")
     with open(path, "a" if mode == "append" else "w", encoding="utf-8") as f:
@@ -4640,6 +4712,8 @@ def agent_call(tool, a, approve, project=None):
                 for v in quiet(ls) if not project or v.get("engine") is None and under(v["project"], project)]
     if tool == "project_status":
         return project_status(where)
+    if tool == "infra":
+        return infra(project)
     if tool == "notes_write":
         return notes_write(where, a["text"], a.get("mode", "append"))
     if tool == "autostart":
@@ -4838,7 +4912,12 @@ AGENT_TOOLS = [
                   "the PC restarts (a task at the user's logon). With vm: inside that Linux VM, turn terminal-ct's "
                   "autostart on or off (its containers start again when the VM boots). Changing needs the user's "
                   "approval.", _schema({"on": {"type": "boolean"}, **_VM})),
-    ("project_status", "Start here: the project's VMs and networks as they are now (want: what each should be "
+    ("infra", "Start here: the map in one call. This PC's quota (limit, used, free), every VM with its state, "
+              "ceiling and use, networks and addresses, internet, description, project, creator and managed (what "
+              "you may run without asking), each network with its members, the projects, and terminal-ct's map "
+              "(containers, nodes, other PCs) when it is installed. Then project_status for your notes and recent "
+              "actions.", _schema({})),
+    ("project_status", "Then this: the project's VMs and networks as they are now (want: what each should be "
                        "doing), the notes left by earlier sessions, and the latest actions with their errors.",
      _schema({"project": {"type": "string", "description": "Only when this server has no project of its own"}})),
     ("notes_write", "Keep notes for the next session (what is set up, what is left to do): appended with the date, "
@@ -4848,8 +4927,9 @@ AGENT_TOOLS = [
 ]
 AGENT_NAMES = {n for n, _, _ in AGENT_TOOLS}
 PROJECT_ARG_TOOLS = {"vm_create", "vm_clone", "net_create", "project_status", "notes_write"}
-INSTRUCTIONS = ("terminal-vm: VMs with a desktop for computer-use agents. Call project_status first: it says what "
-                "this project already has and what earlier sessions did and noted. Before you stop, record with "
+INSTRUCTIONS = ("terminal-vm: VMs with a desktop for computer-use agents. Call infra first: the map of what runs "
+                "where, with what resources and descriptions. Then project_status: what this project has and what "
+                "earlier sessions did and noted. Describe what you create (description, or describe). Before you stop, record with "
                 "notes_write what you set up and what is left, so the next session can pick up from there.")
 _OTHER = {"vm": {"type": "string", "description": "Another VM this agent manages (default: this server's VM)"}}
 SCREEN_TOOLS = [(n, d, s if n in ("top", "quota") else dict(s, properties={**s["properties"], **_OTHER}))
@@ -5039,6 +5119,8 @@ def main(argv=None):
     for n in ("view", "show"):
         v = sub.add_parser(n); v.add_argument("name"); v.add_argument("--read-only", action="store_true")
     sub.add_parser("ls"); sub.add_parser("doctor"); sub.add_parser("help"); sub.add_parser("version")
+    inf = sub.add_parser("infra", help="the map: quota, VMs, networks and addresses, projects (and terminal-ct's)")
+    inf.add_argument("--project"); inf.add_argument("--json", action="store_true")
     cl = sub.add_parser("clone"); cl.add_argument("src"); cl.add_argument("new")
     cl.add_argument("--description", help="what the new one is for (one line)")
     ds = sub.add_parser("describe", help="KIND NAME [TEXT]: one line on what it is for (no TEXT: show it)")
@@ -5122,6 +5204,9 @@ def main(argv=None):
                                      "move": lambda: project_move(*o.args),
                                      "notes": lambda: notes_write(*o.args)}[o.project_cmd](), indent=1))
         if o.cmd == "ls": return ls()
+        if o.cmd == "infra":
+            m = infra(check_project(o.project) if o.project else None)
+            return print(json.dumps(m, indent=1) if o.json else infra_text(m))
         if o.cmd == "doctor": return doctor()
         if o.cmd == "help": return p.print_help()
         if o.cmd == "version": return print(f"terminal-vm {VERSION}")
