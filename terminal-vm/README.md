@@ -301,7 +301,7 @@ The same block as terminal-ct's (see its README, "Shared session"):
   `web user rm NAME`.
 - `web --listen IP [--port N]` also serves the dashboard over HTTPS on that address (default port 7182), with a
   certificate for that IP whose fingerprint `web user add` prints; `--listen off` stops. Never 0.0.0.0.
-- Who is there shows on the page; actions, refusals and failures go to `STORE/web/actions.log`.
+- Who is there shows on the page; actions, refusals and failures go to `STORE/.web/actions.log`.
 
 ### VMs of another PC
 
