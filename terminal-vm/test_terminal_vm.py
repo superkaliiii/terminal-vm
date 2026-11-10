@@ -1049,6 +1049,58 @@ class StoppedVm(unittest.TestCase):
         self.assertIn("terminal-vm internet v on", out.getvalue())
         self.assertTrue(tl.load("v")["offline"])
 
+    def test_mcp_remote_vm(self):
+        """VM@PC: another PC's VM through terminal-ct --host PC vm, under this PC's rules."""
+        calls = []
+
+        def ct_call(args, timeout=60, **k):
+            calls.append(args)
+            self.assertEqual(args[:3], ["--host", "pc1", "vm"])
+            vm_args = args[3:]
+            if vm_args == ["ls"]:
+                return [{"name": "deb", "status": "running"}, {"name": "own", "created_by": "agent"}]
+            if "--output" in vm_args:
+                with open(vm_args[vm_args.index("--output") + 1], "wb") as f:
+                    f.write(b"PNG of deb")
+                return {"path": "x", "width": 8, "height": 6}
+            if vm_args[:3] == ["action", "deb", "exec"]:
+                return {"exit": 0, "stdout": "hi\n", "stderr": ""}
+            return {"done": vm_args[0]}
+        m = tl.load("v"); m["created_by"] = "agent"; tl.save("v", m)
+        call = lambda i, name, **a: {"jsonrpc": "2.0", "id": i, "method": "tools/call",
+                                     "params": {"name": name, "arguments": a}}
+        accept = lambda i: {"jsonrpc": "2.0", "id": f"ask-{i}", "result": {"action": "accept",
+                                                                          "content": {"approve": True}}}
+        lines = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {"elicitation": {}}}},
+                 call(2, "screenshot", vm="deb@pc1"), accept(1),                  # the user's VM: asked once
+                 call(3, "click", vm="deb@pc1", x=1, y=2, clicks=3, screenshot=True),
+                 call(4, "exec", vm="deb@pc1", command="echo hi"), accept(2),    # root: asked again
+                 call(5, "vm_start", vm="own@pc1"),                               # the agent's own: no question
+                 call(6, "vm_clone", vm="own@pc1", new="x"),
+                 call(7, "screenshot", vm="nope@pc1"), call(8, "status", vm="a@PC!")]
+        old = sys.stdin
+        sys.stdin = io.StringIO("".join(json.dumps(x) + "\n" for x in lines))
+        try:
+            with mock.patch.object(tl, "ct_call", ct_call), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                tl.mcp("v")
+        finally:
+            sys.stdin = old
+        msgs = {m.get("id"): m for m in map(json.loads, out.getvalue().splitlines())}
+        self.assertIn("deb on pc1", msgs["ask-1"]["params"]["message"])
+        self.assertEqual(tl.base64.b64decode(msgs[2]["result"]["content"][0]["data"]), b"PNG of deb")
+        self.assertIn(["--host", "pc1", "vm", "action", "deb", "click", "--json",
+                       json.dumps({"x": 1, "y": 2, "clicks": 3})], calls)              # its arguments as they came
+        self.assertEqual([c["type"] for c in msgs[3]["result"]["content"]], ["text", "image"])
+        self.assertIn("as root", msgs["ask-2"]["params"]["message"])
+        self.assertEqual(json.loads(msgs[4]["result"]["content"][0]["text"])["stdout"], "hi\n")
+        self.assertNotIn("ask-3", msgs)
+        self.assertIn(["--host", "pc1", "vm", "start", "own"], calls)
+        self.assertTrue(msgs[6]["result"]["isError"])
+        self.assertIn("terminal-ct --host pc1 vm", msgs[6]["result"]["content"][0]["text"])
+        self.assertIn("no VM named 'nope' on pc1", msgs[7]["result"]["content"][0]["text"])
+        self.assertIn("invalid VM@PC name", msgs[8]["result"]["content"][0]["text"])
+
     def test_install_cache_until_installed(self):
         m = {"os": "win2025", "iso": "/x.iso", "memory_mb": 2048, "cpus": 2}
         os.makedirs(os.path.join(self.d, "answers"))

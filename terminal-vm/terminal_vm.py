@@ -41,7 +41,7 @@ Virtualization), which is also the default for `up` and `create` without `--os`.
   skills get | skills path | skills install [--dir DIR]
 """
 import argparse, base64, collections, contextlib, hashlib, http.server, io, json, os, platform, queue, re, secrets, shlex, shutil, signal, \
-    socket, socketserver, struct, subprocess, sys, threading, time, urllib.parse, urllib.request, webbrowser
+    socket, socketserver, struct, subprocess, sys, tempfile, threading, time, urllib.parse, urllib.request, webbrowser
 import ipaddress, ssl
 from xml.sax.saxutils import escape
 
@@ -2981,6 +2981,7 @@ def vm_list():
                             "cpus": m["cpus"], "memory_gb": m["memory_mb"] // 1024,
                             "display": f"{m.get('width', 1280)}x{m.get('height', 800)}", "layout": m.get("layout", "us"),
                             **({"base": m["base"]} if m.get("base") else {}), **({"sandbox": True} if m.get("sandbox") else {}),
+                            **({"created_by": "agent"} if m.get("created_by") == "agent" else {}),
                             **({"description": t} if (t := description("vm", n)) else {})})
     return out
 
@@ -5044,8 +5045,9 @@ AGENT_TOOLS = [
               "sandbox": {"type": "boolean"}, "iso": {"type": "string"}, **_DESC_ARG}, ["vm"])),
     ("vm_clone", "Copy-on-write clone of a stopped VM, in seconds (install once, clone many). Both stay usable. Cloning one of the user's VMs needs their approval; the clone starts offline.",
      _schema({**_VM, "new": {"type": "string"}, **_DESC_ARG}, ["vm", "new"])),
-    ("vm_start", "Start a managed VM, within the host quota." + _MANAGED, _schema(_VM, ["vm"])),
-    ("vm_stop", "Shut a managed VM down (force: power off at once).",
+    ("vm_start", "Start a managed VM, within the host quota (VM@PC: another PC's, within its quota)." + _MANAGED,
+     _schema(_VM, ["vm"])),
+    ("vm_stop", "Shut a managed VM down (force: power off at once); VM@PC: another PC's.",
      _schema({**_VM, "force": {"type": "boolean"}, "timeout": {"type": "integer"}}, ["vm"])),
     ("vm_remove", "Delete a stopped managed VM and its disk.", _schema(_VM, ["vm"])),
     ("vm_snapshot", "Snapshots of a managed VM: save, load, rm or ls (tag needed except for ls).",
@@ -5092,13 +5094,77 @@ INSTRUCTIONS = ("terminal-vm: VMs with a desktop for computer-use agents. Call i
                 "where, with what resources and descriptions. Then project_status: what this project has and what "
                 "earlier sessions did and noted. Describe what you create (description, or describe). Before you stop, record with "
                 "notes_write what you set up and what is left, so the next session can pick up from there.")
-_OTHER = {"vm": {"type": "string", "description": "Another VM this agent manages (default: this server's VM)"}}
+_OTHER = {"vm": {"type": "string", "description": "Another VM this agent manages (default: this server's VM); "
+                                                "VM@PC: a VM of another PC (terminal-ct host add)"}}
 SCREEN_TOOLS = [(n, d, s if n in ("top", "quota") else dict(s, properties={**s["properties"], **_OTHER}))
                 for n, d, s in TOOLS]
 
 
 def image(data):
     return {"type": "image", "data": base64.b64encode(data).decode(), "mimeType": "image/png"}
+
+
+REMOTE_TOOLS = {"screenshot", "click", "move", "drag", "scroll", "type", "key", "status", "wait", "exec", "vm_start",
+                "vm_stop"}
+
+
+def remote_vm(name):
+    """"VM@PC": a VM of another PC (terminal-ct host add), reached through terminal-ct --host PC vm ...: (VM, PC);
+    None for a VM of this PC."""
+    vm, at, pc = (name or "").partition("@")
+    if not at:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,47}", vm) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,62}", pc):
+        raise ValueError(f"invalid VM@PC name {name!r}")
+    return vm, pc
+
+
+def pc_vm(pc, args, timeout=120):
+    """terminal-vm on another PC, through terminal-ct (its agent or SSH): its JSON reply."""
+    return ct_call(["--host", pc, "vm", *args], timeout)
+
+
+def remote_tool(tool, a, name, approve, project, ok):
+    """An MCP tool on VM@PC, under this PC's rules: the agent's own and sandboxed VMs freely, the user's after
+    their approval (once a session; a root shell asks again). (JSON reply or None, PNG or None)."""
+    vm, pc = remote_vm(name)
+    if tool not in REMOTE_TOOLS:
+        raise SystemExit(f"{tool} works on this PC's VMs; on {pc}: terminal-ct --host {pc} vm ... (or terminal-vm "
+                         "there)")
+    row = next((v for v in pc_vm(pc, ["ls"], 60) if isinstance(v, dict) and v.get("name") == vm), None)
+    if row is None or project and not under(row.get("project") or DEFAULT_PROJECT, project):
+        raise SystemExit(f"no VM named {vm!r} on {pc}")
+    if not (row.get("sandbox") or row.get("created_by") == "agent") and name not in ok:
+        approve(f"Let the agent use your VM {vm} on {pc} (its screen, start and stop)?",
+                f"terminal-ct --host {pc} vm view {vm}   (or do it yourself)")
+        ok.add(name)
+    if tool == "exec" and row.get("created_by") != "agent" and name + " exec" not in ok:  # root: as on this PC
+        approve(f"Let the agent run commands as root (SYSTEM) inside your VM {vm} on {pc}?",
+                f"terminal-ct --host {pc} vm exec {vm} -- COMMAND   (or run the commands yourself)")
+        ok.add(name + " exec")
+    if tool == "vm_start":
+        return pc_vm(pc, ["start", vm], 600), None
+    if tool == "vm_stop":
+        return pc_vm(pc, ["stop", vm, *(["--force"] if a.get("force") else []),
+                          *(["--timeout", str(int(a["timeout"]))] if a.get("timeout") else [])], 600), None
+    out = None
+    if tool != "screenshot":
+        args = {k: v for k, v in a.items() if k != "screenshot"}
+        out = pc_vm(pc, ["action", vm, tool, "--json", json.dumps(args)], 660 if tool == "exec" else 120)
+    if tool in ("screenshot", "wait") or a.get("screenshot") and tool in INPUT_TOOLS:
+        if tool in INPUT_TOOLS:  # its effect on the screen, as settled_screenshot does here
+            pc_vm(pc, ["action", vm, "wait", "--json", json.dumps({"stable": 0.5, "timeout": 5})], 60)
+        # shortcut: a path of this PC, read by terminal-ct as one of its own (Windows + terminal-ct in WSL: not yet)
+        fd, path = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        try:
+            pc_vm(pc, ["action", vm, "screenshot", "--output", path], 120)
+            with open(path, "rb") as f:
+                return out, f.read()
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(path)
+    return out, None
 
 
 def mcp(name, project=None):
@@ -5109,6 +5175,7 @@ def mcp(name, project=None):
         if not os.path.isfile(os.path.join(vm_dir(name), "machine.json")) or not under(project_of(load(name)), project):
             name = None  # its VM (by default "default") is outside the project: serve without one of its own
     shell_ok = set()  # VMs whose root shell (exec) the user approved in this session
+    remote_ok = set()  # another PC's VMs (VM@PC) the user let this agent use, and "VM@PC exec"
     agents = {}  # per VM: whether qemu-guest-agent answered once; unknown until asked
     seen = {}  # per VM: when a logged-in session was last confirmed
     can_ask, pending, asks = False, collections.deque(), iter(range(1, 1 << 30))
@@ -5185,6 +5252,12 @@ def mcp(name, project=None):
             tool, a = p.get("name"), dict(p.get("arguments") or {})
             vm = a.get("vm") if tool in AGENT_NAMES else a.pop("vm", None) or name
             try:
+                if isinstance(vm, str) and "@" in vm:  # a VM of another PC: through terminal-ct
+                    js, png = remote_tool(tool, a, vm, approve, project, remote_ok)
+                    record(tool, dict(a, vm=vm), None)
+                    send({"jsonrpc": "2.0", "id": rid, "result": {"content": (
+                        [] if js is None else [{"type": "text", "text": json.dumps(js)}]) + ([image(png)] if png else [])}})
+                    continue
                 if not vm and tool not in AGENT_NAMES and tool not in ("top", "quota"):
                     raise ValueError("name the VM (vm): this server has no VM of its own in its project")
                 if project and tool not in AGENT_NAMES and tool not in ("top", "quota"):
@@ -5305,6 +5378,7 @@ def main(argv=None):
     a.add_argument("--timeout", type=float, default=30); a.add_argument("--stable", type=float, default=1)
     a.add_argument("--layout", choices=sorted(LAYOUTS), help="this call only: us (QWERTY) or fr (AZERTY)")
     a.add_argument("--no-wake", action="store_true", help="screenshot: only look (a paused VM stays paused)")
+    a.add_argument("--json", dest="json_args", help="the tool's arguments as MCP gives them (a JSON object); exec too")
     lo = sub.add_parser("layout"); lo.add_argument("name"); lo.add_argument("layout", nargs="?", choices=sorted(LAYOUTS))
     sb = sub.add_parser("sandbox"); sb.add_argument("name"); sb.add_argument("value", nargs="?", choices=["on", "off"])
     sub.add_parser("top")
@@ -5433,6 +5507,14 @@ def main(argv=None):
         if o.cmd == "skills": return skills(o.skill_cmd, o.dir)
         if o.cmd == "status":
             print(json.dumps(act(o.name, "status", {}))); return
+        if o.json_args is not None:  # as the MCP tool: another PC's agent reaches this VM this way
+            given = json.loads(o.json_args)
+            if not isinstance(given, dict):
+                raise ValueError("--json: a JSON object of the tool's arguments")
+            if o.tool == "exec":
+                print(json.dumps(guest_shell(o.name, str(given.get("command", "")),
+                                             max(1.0, min(float(given.get("timeout", 60)), 600)))))
+                return
         nums = [float(v) for v in o.args] if o.tool in ("click", "move", "drag") else []
         args = {"screenshot": {}, "status": {}, "wait": {"timeout": o.timeout, "stable": o.stable},
                 "click": lambda: {"x": nums[0], "y": nums[1], "button": o.button, "clicks": 2 if o.double else 1},
@@ -5441,6 +5523,8 @@ def main(argv=None):
                 "scroll": lambda: {k: v for k, v in (("dy", o.dy), ("x", o.x), ("y", o.y)) if v is not None},
                 "type": lambda: {"text": " ".join(o.args), "layout": o.layout},
                 "key": lambda: {"key": o.args[0], "layout": o.layout}}[o.tool]
+        if o.json_args is not None:
+            args = given
         if o.tool == "screenshot" and o.no_wake:  # watching is not a use: as the dashboard's thumbnails
             qm, f = qmp(o.name), f"cli{os.getpid()}.png"
             try:

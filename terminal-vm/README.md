@@ -330,6 +330,12 @@ there, in `~/.local/bin`, or in `TERMINAL_VM`: terminal-ct's dashboard lists the
 `terminal-ct --host PC vm ARGS` runs any terminal-vm command here. Its thumbnails use `screenshot --no-wake` and
 only for running VMs. This tool's own dashboard (7172) shows this PC's VMs only.
 
+The MCP server reaches them too, as `vm: "VM@PC"` (terminal-ct on this PC, the other PC added with `terminal-ct host
+add`): the screen tools, `exec`, `vm_start` and `vm_stop`, under the same rules as here: an agent's own and
+sandboxed VMs freely, the user's after their approval (once per session; a root shell asks again). Creating,
+cloning and removing stay on that PC (`terminal-ct --host PC vm ...`). `action VM TOOL --json '{...}'` takes a
+tool's MCP arguments as they are; `ls` marks the VMs an agent created (`created_by`).
+
 ## Measurements
 
 `terminal-vm bench [--runs 10] [--from VM]` times terminal-vm's own operations on a copy-on-write clone of a
