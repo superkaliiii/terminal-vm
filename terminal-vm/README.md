@@ -23,7 +23,8 @@ One command and one MCP server: the same tools everywhere (`screenshot`, `click`
 - **In the terminal**: an interactive viewer (Kitty graphics or Sixel) that leaves agents working while you watch.
 - **Clones in under a second** (copy-on-write), snapshots with memory, file copies through the guest agent.
 - **Supervision**: restarts, health checks, idle pause and wake, events; quota and live resources.
-- **Agents first**: an MCP server with authority rules, projects with notes, an agent skill, a web dashboard shared
+- **Agents first**: an MCP server with authority rules, an `infra` map read in one call, a one-line description on
+  every VM, network and project, projects with notes, an agent skill, a web dashboard shared
   with read-only or full users, and VMs driven from another PC through [terminal-ct](https://github.com/superkaliiii/terminal-conteneur).
 
 | Host | Linux guests | Windows guests | macOS guests |
@@ -74,6 +75,8 @@ or install this folder as a Claude Code plugin (`.claude-plugin/`).
 | `bench [--runs 10] [--from VM]` | timings of terminal-vm's own operations on a clone (see [Measurements](#measurements)) |
 | `daemon run\|start\|stop\|status`, `supervise NAME [--restart always\|never] [--idle-pause MIN]`, `events [-n 50] [--vm V]` | supervision: restarts, health, idle pause, events (see [Supervision](#supervision)) |
 | `resume [--stay]`, `autostart [on\|off]` | start again the VMs that were running before a restart; at each logon (see [Restarts](#restarts)) |
+| `infra [--project P] [--json]` | the map: this PC's quota, every VM (state, ceiling and use, networks and addresses, description, creator, managed), networks and members, projects, and terminal-ct's map when installed (see [Projects](#projects)) |
+| `describe vm\|net\|project NAME [TEXT\|--clear]` | one line on what it is for (no TEXT: show it); `--description TEXT` on `create`, `clone`, `net create` |
 | `project ls`, `project show [P]`, `project notes [P [TEXT]]`, `project move NAME P`; `create --project P` | projects (see [Projects](#projects)) |
 | `stop NAME [--timeout 60]` / `--force` | asks the guest and waits; reports a guest showing a confirmation dialog |
 | `rm NAME` / `reset NAME` | delete a stopped VM / give it a blank disk of the same size (reinstalls on the next start, Windows answers kept) |
@@ -325,9 +328,16 @@ data 509 ms (mostly `top`'s 0.5 s CPU sample), forced stop 6 ms, rm 48 ms.
   into P or below; outside P nothing is listed and nothing can be approved, so each agent keeps to its own project.
   Its `quota` and `top` show the room left and its project's use, not the other projects'; a name taken elsewhere
   is just "not available".
-- To resume, an agent calls `project_status` (VMs and networks with what each should be doing, notes, latest
-  actions with errors); `notes_write` keeps notes for the next session. The server says so at connection
-  (MCP `instructions`).
+- An agent starts with `infra` (the map: this PC's quota with what is free, every VM with its state, ceiling and
+  use, networks and addresses, description, creator and `managed`, each network with its members, the projects,
+  and terminal-ct's containers, nodes and other PCs when it is installed), then resumes with `project_status`
+  (VMs and networks with what each should be doing, notes, latest actions with errors); `notes_write` keeps notes
+  for the next session. The server says so at connection (MCP `instructions`).
+- Descriptions: one line (at most 200 printable characters) on a VM, network or project (`describe`,
+  `--description` at creation, MCP `describe` and a `description` argument on `vm_create`, `vm_clone`,
+  `net_create`), in `STORE/descriptions.json`: changeable at any time, never inherited by a clone, gone with the
+  object; shown in `ls`, `net ls`, `project show`, `infra` and the web dashboard. An agent describes its own VMs
+  and networks (and its server's project) freely; the user's need their approval.
 
 ## Keyboard layouts and text
 

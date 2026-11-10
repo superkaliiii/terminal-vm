@@ -13,7 +13,11 @@ terminal-vm gives you computer use inside a separate virtual machine (Linux, Win
 
 ## Start and end of a session
 
-First call `project_status`: the VMs and networks of your project (with `want`, what each should be doing), the notes earlier sessions left, and their latest actions and errors. Pick up from there instead of rebuilding. Before you stop, `notes_write` what you set up, what works and what is left. A server started with `--project` shows you only that project (and its sub-projects, `lab/web`): the rest is not yours. `exec` runs a shell command in a managed, non-sandboxed VM (guest agent). `autostart` (with the user's approval) brings running VMs back after the PC restarts; with `vm`, it turns terminal-ct's autostart on inside that Linux VM.
+First call `infra`: the map in one call (this PC's quota with what is free, every VM with its state, ceiling
+and use, networks and addresses, description, creator and `managed`, each network with its members, the projects,
+and terminal-ct's containers, nodes and other PCs when it is installed). Give what you create a one-line
+`description` (`vm_create`, `vm_clone`, `net_create`) or set it later with `describe`; describing the user's VMs
+asks them. Then `project_status`: the VMs and networks of your project (with `want`, what each should be doing), the notes earlier sessions left, and their latest actions and errors. Pick up from there instead of rebuilding. Before you stop, `notes_write` what you set up, what works and what is left. A server started with `--project` shows you only that project (and its sub-projects, `lab/web`): the rest is not yours. `exec` runs a shell command in a managed, non-sandboxed VM (guest agent). `autostart` (with the user's approval) brings running VMs back after the PC restarts; with `vm`, it turns terminal-ct's autostart on inside that Linux VM.
 
 ## Loop: observe -> act -> verify
 
