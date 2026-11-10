@@ -294,7 +294,8 @@ def sync_clock(name, timeout=2, g=None):
 def _sync_after_pause(name):
     """After cont: the guest's clock missed the pause. Best effort (no agent, a busy one: the daemon's next check)."""
     with contextlib.suppress(OSError, RuntimeError, ValueError):
-        drift = sync_clock(name)
+        # an agent answers in milliseconds; a guest without one (TinyCore) must not hold resume (2 s per resume)
+        drift = sync_clock(name, timeout=0.3)
         if drift:
             event("clock_set", name, f"{drift:+} s")
 
