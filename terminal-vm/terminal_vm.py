@@ -58,7 +58,8 @@ STORE = os.environ.get("TERMINAL_VM_HOME") or os.environ.get("TERMINAL_LINUX_HOM
     os.path.join(_DATA, "terminal-vm"))
 HERE = os.path.dirname(os.path.abspath(__file__))
 SKILL = next((p for p in (os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills", "terminal-vm", "SKILL.md"),
-                          os.path.join(sys.prefix, "share", "terminal-vm", "skills", "terminal-vm", "SKILL.md"))  # a pip/pipx/uvx install
+                          os.path.join(sys.prefix, "share", "terminal-vm", "skills", "terminal-vm", "SKILL.md"),  # pip, pipx, uvx
+                          os.path.join(__import__("site").getuserbase(), "share", "terminal-vm", "skills", "terminal-vm", "SKILL.md"))
               if os.path.isfile(p)), os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills", "terminal-vm", "SKILL.md"))
 ABS_MAX = 0x7FFF  # usb-tablet absolute axis range
 IMAGE_INDEX = "https://cdimage.debian.org/debian-cd/current-live/amd64/iso-hybrid/"
@@ -4619,7 +4620,10 @@ def doctor_checks():
     return checks
 
 
-_SECRET = re.compile(r"(?i)(token|password|passwd|secret|key)([\"']?\s*[:=]\s*[\"']?)[^\s\"',}]+")
+_AUTH = re.compile(r"(?i)\b(authorization\s*[:=]\s*)(?:(?:bearer|basic|token)\s+)?[^\s\"',}]+")
+_SECRET = re.compile(r"(?i)(token|password|passwd|pass|pwd|secret|key|bearer)"
+                     r"([\"']?\s*[:=]\s*[\"']?|\s+)(?!<hidden>)[^\s\"',}]+")
+_URL_CRED = re.compile(r"(://[^/\s:@]+:)[^@\s/]+@")  # postgres://user:PASSWORD@host
 
 
 def known_secrets():
@@ -4631,7 +4635,7 @@ def known_secrets():
     for n in machines():
         with contextlib.suppress(Exception):
             out.append(load(n).get("password") or "")
-    return [x for x in out if len(x) >= 6]
+    return [x for x in out if len(x) >= 4]  # shorter: too likely to be part of other words
 
 
 def mask(text, secrets=()):
@@ -4640,7 +4644,9 @@ def mask(text, secrets=()):
     import getpass
     for x in secrets:
         text = text.replace(x, "<hidden>")
+    text = _AUTH.sub(lambda m: m.group(1) + "<hidden>", text)  # the header's scheme word is not its secret
     text = _SECRET.sub(lambda m: m.group(1) + m.group(2) + "<hidden>", text)
+    text = _URL_CRED.sub(lambda m: m.group(1) + "<hidden>@", text)
     for real, alias in ((os.path.expanduser("~"), "~"), (platform.node(), "<host>")):
         if real and len(real) > 1:
             text = text.replace(real, alias)
@@ -4648,6 +4654,8 @@ def mask(text, secrets=()):
         me = getpass.getuser()
         if len(me) > 2:
             text = re.sub(rf"\b{re.escape(me)}\b", "<user>", text)
+    text = re.sub(r"(?i)(/mnt/[a-z]/Users/|[A-Z]:(?:\\\\|\\|/)Users(?:\\\\|\\|/))[^\\/\s\"']+",
+                  lambda m: m.group(1) + "<user>", text)  # a Windows account's folder, from WSL or in JSON too
     return text
 
 
@@ -4666,7 +4674,8 @@ def doctor_report():
                 parts += ["", f"== {name} (last 60 lines)", "".join(collections.deque(f, 60)).rstrip()]
     os.makedirs(STORE, exist_ok=True)
     path = os.path.join(STORE, f"report-{time.strftime('%Y%m%d-%H%M%S')}.txt")
-    with open(path, "w", encoding="utf-8") as f:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)  # the owner's only, masked or not
+    with open(fd, "w", encoding="utf-8") as f:
         f.write(mask("\n".join(parts), known_secrets()) + "\n")
     return path
 

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools>=61"]  # 77+ needs Python 3.9; terminal-vm runs on 3.8
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "A separate desktop VM for computer-use agents, viewed and driven from a terminal: a CLI and an MCP server."
 readme = "README.md"
 requires-python = ">=3.8"
-license = "MIT"
+license = { text = "MIT" }
 authors = [{ name = "superkaliiii" }]
 keywords = ["vm", "qemu", "mcp", "agents", "computer-use", "desktop"]
 classifiers = ["Programming Language :: Python :: 3", "Environment :: Console", "Topic :: System :: Emulators"]
