@@ -1009,6 +1009,39 @@ class GuestAgent(unittest.TestCase):
         with mock.patch.object(tl, "connect", lambda *a: Sock()), mock.patch.object(tl, "endpoint", lambda *a: "x"):
             self.assertEqual(tl.QGA("a").call("guest-exec", path="/bin/true"), {"pid": 42})  # not a sync's answer
 
+    def test_exec_waits_for_a_busy_agent(self):
+        """One client at a time: a command right after a node's ready file waits for the identity step's
+        connection instead of failing; a connection whose sync went unanswered is closed (QEMU's one queued slot)."""
+        closed, tries = [], []
+        class Sock:
+            def __init__(self, busy): self.busy, self.out = busy, []
+            def settimeout(self, t): pass
+            def sendall(self, data):
+                req = json.loads(data)
+                if self.busy:
+                    return
+                r = {"guest-sync": req.get("arguments", {}).get("id"), "guest-exec": {"pid": 7},
+                     "guest-exec-status": {"exited": True, "exitcode": 0, "out-data": "bjEK"}}[req["execute"]]
+                self.out.append(json.dumps({"return": r}).encode() + b"\n")
+            def recv(self, n):
+                if self.busy:
+                    raise socket.timeout("timed out")
+                return self.out.pop(0)
+            def close(self): closed.append(self.busy)
+        def conn(*a):
+            tries.append(1)
+            if len(tries) == 1:
+                raise BlockingIOError(11, "Resource temporarily unavailable")  # the queue is full
+            return Sock(busy=len(tries) == 2)                                  # queued, never served in time
+        with mock.patch.object(tl, "connect", conn), mock.patch.object(tl, "endpoint", lambda *a: "x"), \
+                mock.patch.object(tl.time, "sleep", lambda s: None):
+            self.assertEqual(tl.guest_exec("a", "hostname", []), {"exit": 0, "stdout": "n1\n", "stderr": ""})
+        self.assertEqual((len(tries), closed), (3, [True, False]))
+        with mock.patch.object(tl, "connect", lambda *a: (_ for _ in ()).throw(ConnectionRefusedError())), \
+                mock.patch.object(tl, "endpoint", lambda *a: "x"), mock.patch.object(tl.time, "sleep", lambda s: None):
+            with self.assertRaises(tl.AgentBusy):
+                tl.guest_exec("a", "hostname", [], timeout=0)
+
 
 class Supervision(unittest.TestCase):
     """The daemon's passes: restart with growing delays, guest agent health, idle pause and wake, events."""

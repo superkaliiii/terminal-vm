@@ -207,10 +207,14 @@ class QGA:
     def __init__(self, name, timeout=0.5):
         self.sock = connect(endpoint(name, "qga"), timeout)
         self.buf = b""
-        sync = secrets.randbelow(2 ** 31)
-        self._send("guest-sync", id=sync)
-        while self._reply(errors=False) != sync:  # drop replies (errors too) left by earlier clients; one sync: each
-            pass                      # is answered, and an extra answer would be read as the next call's
+        try:
+            sync = secrets.randbelow(2 ** 31)
+            self._send("guest-sync", id=sync)
+            while self._reply(errors=False) != sync:  # drop replies (errors too) left by earlier clients; one sync:
+                pass                      # each is answered, and an extra answer would be read as the next call's
+        except BaseException:
+            self.sock.close()  # an open socket left queued would hold QEMU's one pending slot
+            raise
 
     def _send(self, execute, **arguments):
         self.sock.sendall(json.dumps({"execute": execute, **({"arguments": arguments} if arguments else {})}).encode() + b"\n")
@@ -296,10 +300,24 @@ def _kv(text):
     return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
 
 
+class AgentBusy(OSError):
+    """No guest agent answered in time: the command never started."""
+
+
 def guest_exec(name, path, args, timeout=120, stdin=None):
     """Run a program in the guest through qemu-guest-agent (root, or SYSTEM on Windows): exit code, stdout, stderr.
     stdin: bytes given to it."""
-    g = QGA(name, timeout=5)
+    # the agent serves one client at a time (a node's identity step holds it ~15 s right before its ready file
+    # shows): wait for it, within the command's own time; nothing has run in the guest until it answers
+    end = time.time() + min(timeout, 30)
+    while True:
+        try:
+            g = QGA(name, timeout=min(5.0, max(0.5, end - time.time())))
+            break
+        except OSError as e:
+            if time.time() >= end:
+                raise AgentBusy(f"guest agent busy or silent ({e})") from None
+            time.sleep(0.2)
     try:
         pid = g.call("guest-exec", path=path, arg=args, **{"capture-output": True},
                      **({"input-data": base64.b64encode(stdin).decode()} if stdin is not None else {}))["pid"]
@@ -342,6 +360,9 @@ def guest_run(name, argv, timeout=60, stdin=None):
     with in_use(name):  # a long command is a use until it ends
         try:
             return guest_exec(name, argv[0], argv[1:], timeout, stdin)
+        except AgentBusy as e:
+            raise SystemExit(f"{name}: {e}; nothing was run (install qemu-guest-agent in the guest if it has "
+                             "none)") from None
         except OSError as e:
             if "timed out" in str(e):
                 raise SystemExit(f"{name}: {e}; the command may still be running in the guest") from None
