@@ -372,3 +372,7 @@ With `qemu-guest-agent` installed in the guest, `status` reports the active grap
 ```sh
 python3 -m unittest -v      # layouts, viewer input parsing, QMP and guest-agent protocol against fake servers
 ```
+
+## License
+
+MIT, like the rest of this repository: see [LICENSE](../LICENSE).
