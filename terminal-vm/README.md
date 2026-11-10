@@ -116,7 +116,12 @@ internet), then every node is an overlay on it.
 - A node's own identity is set by the guest agent at its first start: host name, `user` account and password (sent
   on stdin, never in the guest's process list), root file system grown to `--disk`, new SSH host keys; then its
   ready file, once it has a route and Docker answers. `clone` and `reset` do it again.
-- A newer cloud image (or a new template version) builds a new template; older ones go when no VM is built on them.
+- A newer cloud image (or a new template version) builds a new template; older ones go when no VM (nor a clone's
+  base) is built on them. A clone gets new SSH host keys, machine id and Docker id. Templates, like cloud images,
+  are a cache outside the disk quota (0.4-1 GB each).
+- One build at a time per kind (others wait for it); a build that was killed is taken over by the next `create`,
+  and its leftover `tmpl-*` VM removed. A node whose identity step fails is never reported ready
+  (`identity_failed` event, details in its `qemu.log`).
 
 | WSL with nested KVM | from the cloud image | node template |
 |---|---:|---:|
@@ -258,7 +263,9 @@ itself 10 minutes after the last VM that should run). Every 5 s it:
 - keeps guest clocks on the host's: a guest's clock stops while QEMU is paused and while the host sleeps, and a
   guest hours behind refuses TLS, `apt` and image pulls. Through the guest agent, the clock is set again after a
   wake or `resume`, and checked once a minute (which catches a host that slept); stepped only when more than
-  0.25 s off (`clock_set` events). Measured: 20 s paused, back to 0 s off at once.
+  0.25 s off (`clock_set` events), either way (a guest ahead goes back). Measured: 20 s paused, back to 0 s off at
+  once. Node templates have no NTP daemon: a node nobody supervises (`TERMINAL_VM_DAEMON=0`) catches up only at its
+  next resume or start.
 
 What it does goes to `STORE/events.log` (`events [-n 50] [--vm V]`: `restarted`, `restart_failed`, `unhealthy`,
 `healthy`, `idle_paused`, `woken`, `clock_set`, `window_closed`, `supervise_failed`, `daemon_started`/`stopped`), in

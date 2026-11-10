@@ -999,7 +999,7 @@ class GuestAgent(unittest.TestCase):
     """The guest agent client."""
     def test_agent_resync_after_stale_reply(self):
         class Sock:  # the guest agent answers each request in order; an earlier client left one reply unread
-            def __init__(self): self.out = [b'{"return": 7}\n']
+            def __init__(self): self.out = [b'{"return": 7}\n', b'{"error": {"desc": "late set-time"}}\n']
             def sendall(self, data):
                 req = json.loads(data)
                 self.out.append(json.dumps({"return": req["arguments"]["id"] if req["execute"] == "guest-sync"
@@ -1188,7 +1188,7 @@ class Supervision(unittest.TestCase):
 class SharedDashboard(unittest.TestCase):
     """The web dashboard's code is one block, identical in terminal-ct and terminal-vm: change it in both, then set
     SHARED_SHA in both tests to the new value."""
-    SHARED_SHA = "7e5a6d078fad6b5a27d96b0dcc889ea461941444dc39d7d642a5ff2ce69268eb"
+    SHARED_SHA = "387455b4b6b8816aeb0bf16492484b9f6a60a0c710062f2abb0d2ac2fde86662"
 
     @staticmethod
     def block(path):
@@ -1473,6 +1473,45 @@ class CloudImages(unittest.TestCase):
         m = tl.load("n_2")
         self.assertTrue(m["identity"]); self.assertNotEqual(m["ready_file"], first)          # set up again
         self.assertIn(tpl, self.calls[-1])                                                   # on the template again
+
+    def test_template_gc_build_lock_and_clone_ids(self):
+        img = os.path.join(self.tmp, "images")
+        os.makedirs(img, exist_ok=True)
+        old, new = (os.path.join(img, f"node-generic_alpine-3.2{i}-x86_64-bios-cloudinit-r0-ab-t1.qcow2") for i in (1, 2))
+        for f in (old, new):
+            open(f, "w").close()
+            os.utime(f, (time.time() - 3600, time.time() - 3600))
+        os.makedirs(os.path.join(self.tmp, ".bases"))
+        base = os.path.join(self.tmp, ".bases", "n1-abcd.qcow2"); open(base, "w").close()   # a clone's source moved here
+        backing = {base: old}
+
+        def run(cmd, **k):
+            return mock.Mock(returncode=0 if cmd[-1] in backing else 1,
+                             stdout=json.dumps({"backing-filename": backing.get(cmd[-1])}))
+        with mock.patch.object(tl.subprocess, "run", run):
+            tl._gc_node_templates(new)
+            self.assertTrue(os.path.exists(old))                                 # still needed by n1 and its clone
+            backing.clear(); backing[base] = None
+            os.makedirs(os.path.join(self.tmp, "x")); open(os.path.join(self.tmp, "x", "disk.qcow2"), "w").close()
+            tl._gc_node_templates(new)                                           # x's disk unreadable: no guess
+            self.assertTrue(os.path.exists(old))
+            os.remove(os.path.join(self.tmp, "x", "disk.qcow2"))
+            tl._gc_node_templates(new)
+            self.assertFalse(os.path.exists(old)); self.assertTrue(os.path.exists(new))
+        lock = os.path.join(img, "t.lock"); os.mkdir(lock)
+        self.assertTrue(tl._builder_alive(lock))                                 # being taken: no pid yet
+        with open(os.path.join(lock, "pid"), "w") as f:
+            f.write(str(os.getpid()))
+        self.assertTrue(tl._builder_alive(lock))
+        with open(os.path.join(lock, "pid"), "w") as f:
+            f.write("999999999")                                                 # its build was killed
+        self.assertFalse(tl._builder_alive(lock))
+        m = {"image": "alpine", "user": "user", "ready_file": "/var/lib/terminal-vm/ready-x"}
+        tl.node_seed("c2", m, fresh=True)
+        script = tl.node_identity_script("c2", m)
+        self.assertIn("rm -f /etc/ssh/ssh_host_*", script); self.assertIn("rc-service docker restart", script)
+        self.assertNotIn("ssh_host_* /var", tl.node_identity_script("c2", dict(m, fresh_ids=False)))
+        self.assertIn("sed -i '/^127[.]0[.]1[.]1", script)                       # the build VM's name replaced
 
     def test_new_instance_each_seed(self):
         with contextlib.redirect_stdout(io.StringIO()):

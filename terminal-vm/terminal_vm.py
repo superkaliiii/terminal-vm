@@ -209,7 +209,7 @@ class QGA:
         self.buf = b""
         sync = secrets.randbelow(2 ** 31)
         self._send("guest-sync", id=sync)
-        while self._reply() != sync:  # drop replies left over from earlier clients; one sync only: each one sent
+        while self._reply(errors=False) != sync:  # drop replies (errors too) left by earlier clients; one sync: each
             pass                      # is answered, and an extra answer would be read as the next call's
 
     def _send(self, execute, **arguments):
@@ -219,7 +219,7 @@ class QGA:
         self._send(execute, **arguments)
         return self._reply()
 
-    def _reply(self):
+    def _reply(self, errors=True):
         while True:
             while b"\n" not in self.buf:
                 chunk = self.sock.recv(65536)
@@ -232,7 +232,9 @@ class QGA:
             except ValueError:
                 continue
             if "error" in reply:
-                raise OSError(reply["error"].get("desc", "guest agent error"))
+                if errors:
+                    raise OSError(reply["error"].get("desc", "guest agent error"))
+                continue
             if "return" in reply:
                 return reply["return"]
 
@@ -1048,7 +1050,7 @@ def qemu_args(name, m, window, vnc_port=None):
 
 def create(name, iso, os_name="linux", cpus=None, memory=None, disk=None, width=1280, height=800, layout="us",
            offline=False, product_key=None, ui_language="en-US", sandbox=False, max_cpus=None, max_memory=None,
-           project=None, image=None, node=False, template=True):
+           project=None, image=None, node=False, template=True, base_image=None):
     """A VM installed from an ISO, or (image) one booting an official cloud image, set up by cloud-init at its
     first start; node: with Docker and Python 3, for terminal-ct, an overlay on the node template (built once;
     template=False: from the cloud image itself, as the template's own build)."""
@@ -1089,8 +1091,11 @@ def create(name, iso, os_name="linux", cpus=None, memory=None, disk=None, width=
         raise SystemExit(f"this VM could never start within the quota ({lim['cpus']} CPUs, {lim['memory_gb']} GiB "
                          f"for its memory ceiling of {top[1]}): lower --cpus/--max-memory, or raise the quota")
     tpl = bool(node and template)
+    if tpl:
+        with quota_lock():  # said before a template build of minutes, not after (checked again below)
+            quota_check({"disk_gb": disk})
     # before the folder exists: a failed download (or template build) leaves nothing
-    base = node_template(image) if tpl else cloud_image(image) if image else None
+    base = node_template(image) if tpl else (base_image or cloud_image(image)) if image else None
     with quota_lock():
         quota_check({"disk_gb": disk})
         os.makedirs(d, mode=0o700, exist_ok=True)  # under the lock: the disk now counts for the next check
@@ -2198,10 +2203,6 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
             if method == "GET" and u.path == "/api/session":
                 return self._send(200, "application/json", web_session(who))
             ctype, out = web_api(method, u.path, dict(urllib.parse.parse_qsl(u.query)), body)
-            if who[1] == "read" and isinstance(out, dict) and isinstance(out.get("desired"), dict):
-                out = dict(out, desired=dict(out["desired"], services={  # a stack's env holds secrets: full only
-                    k: {**v, "env": "(hidden: read only)"} if isinstance(v, dict) and v.get("env") else v
-                    for k, v in (out["desired"].get("services") or {}).items()}))
             if method == "POST":
                 _web_act_log(who[0], addr, u.path, body)
             self._send(200, ctype, out)
@@ -3144,8 +3145,8 @@ def clone(src, new):
     m.pop("networks", None)  # each NIC's MAC is per VM: attach the clone again
     if m.get("cloud"):
         cloud_seed(new, m)
-    if m.get("template"):  # its own name, account and ready file at its first start
-        node_seed(new, m)
+    if m.get("template"):  # its own name, account, host keys, ids and ready file at its first start
+        node_seed(new, m, fresh=True)
     if m.get("os") in GUEST_TOOLS_OS and not m.get("sandbox"):  # renamed at its first start (sandbox: no agent)
         m["rename"] = computer_name(new)
     save(new, m)
@@ -3960,25 +3961,33 @@ def _in_use_now(image):
     return image
 
 
-def _gc_cloud_images(keep):
-    """Older cloud images no VM disk (or base) is built on any more: ~350 MB each, and Debian's latest changes often.
-    Not one handed out in the last 10 minutes (its VM's disk may not exist yet), and nothing when a disk's backing
-    cannot be read (an image in use would look free)."""
-    folder = os.path.dirname(keep)
+def _used_backings():
+    """The files some VM disk or clone base is built on (normalised paths); None when a disk cannot be read: an
+    image in use would look free."""
     disks = [os.path.join(STORE, n, "disk.qcow2") for n in os.listdir(STORE)]
-    if os.path.isdir(os.path.join(STORE, ".bases")):
+    if os.path.isdir(os.path.join(STORE, ".bases")):  # a clone's source moved its disk there: the template's user
         disks += [os.path.join(STORE, ".bases", f) for f in os.listdir(os.path.join(STORE, ".bases"))]
     used = set()
     for disk in filter(os.path.isfile, disks):
         r = subprocess.run([qemu_bin("qemu-img"), "info", "-U", "--output=json", disk], capture_output=True, text=True)
         if r.returncode:
-            return
+            return None
         try:
             backing = json.loads(r.stdout).get("backing-filename")
         except ValueError:
-            return
+            return None
         if backing:
             used.add(os.path.normcase(os.path.abspath(backing)))
+    return used
+
+
+def _gc_cloud_images(keep):
+    """Older cloud images no VM disk (or base) is built on any more: ~350 MB each, and Debian's latest changes often.
+    Not one handed out in the last 10 minutes (its VM's disk may not exist yet), and nothing when a disk's backing
+    cannot be read (an image in use would look free)."""
+    folder, used = os.path.dirname(keep), _used_backings()
+    if used is None:
+        return
     for f in os.listdir(folder):
         path = os.path.normcase(os.path.abspath(os.path.join(folder, f)))
         if (f.startswith(("debian-13-genericcloud", "generic_alpine-")) and f.endswith(".qcow2")
@@ -4061,21 +4070,31 @@ def node_template(kind):
     base = cloud_image(kind)
     folder = os.path.dirname(base)
     dest = os.path.join(folder, f"node-{os.path.basename(base)[:-6]}-t{NODE_TEMPLATE_V}.qcow2")
-    lock, end = dest + ".lock", time.monotonic() + 1200
+    lock, end = dest + ".lock", time.monotonic() + 3600  # longer than the slowest build (setup 15 min and more)
     while True:  # one build at a time: two node add at once wait for the same template
         if os.path.exists(dest):
             return _in_use_now(dest)
         try:
             os.mkdir(lock)
+            with open(os.path.join(lock, "pid"), "w") as f:
+                f.write(str(os.getpid()))
             break
         except FileExistsError:
-            with contextlib.suppress(OSError):
-                if time.time() - os.path.getmtime(lock) > 1800:  # left by a killed build
-                    os.rmdir(lock)
-                    continue
+            if not _builder_alive(lock):  # its build was killed (or the host restarted): take over
+                stale = f"{lock}.{os.getpid()}.stale"
+                with contextlib.suppress(OSError):
+                    os.rename(lock, stale)  # of two seeing it dead, one claims it
+                    shutil.rmtree(stale, ignore_errors=True)
+                continue
             if time.monotonic() > end:
                 raise SystemExit(f"another command is still building the {kind} node template; try again")
             time.sleep(1)
+    for n in machines():  # left by a killed build of this kind (the lock was free: no build of it runs)
+        if n.startswith(f"tmpl-{kind}-"):
+            with contextlib.suppress(OSError, SystemExit), captured(io.StringIO()):
+                if state(n) != "stopped":
+                    stop(n, force=True)
+                rm(n)
     tmp = f"tmpl-{kind}-{secrets.token_hex(3)}"
     try:
         if os.path.exists(dest):
@@ -4083,7 +4102,7 @@ def node_template(kind):
         print(f"building the {kind} node template once (about 2 min, needs the internet)", file=sys.stderr)
         with captured(io.StringIO()):
             create(tmp, None, image=kind, node=True, cpus=min(2, os.cpu_count()), memory=1, max_memory=1, disk=4,
-                   template=False)  # 1 GiB and no balloon headroom: a build, not a VM to grow
+                   template=False, base_image=base)  # 1 GiB, no balloon headroom; the image dest names
             start(tmp, set_want=False)
         ready, end = load(tmp)["ready_file"], time.monotonic() + 900
         while True:
@@ -4115,23 +4134,49 @@ def node_template(kind):
                 if state(tmp) != "stopped":
                     stop(tmp, force=True)
                 rm(tmp)
-        with contextlib.suppress(OSError):
-            for f in os.listdir(folder):
-                if f.startswith(os.path.basename(dest) + ".") and f.endswith(".part"):
+        for f in os.listdir(folder):
+            if f.startswith(os.path.basename(dest) + ".") and f.endswith(".part"):
+                with contextlib.suppress(OSError):
+                    os.chmod(os.path.join(folder, f), 0o600)  # read-only: Windows refuses to remove it
                     os.remove(os.path.join(folder, f))
-            os.rmdir(lock)
+        shutil.rmtree(lock, ignore_errors=True)
+
+
+def _builder_alive(lock):
+    """Whether the process that holds a template build lock still runs (no pid yet: being taken, for a minute)."""
+    try:
+        with open(os.path.join(lock, "pid")) as f:
+            pid = int(f.read())
+    except FileNotFoundError:
+        try:
+            return time.time() - os.path.getmtime(lock) < 60
+        except OSError:
+            return False
+    except (OSError, ValueError):
+        return False
+    if WINDOWS:
+        return _proc_created(pid) is not None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # another user's process: alive
+        return True
+    return True
 
 
 def _gc_node_templates(keep):
-    """Older node templates of the same kind that no VM disk is built on any more."""
+    """Older node templates of the same kind that no VM disk or clone base is built on any more; not one handed out
+    in the last 10 minutes (a create or reset may be about to build on it), nothing when a disk cannot be read."""
     folder, kind = os.path.dirname(keep), os.path.basename(keep).split("-")[1]
     prefix = "node-debian-13-genericcloud" if kind == "debian" else "node-generic_alpine-"
-    used = {os.path.normcase(os.path.abspath(b)) for b in
-            map(_backing, filter(os.path.isfile, (os.path.join(STORE, n, "disk.qcow2") for n in machines()))) if b}
+    used = _used_backings()
+    if used is None:
+        return
     for f in os.listdir(folder):
         path = os.path.normcase(os.path.abspath(os.path.join(folder, f)))
         if f.startswith(prefix) and f.endswith(".qcow2") and path != os.path.normcase(os.path.abspath(keep)) \
-                and path not in used:
+                and path not in used and time.time() - os.path.getmtime(path) > 600:
             with contextlib.suppress(OSError):
                 os.chmod(path, 0o600)
                 os.remove(path)
@@ -4147,14 +4192,21 @@ def node_identity_script(name, m):
            f"id {user} >/dev/null 2>&1 || useradd -m -s /bin/bash {user}; "
            f"echo {shlex.quote(m['user'] + ' ALL=(ALL) NOPASSWD:ALL')} > /etc/sudoers.d/90-terminal-vm; "
            f"chmod 440 /etc/sudoers.d/90-terminal-vm")
+    # a clone's disk holds its source's host keys and ids: new ones, then the services that read them restarted
+    fresh = bool(m.get("fresh_ids"))
+    fresh_rm = ("rm -f /etc/ssh/ssh_host_* /var/lib/docker/engine-id; : > /etc/machine-id; "
+                "rm -f /var/lib/dbus/machine-id\n") if fresh else ""
+    fresh_restart = (("rc-service docker restart >/dev/null 2>&1 || true; rc-service sshd restart >/dev/null 2>&1 "
+                      "|| true\n") if alpine else "systemctl restart docker ssh >/dev/null 2>&1 || true\n") if fresh else ""
     return f"""set -e
 IFS= read -r pw  # on stdin: never in the guest's process list
 echo {host} > /etc/hostname; hostname {host}
-grep -q " {host}$" /etc/hosts || echo "127.0.1.1 {host}" >> /etc/hosts
+sed -i '/^127[.]0[.]1[.]1[[:space:]]/d' /etc/hosts; echo "127.0.1.1 {host}" >> /etc/hosts
 {add}
 printf '%s:%s\\n' {user} "$pw" | chpasswd
-[ -s /etc/machine-id ] || {{ command -v systemd-machine-id-setup >/dev/null && systemd-machine-id-setup >/dev/null; }} || true
+{fresh_rm}[ -s /etc/machine-id ] || {{ command -v systemd-machine-id-setup >/dev/null && systemd-machine-id-setup >/dev/null; }} || true
 ls /etc/ssh/ssh_host_*_key >/dev/null 2>&1 || ssh-keygen -A >/dev/null 2>&1 || true
+{fresh_restart}
 dev=$(awk '$2 == "/" {{print $1}}' /proc/mounts | tail -1); dev=$(readlink -f "$dev")
 case "$dev" in
   *[0-9]) disk=$(echo "$dev" | sed 's/p\\?[0-9]*$//'); [ -b "$disk" ] && [ "$disk" != "$dev" ] && \\
@@ -4175,10 +4227,15 @@ def node_identity(name, wait=600):
     while time.time() < end and state(name) != "stopped":
         m = load(name)
         try:
-            r = guest_exec(name, "/bin/sh", ["-c", node_identity_script(name, m)], 180,
-                           stdin=(m["password"] + "\n").encode())
+            with in_use(name):  # holds the agent's one connection: a use (no idle pause, no health miss)
+                r = guest_exec(name, "/bin/sh", ["-c", node_identity_script(name, m)], 180,
+                               stdin=(m["password"] + "\n").encode())
             if r["exit"] == 0:
-                m = load(name); m.pop("identity", None); save(name, m)
+                with vm_op(name):
+                    m = load(name)
+                    for k in ("identity", "fresh_ids"):
+                        m.pop(k, None)
+                    save(name, m)
                 return
             err = (r["stderr"] or r["stdout"])[-300:]
             if err != said:  # once per distinct failure (qemu.log), retried until wait
@@ -4187,15 +4244,19 @@ def node_identity(name, wait=600):
         except (OSError, ValueError, TypeError, KeyError):  # agent not up yet, or busy with another client
             pass
         time.sleep(1)
+    if state(name) != "stopped":  # never ready, and why: in the events, not only in qemu.log
+        event("identity_failed", name, said or f"guest agent silent for {wait} s")
 
 
-def node_seed(name, m):
+def node_seed(name, m, fresh=False):
     """A template node's own identity, set at its next start (node_identity): a new ready file (a clone's disk holds
     its source's)."""
     host = name.replace("_", "-").strip("-") or "vm"
     m["instance_id"] = f"{host}-{secrets.token_hex(4)}"
     m["ready_file"] = f"/var/lib/terminal-vm/ready-{m['instance_id']}"
     m["identity"] = True
+    if fresh:  # a clone: new host keys and ids too
+        m["fresh_ids"] = True
 
 
 def guest_tools():
