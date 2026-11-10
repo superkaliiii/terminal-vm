@@ -630,7 +630,13 @@ def png_size(data):
 
 def screenshot(name, q=None, file="screen.png"):
     path = os.path.join(vm_dir(name), file)
-    (q or qmp(name)).cmd("screendump", filename=path, format="png")  # QEMU's QMP socket takes one client at a time
+    own = q is None  # QEMU's QMP socket takes one client at a time: one opened here is closed here
+    q = q or qmp(name)
+    try:
+        q.cmd("screendump", filename=path, format="png")
+    finally:
+        if own:
+            q.close()
     with open(path, "rb") as f:
         data = f.read()
     return data, png_size(data)
@@ -3943,7 +3949,11 @@ def view(name, fps=30, read_only=False):
     layout, family = m.get("layout", "us"), PROFILES[m.get("os", "linux")]["family"]
     # own QMP monitor and capture file, so agents keep working while someone watches
     q, out = QMP(endpoint(name, "qmp-view")), sys.stdout.buffer
-    restore = raw_terminal()
+    try:
+        restore = raw_terminal()
+    except BaseException:  # no terminal to take over: give the monitor back at once
+        q.close()
+        raise
     keys = queue.Queue()  # a reader thread: select() does not take console handles on Windows
 
     def reader():
