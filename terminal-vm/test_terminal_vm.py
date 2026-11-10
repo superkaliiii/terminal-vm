@@ -1105,6 +1105,24 @@ class GuestAgent(unittest.TestCase):
                 tl.guest_exec("a", "hostname", [], timeout=0)
 
 
+class Doctor(unittest.TestCase):
+    """Phase 13.1: known problems with their fix, a masked report (VM passwords too)."""
+    def test_report_masks_and_checks_have_fixes(self):
+        tl.STORE = tempfile.mkdtemp()
+        os.makedirs(os.path.join(tl.STORE, "v"))
+        tl.save("v", {"cpus": 1, "memory_mb": 1024, "password": "Pw-secret-42"})
+        with open(os.path.join(tl.STORE, "events.log"), "w") as f:
+            f.write(json.dumps({"event": "created", "detail": "password Pw-secret-42 set"}) + "\n")
+        checks = tl.doctor_checks()
+        self.assertTrue(all({"check", "ok", "detail", "required"} <= set(c) for c in checks))
+        self.assertFalse([c for c in checks if c["ok"] and "fix" in c])
+        with open(tl.doctor_report(), encoding="utf-8") as f:
+            report = f.read()
+        self.assertNotIn("Pw-secret-42", report)
+        self.assertIn("== events.log", report)
+        self.assertNotIn(os.path.expanduser("~"), tl.mask(os.path.expanduser("~") + "/x token=abc"))
+
+
 class Supervision(unittest.TestCase):
     """The daemon's passes: restart with growing delays, guest agent health, idle pause and wake, events."""
     def setUp(self):

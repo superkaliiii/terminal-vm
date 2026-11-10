@@ -4518,43 +4518,165 @@ def up(name, iso=None, no_view=False, plan=False, **opts):
         print(json.dumps({"ready": name, "next": f"terminal-vm view {name}  (or: terminal-vm mcp {name})"}))
 
 
-def doctor():
+QEMU_PKGS = {"apt-get": "qemu-system-x86 qemu-utils", "dnf": "qemu-kvm qemu-img", "zypper": "qemu-x86 qemu-tools",
+             "pacman": "qemu-full", "apk": "qemu-system-x86_64 qemu-img", "brew": "qemu"}
+
+
+def _pkg(names=None, qemu=False):
+    """The command that installs these packages here (first package manager found), or None."""
+    for exe, cmd in (("apt-get", "sudo apt-get install -y"), ("dnf", "sudo dnf install -y"), ("zypper", "sudo zypper install -y"),
+                     ("pacman", "sudo pacman -S --noconfirm"), ("apk", "sudo apk add"), ("brew", "brew install")):
+        if shutil.which(exe):
+            return f"{cmd} {QEMU_PKGS[exe] if qemu else names}"
+    return None
+
+
+def _standby_minutes():
+    """Minutes before Windows sleeps on mains power (from WSL too), None when unknown or not Windows."""
+    exe = "powercfg" if WINDOWS else "powercfg.exe" if in_wsl() and shutil.which("powercfg.exe") else None
+    if not exe:
+        return None
+    with contextlib.suppress(OSError, subprocess.SubprocessError, ValueError):
+        out = subprocess.run([exe, "/query", "SCHEME_CURRENT", "SUB_SLEEP", "STANDBYIDLE"], capture_output=True,
+                             text=True, errors="replace", timeout=10).stdout  # an OEM code page
+        m = re.findall(r"0x([0-9a-fA-F]{8})", out)
+        return int(m[-2], 16) // 60 if len(m) >= 2 else None  # AC, then DC: seconds
+    return None
+
+
+def doctor_checks():
+    """Each known problem: {check, ok, detail, fix (the exact command), required}."""
     checks = []
-    def check(name, ok, detail, required=True):
-        checks.append({"check": name, "ok": bool(ok), "detail": detail, "required": required})
+    def check(name, ok, detail, fix=None, required=True):
+        checks.append({"check": name, "ok": bool(ok), "detail": detail, **({"fix": fix} if fix and not ok else {}),
+                       "required": required})
     def found(tool):
         try:
             return qemu_bin(tool)
         except SystemExit:
             return None
     qemu, img = found("qemu-system-x86_64"), found("qemu-img")
-    ver = subprocess.run([qemu, "--version"], capture_output=True, text=True).stdout.split("\n")[0] if qemu else ""
-    num = tuple(int(x) for x in re.search(r"(\d+)\.(\d+)", ver).groups()) if ver else (0, 0)
-    install = "winget install SoftwareFreedomConservancy.QEMU" if WINDOWS else "apt install qemu-system-x86 qemu-utils"
-    check("qemu", num >= ((7, 2) if WINDOWS else (7, 1)), ver or f"qemu-system-x86_64 not found ({install})")  # 7.2: unix sockets on Windows
-    check("qemu-img", img, img or install)
+    ver = ""
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        ver = subprocess.run([qemu, "--version"], capture_output=True, text=True, timeout=20).stdout.split("\n")[0] if qemu else ""
+    m = re.search(r"(\d+)\.(\d+)", ver)
+    num = tuple(int(x) for x in m.groups()) if m else (0, 0)
+    install = "winget install SoftwareFreedomConservancy.QEMU" if WINDOWS else _pkg(qemu=True) or "install QEMU"
+    check("qemu", num >= ((7, 2) if WINDOWS else (7, 1)), ver or "qemu-system-x86_64 not found", install)  # 7.2: unix sockets on Windows
+    check("qemu-img", img, img or "qemu-img not found", install)
     if WINDOWS:
-        probe = subprocess.run(["powershell", "-NoProfile", "-Command",
-                                "(Get-CimInstance Win32_OptionalFeature -Filter \"Name='HypervisorPlatform'\").InstallState"],
-                               capture_output=True, text=True).stdout.strip()
+        probe = ""
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            probe = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                    "(Get-CimInstance Win32_OptionalFeature -Filter \"Name='HypervisorPlatform'\").InstallState"],
+                                   capture_output=True, text=True, timeout=30).stdout.strip()
         check("whpx", probe == "1", "Windows Hypervisor Platform enabled" if probe == "1" else
-              "disabled: VMs run very slowly. As administrator: Enable-WindowsOptionalFeature -Online "
-              "-FeatureName HypervisorPlatform, then restart", required=False)
-    else:
-        check("kvm", os.access("/dev/kvm", os.R_OK | os.W_OK),
-              "ok" if os.access("/dev/kvm", os.R_OK | os.W_OK) else "no access to /dev/kvm: sudo usermod -aG kvm $USER, then log in again")
+              "disabled: VMs run very slowly", "as administrator: Enable-WindowsOptionalFeature -Online -FeatureName "
+              "HypervisorPlatform, then restart", required=False)
+    elif not MAC:
+        kvm = os.access("/dev/kvm", os.R_OK | os.W_OK)
+        check("kvm", kvm, "ok" if kvm else "no access to /dev/kvm: VMs run very slowly" if os.path.exists("/dev/kvm")
+              else "no /dev/kvm (virtualization off in the firmware, or nested virtualization unavailable)",
+              "sudo usermod -aG kvm $USER   (then log out and in again)" if os.path.exists("/dev/kvm") else None)
         if in_wsl():
-            check("wsl", False, "WSL can stop this distribution when no WSL terminal is open, killing its VMs "
-                  "mid-install: keep one open (wsl -d <distro> -- sleep infinity)", required=False)
-    check("python", sys.version_info >= (3, 8), sys.version.split()[0])
+            check("wsl", False, "WSL stops this distribution when no Windows program uses it, killing its VMs",
+                  "terminal-vm autostart on   (a logon task keeps it running while VMs run)", required=False)
+    check("python", sys.version_info >= (3, 8), sys.version.split()[0], _pkg("python3"))
+    standby = _standby_minutes()
+    if standby is not None:
+        check("sleep", standby == 0, "this PC never sleeps on mains power" if standby == 0 else
+              f"this PC sleeps after {standby} min idle on mains power: running VMs pause with it",
+              "powercfg /change standby-timeout-ac 0", required=False)
+    with contextlib.suppress(OSError):
+        os.makedirs(STORE, exist_ok=True)
+        free = shutil.disk_usage(STORE).free / 2 ** 30
+        if in_wsl() and os.path.isdir("/mnt/c"):  # WSL's disk reports its maximum size; it really grows on C:
+            free = min(free, shutil.disk_usage("/mnt/c").free / 2 ** 30)
+        check("disk", free >= 20, f"{free:.0f} GiB free for VM disks and images", "free some space, or set "
+              "TERMINAL_VM_HOME to a larger drive", required=False)
+    ossl = shutil.which("openssl")
+    check("openssl", ossl, ossl or "not found (web --listen makes its certificate with it)",
+          "winget install ShiningLight.OpenSSL.Light" if WINDOWS else _pkg("openssl"), required=False)
     viewer = next((e for e, _ in VIEWERS if shutil.which(e)), None)
-    check("window viewer", viewer, viewer or ("optional: winget install TigerVNC.TigerVNC" if WINDOWS
-                                              else "optional: apt install tigervnc-viewer"), required=False)
+    check("window viewer", viewer, viewer or "show NAME opens a VM in a window with TigerVNC's viewer",
+          "winget install TigerVNC.TigerVNC" if WINDOWS else "brew install --cask tigervnc-viewer" if MAC
+          else _pkg("tigervnc-viewer"), required=False)
     if MAC:
         check("terminal-mac", mac_bin(), mac_bin() or "for macOS guests: install terminal-mac", required=False)
     check("terminal graphics", graphics(), f"{graphics()} images in this terminal" if graphics()
-          else "optional: run view in Windows Terminal, Kitty, Ghostty, WezTerm or foot", required=False)
-    print(json.dumps(checks, indent=1))
+          else "view shows VMs in Windows Terminal, Kitty, Ghostty, WezTerm or foot", required=False)
+    ct = ct_cli()
+    check("terminal-ct", ct, " ".join(ct) if ct else "not found: its containers on the dashboard and in infra need it",
+          "install terminal-ct (its install.sh)", required=False)
+    claude = shutil.which("claude")
+    check("claude", claude, claude or "Claude Code not found: declare the MCP server in your agent's own way",
+          required=False)
+    return checks
+
+
+_SECRET = re.compile(r"(?i)(token|password|passwd|secret|key)([\"']?\s*[:=]\s*[\"']?)[^\s\"',}]+")
+
+
+def known_secrets():
+    """The secrets this store holds (dashboard token, VM passwords): hidden wherever they show."""
+    out = []
+    with contextlib.suppress(OSError):
+        with open(os.path.join(STORE, "web.token"), encoding="utf-8") as f:
+            out.append(f.read().strip())
+    for n in machines():
+        with contextlib.suppress(Exception):
+            out.append(load(n).get("password") or "")
+    return [x for x in out if len(x) >= 6]
+
+
+def mask(text, secrets=()):
+    """A report safe to attach to a ticket: known secrets, values after token=/password=..., the home folder, user
+    and host names."""
+    import getpass
+    for x in secrets:
+        text = text.replace(x, "<hidden>")
+    text = _SECRET.sub(lambda m: m.group(1) + m.group(2) + "<hidden>", text)
+    for real, alias in ((os.path.expanduser("~"), "~"), (platform.node(), "<host>")):
+        if real and len(real) > 1:
+            text = text.replace(real, alias)
+    with contextlib.suppress(Exception):
+        me = getpass.getuser()
+        if len(me) > 2:
+            text = re.sub(rf"\b{re.escape(me)}\b", "<user>", text)
+    return text
+
+
+def doctor_report():
+    """doctor --report: versions, checks, VMs, quota and the end of the logs, masked; written to a file to attach."""
+    parts = [f"terminal-vm {VERSION}", f"python {sys.version.split()[0]} on {platform.platform()}"
+             + (" (WSL)" if in_wsl() else ""), "", "== checks", json.dumps(doctor_checks(), indent=1)]
+    with contextlib.suppress(Exception):
+        parts += ["", "== VMs", json.dumps([{k: v.get(k) for k in ("name", "os", "status", "cpus", "memory_gb")}
+                                            for v in vm_list()], indent=1)]
+    with contextlib.suppress(Exception):
+        parts += ["", "== quota", json.dumps(quota(), indent=1)]
+    for name in ("events.log", "daemon.log", os.path.join(WEB_DIR, "actions.log")):
+        with contextlib.suppress(OSError):
+            with open(os.path.join(STORE, name), encoding="utf-8", errors="replace") as f:
+                parts += ["", f"== {name} (last 60 lines)", "".join(collections.deque(f, 60)).rstrip()]
+    os.makedirs(STORE, exist_ok=True)
+    path = os.path.join(STORE, f"report-{time.strftime('%Y%m%d-%H%M%S')}.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(mask("\n".join(parts), known_secrets()) + "\n")
+    return path
+
+
+def doctor(as_json=False, report=False):
+    if report:
+        return print(f"report written (secrets, home folder, user and host names masked; read it before sending): "
+                     f"{doctor_report()}")
+    checks = doctor_checks()
+    if as_json:
+        print(json.dumps(checks, indent=1))
+    else:
+        for c in checks:
+            mark = "ok " if c["ok"] else "ERR" if c["required"] else " - "
+            print(f"[{mark}] {c['check']:<17} {c['detail']}" + (f"\n      fix: {c['fix']}" if c.get("fix") else ""))
     if not all(c["ok"] for c in checks if c["required"]):
         sys.exit(1)
 
@@ -5142,7 +5264,9 @@ def main(argv=None):
     pj.add_argument("args", nargs="*")
     for n in ("view", "show"):
         v = sub.add_parser(n); v.add_argument("name"); v.add_argument("--read-only", action="store_true")
-    sub.add_parser("ls"); sub.add_parser("doctor"); sub.add_parser("help"); sub.add_parser("version")
+    sub.add_parser("ls"); sub.add_parser("help"); sub.add_parser("version")
+    dr = sub.add_parser("doctor", help="known problems and their fix; --report: a masked report to attach to a ticket")
+    dr.add_argument("--json", action="store_true"); dr.add_argument("--report", action="store_true")
     inf = sub.add_parser("infra", help="the map: quota, VMs, networks and addresses, projects (and terminal-ct's)")
     inf.add_argument("--project"); inf.add_argument("--json", action="store_true")
     cl = sub.add_parser("clone"); cl.add_argument("src"); cl.add_argument("new")
@@ -5233,7 +5357,7 @@ def main(argv=None):
             if not o.json and hasattr(sys.stdout, "reconfigure"):
                 sys.stdout.reconfigure(errors="replace")  # a description in a script the console cannot show
             return print(json.dumps(m, indent=1) if o.json else infra_text(m))
-        if o.cmd == "doctor": return doctor()
+        if o.cmd == "doctor": return doctor(o.json, o.report)
         if o.cmd == "help": return p.print_help()
         if o.cmd == "version": return print(f"terminal-vm {VERSION}")
         if o.cmd == "rm": return rm(o.name)
