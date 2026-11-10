@@ -46,8 +46,26 @@ For Linux and Windows guests, the host drives QEMU over QMP (only the optional g
 
 ## Install and run
 
+Linux, macOS and WSL:
+
 ```sh
-sh install.sh            # ~/.local/bin/terminal-vm, no root; runs `doctor`
+curl -fsSL https://raw.githubusercontent.com/superkaliiii/terminal-mac-inspection/unified/terminal-vm/install.sh | sh
+```
+
+Windows:
+
+```powershell
+irm https://raw.githubusercontent.com/superkaliiii/terminal-mac-inspection/unified/terminal-vm/install.ps1 | iex
+```
+
+One command does it all: what is missing (Python, QEMU, KVM access; on Windows QEMU and the Windows Hypervisor
+Platform) after one confirmation, `terminal-vm` on the PATH, and, when Claude Code is installed, its MCP server and
+skill. Options: `--yes`, `--no-deps`, `--no-mcp`, `--update`, `--uninstall` (VMs stay); on Windows `-Yes`, ... or
+`TERMINAL_VM_INSTALL="-Yes"` before `irm`. Other ways: `pipx install terminal-vm` / `uvx terminal-vm`,
+`npm i -g terminal-vm`, `.deb` and `.rpm` (`packaging/build.sh`), Homebrew (from the first public release).
+`terminal-vm doctor` gives the fix for each known problem; `doctor --report` writes a masked report for an issue.
+
+```sh
 terminal-vm up        # downloads Debian live XFCE (SHA-256 verified), creates, boots, opens the viewer
 ```
 
@@ -55,8 +73,10 @@ terminal-vm up        # downloads Debian live XFCE (SHA-256 verified), creates, 
 
 ## Use with agents
 
+The installer declares the MCP server and skill for Claude Code when it is there. By hand, or for another client:
+
 ```sh
-claude mcp add terminal-vm -- terminal-vm mcp default
+claude mcp add -s user terminal-vm -- terminal-vm mcp default
 terminal-vm skills install            # ~/.claude/skills/terminal-vm/SKILL.md
 ```
 
