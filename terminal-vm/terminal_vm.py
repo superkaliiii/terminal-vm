@@ -2477,7 +2477,8 @@ function renderCts(d) {
         r.flags.includes("D") && run ? shotButton("ct", r.name) : null,
         button("rm", {op: "rm", name: r.name}, "Remove " + r.name + " and its /data?" + (r.stack ? " (a stack replica: the daemon makes it again, with an empty /data)" : ""), "danger")]);
     tb.append(keyed(r.name, {acts}, h("td", null, h("b", {textContent: r.name}),
-      r.node ? h("span", {className: "mute", textContent: " @" + r.node, title: "in node " + r.node}) : null), h("td", {className: r.status, textContent: r.status}),
+      r.node ? h("span", {className: "mute", textContent: " @" + r.node, title: "in node " + r.node}) : null,
+      r.description ? h("div", {className: "mute", textContent: r.description}) : null), h("td", {className: r.status, textContent: r.status}),
       h("td", {className: r.health.split(" ")[0], textContent: r.health}), h("td", {textContent: r.project}), h("td", {textContent: r.stack || "-"}),
       h("td", null, spark(hh.cpu, Math.max(100, cpuMax), css("--cpu")), r.cpu_percent == null ? "-" : r.cpu_percent + "%"),
       h("td", null, spark(hh.mem, memMax, css("--mem")), (r.used_memory_gb == null ? "-" : r.used_memory_gb) + " / " + (r.memory_gb || "-") + " GiB"),
@@ -2537,7 +2538,8 @@ function renderVms(v) {
       m.engine ? null : run ? button("stop", {kind: "vm", op: "stop", name: m.name}, "Stop VM " + m.name + "?")
         : button("start", {kind: "vm", op: "start", name: m.name}), run ? shotButton("vm", m.name) : null,
       run && !m.engine ? button("force stop", {kind: "vm", op: "force_stop", name: m.name}, "Power off VM " + m.name + " at once (like pulling the plug)?", "danger") : null]);
-    tb.append(keyed(m.name, {acts}, h("td", null, h("b", {textContent: m.name})), h("td", {textContent: m.os || "-"}),
+    tb.append(keyed(m.name, {acts}, h("td", null, h("b", {textContent: m.name}),
+      m.description ? h("div", {className: "mute", textContent: m.description}) : null), h("td", {textContent: m.os || "-"}),
       h("td", {className: run ? "running" : "exited", textContent: m.status || "-"}), h("td", {textContent: m.project || "-"}),
       h("td", {textContent: m.cpu_percent == null ? "-" : m.cpu_percent + "%"}),
       h("td", {textContent: (m.host_memory_gb == null ? "-" : m.host_memory_gb) + " / " + (m.memory_gb || "-") + " GiB"}),
@@ -2678,11 +2680,13 @@ def net_rm(net):
         raise SystemExit(f"network {net!r} still has VMs: " + ", ".join(n for n, _ in net_members(net))
                          + f"; detach them first: terminal-vm net detach VM {net}")
     os.unlink(net_file(net))
+    set_description("net", net, "")
     return {"removed": net}
 
 
 def net_ls():
-    return [dict(net_load(n), vms=[{"vm": v, **a} for v, a in net_members(n)]) for n in networks()]
+    return [dict(net_load(n), vms=[{"vm": v, **a} for v, a in net_members(n)],
+                 **({"description": t} if (t := description("net", n)) else {})) for n in networks()]
 
 
 def net_attach(name, net, attach=True):
@@ -2961,7 +2965,8 @@ def vm_list():
                 out.append({"name": n, "os": m.get("os", "linux"), "status": state(n), "project": project_of(m),
                             "cpus": m["cpus"], "memory_gb": m["memory_mb"] // 1024,
                             "display": f"{m.get('width', 1280)}x{m.get('height', 800)}", "layout": m.get("layout", "us"),
-                            **({"base": m["base"]} if m.get("base") else {}), **({"sandbox": True} if m.get("sandbox") else {})})
+                            **({"base": m["base"]} if m.get("base") else {}), **({"sandbox": True} if m.get("sandbox") else {}),
+                            **({"description": t} if (t := description("vm", n)) else {})})
     return out
 
 
@@ -3059,11 +3064,75 @@ def project_status(project=None, log_lines=30):
         with open(os.path.join(d, AGENT_LOG), encoding="utf-8") as f:
             log = [json.loads(l) for l in collections.deque(f, log_lines) if l.strip()]
     vms = [dict(v, want=wanted(v["name"])) for v in quiet(ls) if v.get("engine") is None and under(v["project"], project)]
-    return {"project": project, "vms": vms,
+    return {"project": project, **({"description": t} if (t := description("project", project)) else {}), "vms": vms,
             "networks": [dict(n, vms=[v for v in n["vms"] if under(project_of(load(v["vm"])), project)])
                          for n in net_ls() if under(n.get("project", "default"), project)],
             "sub_projects": sorted(p["project"] for p in projects() if p["project"].startswith(project + "/")),
             "notes": notes, "recent_actions": log}
+
+
+# ---------- descriptions (phase 12) ----------
+# One line on each VM, network and project (what it is for, who uses it), so an agent arriving knows who does what.
+# One central file (terminal-ct keeps the same for its objects): changeable at any time, never inherited by a clone.
+DESC_MAX = 200
+DESC_KINDS = ("vm", "net", "project")
+_DESC = {}  # (path, mtime, size) -> its content: read once per change, not once per VM listed
+
+
+def check_description(text):
+    if not isinstance(text, str) or len(text) > DESC_MAX or not text.isprintable():
+        raise SystemExit(f"a description is one line of at most {DESC_MAX} printable characters")
+    return text.strip()
+
+
+def descriptions():
+    """{"KIND:NAME": text}."""
+    path = os.path.join(STORE, "descriptions.json")
+    try:
+        st = os.stat(path)
+        key = (path, st.st_mtime_ns, st.st_size)
+        if key not in _DESC:
+            with open(path, encoding="utf-8") as f:
+                d = json.load(f)
+            _DESC.clear()
+            _DESC[key] = d if isinstance(d, dict) else {}
+        return _DESC[key]
+    except (OSError, ValueError):
+        return {}
+
+
+def description(kind, name):
+    return descriptions().get(f"{kind}:{name}", "")
+
+
+def set_description(kind, name, text):
+    """Set NAME's description; "" clears it. No check that NAME exists (describe does): rm uses it to forget."""
+    text = check_description(text)
+    with quota_lock():
+        d = dict(descriptions())
+        if text:
+            d[f"{kind}:{name}"] = text
+        elif d.pop(f"{kind}:{name}", None) is None:
+            return {kind: name, "description": ""}
+        path = os.path.join(STORE, "descriptions.json")
+        with open(path + ".new", "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=1, ensure_ascii=False)
+        os.replace(path + ".new", path)
+        _DESC.clear()  # same size within one clock tick would look unchanged
+    return {kind: name, "description": text}
+
+
+def describe(kind, name, text):
+    """describe KIND NAME TEXT: the VM or network must exist (a project only needs a valid name)."""
+    if kind not in DESC_KINDS:
+        raise SystemExit(f"describe one of: {', '.join(DESC_KINDS)}")
+    if kind == "project":
+        check_project(name)
+    elif kind == "net":
+        net_load(name)
+    elif name not in machines():
+        raise SystemExit(f"no VM named {name!r} (terminal-vm ls)")
+    return set_description(kind, name, text)
 
 
 def notes_write(project, text, mode="append"):
@@ -3178,6 +3247,7 @@ def clone(src, new):
 def rm(name):
     _stopped(name)
     shutil.rmtree(vm_dir(name))  # its network memberships go with its machine.json
+    set_description("vm", name, "")  # a new VM of this name says nothing it did not say itself
     _gc_bases()
     print(json.dumps({"removed": name}))
 
@@ -4525,6 +4595,34 @@ def scoped_quota(project):
             for k, v in q.items()}
 
 
+def agent_describe(kind, name, text, approve, project=None):
+    """describe through MCP: free on the agent's own VMs and networks and on its server's project (and below); the
+    user's need their approval. Outside the agent's project: not found."""
+    text = check_description(text)
+    if not isinstance(name, str) or kind not in DESC_KINDS:
+        raise SystemExit(f"kind is one of {', '.join(DESC_KINDS)}, and name a string")
+    cli = f"terminal-vm describe {kind} {shlex.quote(name)} " + (shlex.quote(text) if text else "--clear")
+    ask = lambda what: approve(f"Let the agent describe {what} as: {text!r}?" if text else
+                               f"Let the agent clear the description of {what}?", cli)
+    if kind == "vm":
+        if name not in machines():
+            raise SystemExit(f"no VM named {name!r}; create it with: terminal-vm up {name}")
+        in_scope(name, project)
+        if not agent_owned(name):
+            ask(f"your VM {name}")
+    elif kind == "net":
+        if name not in networks() or not under(net_load(name).get("project", "default"), project):
+            raise SystemExit(f"no network named {name!r}; create it with: terminal-vm net create {name}")
+        if not _net_owned(name):
+            ask(f"your network {name}")
+    else:
+        if not under(check_project(name), project):
+            raise SystemExit(f"project {name!r} is not this agent's project {project!r} or below it")
+        if not project:
+            ask(f"the project {name}")
+    return describe(kind, name, text)
+
+
 def agent_call(tool, a, approve, project=None):
     """project: the server's own (--project); then nothing outside it is visible or reachable."""
     vm, net = a.get("vm"), a.get("net")
@@ -4569,6 +4667,9 @@ def agent_call(tool, a, approve, project=None):
                      "the PC (a task at your logon)?") if a["on"] else "Stop restarting VMs after a restart of the PC?",
                     f"terminal-vm autostart {'on' if a['on'] else 'off'}")
         return autostart(a.get("on"))
+    if tool == "describe":
+        return agent_describe(a.get("kind"), a.get("name"), a.get("description", ""), approve, project)
+    desc = check_description(a.get("description") or "") if tool in ("vm_create", "vm_clone", "net_create") else ""
     if tool in ("vm_create", "vm_clone", "net_create"):
         taken = (a.get("new") if tool == "vm_clone" else vm) if tool != "net_create" else None
         if taken is not None and os.path.exists(os.path.join(vm_dir(taken), "machine.json")) or \
@@ -4593,6 +4694,8 @@ def agent_call(tool, a, approve, project=None):
         out = quiet(create, vm, iso, os_name, a.get("cpus"), a.get("memory_gb"), a.get("disk_gb"),
                     offline=not sandbox, sandbox=sandbox, max_cpus=a.get("max_cpus"), max_memory=mm, project=where)
         m = load(vm); m["created_by"] = "agent"; save(vm, m)
+        if desc:
+            set_description("vm", vm, desc)
         return out
     if tool == "vm_clone":
         src = load(vm)
@@ -4607,6 +4710,8 @@ def agent_call(tool, a, approve, project=None):
         if users and not m.get("sandbox"):
             m["offline"] = True  # internet stays the user's call (vm_internet)
         save(a["new"], m)
+        if desc:
+            set_description("vm", a["new"], desc)
         return out
     if tool == "net_list":
         return [dict(n, vms=[v for v in n["vms"] if under(project_of(load(v["vm"])), project)])
@@ -4615,6 +4720,8 @@ def agent_call(tool, a, approve, project=None):
         cfg = net_create(net, where)
         with open(net_file(net), "w") as f:
             json.dump(dict(cfg, created_by="agent"), f)
+        if desc:
+            set_description("net", net, desc)
         return cfg
     if tool == "net_remove":
         if not _net_owned(net):
@@ -4688,6 +4795,7 @@ TOOLS = [
 INPUT_TOOLS = {"click", "move", "drag", "scroll", "type", "key"}
 _VM, _NET = {"vm": {"type": "string"}}, {"net": {"type": "string"}}
 _MANAGED = " Agents manage sandboxed VMs and the VMs they created; the user's other VMs are off-limits."
+_DESC_ARG = {"description": {"type": "string", "description": "what it is for, one line (who uses it, its role)"}}
 AGENT_TOOLS = [
     ("vm_list", "Every VM with its state; managed=true marks the ones this agent may run." + _MANAGED, _schema({})),
     ("vm_create", "Create a VM, sandboxed by default (no network, disk reset at each stop). It installs at first "
@@ -4698,9 +4806,9 @@ AGENT_TOOLS = [
      _schema({**_VM, "os": {"type": "string", "enum": sorted(PROFILES)}, "cpus": {"type": "integer", "minimum": 1},
               "max_cpus": {"type": "integer", "minimum": 1}, "max_memory_gb": {"type": "integer", "minimum": 1},
               "memory_gb": {"type": "integer", "minimum": 1}, "disk_gb": {"type": "integer", "minimum": 4},
-              "sandbox": {"type": "boolean"}, "iso": {"type": "string"}}, ["vm"])),
+              "sandbox": {"type": "boolean"}, "iso": {"type": "string"}, **_DESC_ARG}, ["vm"])),
     ("vm_clone", "Copy-on-write clone of a stopped VM, in seconds (install once, clone many). Both stay usable. Cloning one of the user's VMs needs their approval; the clone starts offline.",
-     _schema({**_VM, "new": {"type": "string"}}, ["vm", "new"])),
+     _schema({**_VM, "new": {"type": "string"}, **_DESC_ARG}, ["vm", "new"])),
     ("vm_start", "Start a managed VM, within the host quota." + _MANAGED, _schema(_VM, ["vm"])),
     ("vm_stop", "Shut a managed VM down (force: power off at once).",
      _schema({**_VM, "force": {"type": "boolean"}, "timeout": {"type": "integer"}}, ["vm"])),
@@ -4715,7 +4823,13 @@ AGENT_TOOLS = [
     ("vm_internet", "Show (without on) or change a stopped managed VM's internet access; turning it on needs the "
                     "user's approval.", _schema({**_VM, "on": {"type": "boolean"}}, ["vm"])),
     ("net_list", "Isolated networks and their VMs (MAC, suggested static address).", _schema({})),
-    ("net_create", "Create an isolated VM-to-VM network (no LAN, no internet, no DHCP).", _schema(_NET, ["net"])),
+    ("net_create", "Create an isolated VM-to-VM network (no LAN, no internet, no DHCP).",
+     _schema({**_NET, **_DESC_ARG}, ["net"])),
+    ("describe", "Set what an object is for, in one line (at most 200 characters; \"\" clears it), so the next agent "
+                 "knows who does what: a VM, a network or a project. Free on the agent's own VMs and networks (and "
+                 "its own project); the user's need their approval.",
+     _schema({"kind": {"type": "string", "enum": list(DESC_KINDS)}, "name": {"type": "string"},
+              "description": {"type": "string"}}, ["kind", "name", "description"])),
     ("net_remove", "Remove an empty network this agent created.", _schema(_NET, ["net"])),
     ("net_attach", "Plug a stopped managed VM into a network; set the suggested address in the guest. A network "
                    "the user created needs their approval.", _schema({**_VM, **_NET}, ["vm", "net"])),
@@ -4911,6 +5025,7 @@ def main(argv=None):
     c = sub.add_parser("create"); c.add_argument("name"); c.add_argument("--iso"); sizes(c)
     c.add_argument("--image", choices=["debian", "alpine"], help="an official cloud image instead of an ISO")
     c.add_argument("--node", action="store_true", help="with --image: Docker and Python 3, a node for terminal-ct")
+    c.add_argument("--description", help="what it is for (one line)")
     s = sub.add_parser("start"); s.add_argument("name"); s.add_argument("--window", action="store_true")
     t = sub.add_parser("stop"); t.add_argument("name"); t.add_argument("--force", action="store_true")
     t.add_argument("--timeout", type=int, default=60)
@@ -4925,6 +5040,10 @@ def main(argv=None):
         v = sub.add_parser(n); v.add_argument("name"); v.add_argument("--read-only", action="store_true")
     sub.add_parser("ls"); sub.add_parser("doctor"); sub.add_parser("help"); sub.add_parser("version")
     cl = sub.add_parser("clone"); cl.add_argument("src"); cl.add_argument("new")
+    cl.add_argument("--description", help="what the new one is for (one line)")
+    ds = sub.add_parser("describe", help="KIND NAME [TEXT]: one line on what it is for (no TEXT: show it)")
+    ds.add_argument("desc_kind", choices=DESC_KINDS); ds.add_argument("desc_name")
+    ds.add_argument("desc_text", nargs="?"); ds.add_argument("--clear", action="store_true")
     sn = sub.add_parser("snapshot"); sn.add_argument("name"); sn.add_argument("snap_cmd", choices=["save", "load", "rm", "ls"])
     sn.add_argument("tag", nargs="?")
     di = sub.add_parser("display"); di.add_argument("name")
@@ -4960,6 +5079,7 @@ def main(argv=None):
     ne = sub.add_parser("net"); nsub = ne.add_subparsers(dest="net_cmd", required=True)
     nsub.add_parser("create").add_argument("net"); nsub.add_parser("rm").add_argument("net")
     nsub.choices["create"].add_argument("--project")
+    nsub.choices["create"].add_argument("--description", help="what it is for (one line)")
     nsub.add_parser("ls")
     for c in ("attach", "detach"):
         x = nsub.add_parser(c); x.add_argument("name"); x.add_argument("net")
@@ -4973,14 +5093,19 @@ def main(argv=None):
     rs.add_argument("--max-cpus", type=int, help="new ceiling (stopped VM)")
     rs.add_argument("--max-memory", type=int, help="new ceiling in GiB (stopped VM)")
     o = p.parse_args(argv)
+    if getattr(o, "description", None) is not None:  # refused before anything is made
+        o.description = check_description(o.description)
+    described = lambda kind, name: set_description(kind, name, o.description) if getattr(o, "description", None) else None
 
     opts = ({k: getattr(o, k) for k in ("os_name", "cpus", "memory", "disk", "width", "height", "layout", "offline", "product_key", "ui_language", "sandbox", "max_cpus", "max_memory", "project")}
             if o.cmd in ("up", "create") else {})
     try:
         if o.cmd == "up": return up(o.name, o.iso, o.no_view, o.plan, **opts)
         if o.cmd == "create":
-            return create(o.name, None if o.image else o.iso or default_image(os_name=o.os_name), image=o.image,
-                          node=o.node, **opts)
+            r = create(o.name, None if o.image else o.iso or default_image(os_name=o.os_name), image=o.image,
+                       node=o.node, **opts)
+            described("vm", o.name)
+            return r
         if o.cmd == "start": return start(o.name, o.window)
         if o.cmd == "stop": return stop(o.name, o.force, o.timeout)
         if o.cmd == "resume" and not o.name: return resume_all(o.stay)
@@ -5002,7 +5127,14 @@ def main(argv=None):
         if o.cmd == "version": return print(f"terminal-vm {VERSION}")
         if o.cmd == "rm": return rm(o.name)
         if o.cmd == "reset": return reset(o.name)
-        if o.cmd == "clone": return clone(o.src, o.new)
+        if o.cmd == "clone":
+            r = clone(o.src, o.new)
+            described("vm", o.new)
+            return r
+        if o.cmd == "describe":
+            if o.desc_text is None and not o.clear:
+                return print(json.dumps({o.desc_kind: o.desc_name, "description": description(o.desc_kind, o.desc_name)}))
+            return print(json.dumps(describe(o.desc_kind, o.desc_name, "" if o.clear else o.desc_text)))
         if o.cmd == "snapshot": return snapshot(o.name, o.snap_cmd, o.tag)
         if o.cmd == "display": return display(o.name, o.width, o.height)
         if o.cmd == "layout": return set_layout(o.name, o.layout)
@@ -5035,6 +5167,10 @@ def main(argv=None):
             return
         if o.cmd == "internet": return print(json.dumps(set_internet(o.name, o.value)))
         if o.cmd == "net":
+            if o.net_cmd == "create":
+                r = net_create(o.net, o.project)
+                described("net", o.net)
+                return print(json.dumps(r, indent=1))
             return print(json.dumps(
                 net_create(o.net, o.project) if o.net_cmd == "create" else net_rm(o.net) if o.net_cmd == "rm" else
                 net_ls() if o.net_cmd == "ls" else net_attach(o.name, o.net, o.net_cmd == "attach"), indent=1))

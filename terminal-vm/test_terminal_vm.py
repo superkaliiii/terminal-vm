@@ -907,6 +907,33 @@ class StoppedVm(unittest.TestCase):
         self.assertEqual((entry["tool"], entry["arguments"]), ("click", {"x": 5, "y": 6}))
         self.assertIn("error", entry)
 
+    def test_descriptions(self):
+        """Phase 12: one line on each VM, network and project; the agent's own free, the user's with approval;
+        never inherited by a clone, forgotten with the object."""
+        asked = []
+        def yes(msg, cli): asked.append(cli)
+        def no(msg, cli): raise RuntimeError("declined: " + cli)
+        self.snaps = []
+        self.quiet(tl.main, ["describe", "vm", "v", "the docs build box"])
+        self.assertEqual({r["name"]: r.get("description") for r in tl.vm_list()}, {"v": "the docs build box"})
+        tl.agent_call("vm_clone", {"vm": "v", "new": "x", "description": "a throwaway copy"}, yes)
+        self.assertEqual(tl.description("vm", "x"), "a throwaway copy")    # its own, not v's
+        tl.agent_call("describe", {"kind": "vm", "name": "x", "description": "a test copy"}, no)
+        tl.agent_call("net_create", {"net": "lab", "description": "x and its peers"}, no)
+        self.assertEqual(tl.net_ls()[0]["description"], "x and its peers")
+        with self.assertRaisesRegex(RuntimeError, "terminal-vm describe vm v 'my box'"):
+            tl.agent_call("describe", {"kind": "vm", "name": "v", "description": "my box"}, no)
+        tl.agent_call("describe", {"kind": "project", "name": "default", "description": "docs"}, yes)
+        self.assertEqual(tl.project_status()["description"], "docs")
+        self.assertEqual(asked, ["terminal-vm clone v x", "terminal-vm describe project default docs"])
+        for bad in ("a\tb", "y" * 201):
+            with self.assertRaisesRegex(SystemExit, "one line of at most 200"):
+                tl.main(["describe", "vm", "v", bad])
+        with self.assertRaisesRegex(SystemExit, "no VM named 'nope'"):
+            tl.describe("vm", "nope", "z")
+        self.quiet(tl.rm, "x"); self.quiet(tl.main, ["net", "rm", "lab"])
+        self.assertEqual(tl.descriptions(), {"vm:v": "the docs build box", "project:default": "docs"})
+
     def test_agent_authority(self):
         """Agents run sandboxed VMs and their own; the user's VMs are off-limits; risky steps ask the user."""
         asked = []
@@ -1221,7 +1248,7 @@ class Supervision(unittest.TestCase):
 class SharedDashboard(unittest.TestCase):
     """The web dashboard's code is one block, identical in terminal-ct and terminal-vm: change it in both, then set
     SHARED_SHA in both tests to the new value."""
-    SHARED_SHA = "387455b4b6b8816aeb0bf16492484b9f6a60a0c710062f2abb0d2ac2fde86662"
+    SHARED_SHA = "9e5cc401b4e9f239cd5e7c3461117645a0fd33d8f9bff7fc8ef37b2acb8d06a3"
 
     @staticmethod
     def block(path):
