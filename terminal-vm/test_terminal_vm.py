@@ -962,6 +962,11 @@ class StoppedVm(unittest.TestCase):
             scoped = tl.agent_call("infra", {}, yes, project="alpha")
         self.assertEqual([v["name"] for v in scoped["vms"]], ["job"])          # not the user's v (default)
         self.assertIn("terminal-ct not found", scoped["containers_note"])
+        self.assertIn("used_by_project", scoped["this_pc"]["quota"]["cpus"])    # its own use, not the others'
+        tl.infra_text(scoped)
+        for reserved in ("networks", "images"):                                # STORE/NAME is a VM's folder
+            with self.assertRaisesRegex(SystemExit, "invalid VM name"):
+                tl.vm_dir(reserved)
         self.assertEqual([p["project"] for p in scoped["projects"]], ["alpha"])
 
     def test_agent_authority(self):
@@ -1278,7 +1283,7 @@ class Supervision(unittest.TestCase):
 class SharedDashboard(unittest.TestCase):
     """The web dashboard's code is one block, identical in terminal-ct and terminal-vm: change it in both, then set
     SHARED_SHA in both tests to the new value."""
-    SHARED_SHA = "9e5cc401b4e9f239cd5e7c3461117645a0fd33d8f9bff7fc8ef37b2acb8d06a3"
+    SHARED_SHA = "1438c234262934d5b591839c36d218bb09d2204f8bc14b6e2a6d0666630ab50f"
 
     @staticmethod
     def block(path):
@@ -1350,7 +1355,7 @@ class WebDashboard(unittest.TestCase):
                          {"scale": ["lab", "app", "3"]})
         spec = {"stack": "lab", "services": {"app": {"image": "nginx"}}}
         self.assertEqual(api("POST", "/api/do", body={"op": "apply", "stack": spec}), spec)
-        self.assertEqual(os.listdir(os.path.join(self.tmp, "web")), [])               # its temporary file removed
+        self.assertEqual(os.listdir(os.path.join(self.tmp, ".web")), [])               # its temporary file removed
         for bad in ({"op": "rm", "name": "-rf"}, {"op": "start", "name": "../x"}, {"op": "scale", "stack": "a b"},
                     {"kind": "vm", "op": "rm", "name": "a"}, {"op": "format"}):
             with self.assertRaises((ValueError, SystemExit)):

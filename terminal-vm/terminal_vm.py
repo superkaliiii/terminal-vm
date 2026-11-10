@@ -64,7 +64,7 @@ IMAGE_PATTERN = r"debian-live-[\d.]+-amd64-xfce\.iso"
 
 
 def vm_dir(name):
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,47}", name or "") or name == "images":
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,47}", name or "") or name in ("images", "networks"):
         raise SystemExit(f"invalid VM name: {name!r} (letters, digits, _ and -)")
     return os.path.join(STORE, name)
 
@@ -1798,8 +1798,7 @@ def web_api(method, path, q, body=None):
                 qm.close()
                 with contextlib.suppress(OSError):
                     os.remove(os.path.join(vm_dir(name), f))
-        os.makedirs(os.path.join(STORE, "web"), mode=0o700, exist_ok=True)  # screenshots, stacks (env values)
-        out = os.path.join(STORE, "web", f"ct-{_ct_name(name)}.{threading.get_ident()}.png")
+        out = os.path.join(_web_dir(), f"ct-{_ct_name(name)}.{threading.get_ident()}.png")  # screenshots: private
         try:
             ct_call(["action", name, "screenshot", "--output", out], timeout=20)
             with open(out, "rb") as f:
@@ -1847,8 +1846,7 @@ def web_api(method, path, q, body=None):
             if op == "apply":
                 if not isinstance(body.get("stack"), dict):
                     raise ValueError("apply needs the stack as a JSON object")
-                os.makedirs(os.path.join(STORE, "web"), mode=0o700, exist_ok=True)  # screenshots, stacks (env values)
-                f = os.path.join(STORE, "web", f"stack.{threading.get_ident()}.json")
+                f = os.path.join(_web_dir(), f"stack.{threading.get_ident()}.json")  # env values: private
                 try:
                     with open(f, "w", encoding="utf-8") as out:
                         json.dump(body["stack"], out)
@@ -1972,9 +1970,18 @@ WEB_ROLES = ("read", "full")  # read: look (every GET); full: act too (POST)
 WEB_SEEN = {}  # user: (time of its latest call, role): who is on the dashboard now
 
 
+WEB_DIR = ".web"  # a name no container or VM can take (STORE/NAME is theirs)
+
+
 def _web_dir():
-    d = os.path.join(STORE, "web")
-    os.makedirs(d, mode=0o700, exist_ok=True)
+    d = os.path.join(STORE, WEB_DIR)
+    if not os.path.isdir(d):
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        old = os.path.join(STORE, "web")  # where they were: a container or VM named web shared (and rm'd) it
+        for f in (os.listdir(old) if os.path.isdir(old) else []):
+            if f == "actions.log" or f.startswith("cert-") and f.endswith(".pem"):  # the audit log, pinned certs
+                with contextlib.suppress(OSError):
+                    os.replace(os.path.join(old, f), os.path.join(d, f))
     return d
 
 
@@ -2086,7 +2093,7 @@ def _web_act_log(user, addr, path, body, error=None):
 def web_actions(n=20):
     """The latest actions done through the dashboard, newest first."""
     try:
-        with open(os.path.join(STORE, "web", "actions.log"), encoding="utf-8") as f:
+        with open(os.path.join(_web_dir(), "actions.log"), encoding="utf-8") as f:
             lines = f.readlines()[-n:]
     except OSError:
         return []
@@ -2909,10 +2916,14 @@ def quota_limits(use=None):
 
 
 class quota_lock:
-    """Cross-process lock (an atomic mkdir), so two commands cannot both pass the check and then both start."""
+    """Cross-process lock (an atomic mkdir), so two commands cannot both pass the check and then both start.
+    what: another lock of the same kind (descriptions)."""
+    def __init__(self, what="quota"):
+        self.what = what
+
     def __enter__(self):
         os.makedirs(STORE, exist_ok=True)
-        self.path = os.path.join(STORE, ".quota.lock")
+        self.path = os.path.join(STORE, f".{self.what}.lock")
         for _ in range(300):
             try:
                 os.mkdir(self.path); return self
@@ -2920,7 +2931,7 @@ class quota_lock:
                 if time.time() - os.path.getmtime(self.path) > 120:  # left by a crashed command
                     os.rmdir(self.path)
                 time.sleep(0.1)
-        raise SystemExit("another terminal-vm command holds the quota lock; try again")
+        raise SystemExit(f"another terminal-vm command holds the {self.what} lock; try again")
 
     def __exit__(self, *exc):
         os.rmdir(self.path)
@@ -3090,13 +3101,15 @@ def descriptions():
     path = os.path.join(STORE, "descriptions.json")
     try:
         st = os.stat(path)
-        key = (path, st.st_mtime_ns, st.st_size)
-        if key not in _DESC:
+        key = (path, st.st_ino, st.st_mtime_ns, st.st_size)
+        d = _DESC.get(key)
+        if d is None:
             with open(path, encoding="utf-8") as f:
                 d = json.load(f)
-            _DESC.clear()
-            _DESC[key] = d if isinstance(d, dict) else {}
-        return _DESC[key]
+            d = d if isinstance(d, dict) else {}
+            _DESC.clear()  # one file: the last read only (threads of the web dashboard may race here, harmlessly)
+            _DESC[key] = d
+        return d
     except (OSError, ValueError):
         return {}
 
@@ -3108,16 +3121,25 @@ def description(kind, name):
 def set_description(kind, name, text):
     """Set NAME's description; "" clears it. No check that NAME exists (describe does): rm uses it to forget."""
     text = check_description(text)
-    with quota_lock():
+    with quota_lock("descriptions"):
+        _DESC.clear()  # under the lock, from the file itself: never merged into a stale copy
         d = dict(descriptions())
         if text:
             d[f"{kind}:{name}"] = text
         elif d.pop(f"{kind}:{name}", None) is None:
             return {kind: name, "description": ""}
         path = os.path.join(STORE, "descriptions.json")
-        with open(path + ".new", "w", encoding="utf-8") as f:
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.new"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(d, f, indent=1, ensure_ascii=False)
-        os.replace(path + ".new", path)
+        for i in range(20):  # Windows: refused while a reader (the web dashboard) has it open for a moment
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if i == 19:
+                    raise
+                time.sleep(0.05)
         _DESC.clear()  # same size within one clock tick would look unchanged
     return {kind: name, "description": text}
 
@@ -3167,11 +3189,12 @@ def infra(project=None):
     names = {DEFAULT_PROJECT} | {v.get("project") or DEFAULT_PROJECT for v in vms} | {n["project"] for n in nets.values()}
     if os.path.isdir(os.path.join(STORE, ".projects")):  # as projects() finds them
         names |= {d.replace("+", "/") for d in os.listdir(os.path.join(STORE, ".projects"))}
-    out = {"project": project, "rules": INFRA_RULES, "this_pc": {"quota": t["quota"]}, "vms": vms, "networks": nets,
+    q = scoped_quota(project) if project else t["quota"]
+    out = {"project": project, "rules": INFRA_RULES, "this_pc": {"quota": q}, "vms": vms, "networks": nets,
            "projects": [{"project": p, **({"description": d} if (d := description("project", p)) else {})}
                         for p in sorted(names) if mine(p)]}
     try:  # terminal-ct: its containers, nodes and other PCs
-        out["containers"] = ct_call(["infra", "--json", *(["--project", project] if project else [])], timeout=60)
+        out["containers"] = ct_call(["infra", "--json", *(["--project", project] if project else [])], timeout=120)
     except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as e:
         out["containers_note"] = str(e)[:200]
     return out
@@ -3181,7 +3204,8 @@ def infra_text(m):
     """infra for a person: the quota, one line per VM and network, then terminal-ct's map."""
     q = m["this_pc"]["quota"]
     out = [f"terminal-vm {VERSION}" + (f"  project {m['project']}" if m.get("project") else ""),
-           "this PC  " + "  ".join(f"{k.replace('_gb', '')} {v['used']:g}/{v['limit']:g}" for k, v in q.items()), ""]
+           "this PC  " + "  ".join(f"{k.replace('_gb', '')} {v.get('used', v.get('used_by_project', '-'))}/"
+                                   f"{v['limit']}" for k, v in q.items()), ""]
     for v in m["vms"]:
         flags = "".join(f for f, on in (("S", v.get("sandbox")), ("I", v.get("internet")), ("M", v.get("managed")))
                         if on)
@@ -5206,6 +5230,8 @@ def main(argv=None):
         if o.cmd == "ls": return ls()
         if o.cmd == "infra":
             m = infra(check_project(o.project) if o.project else None)
+            if not o.json and hasattr(sys.stdout, "reconfigure"):
+                sys.stdout.reconfigure(errors="replace")  # a description in a script the console cannot show
             return print(json.dumps(m, indent=1) if o.json else infra_text(m))
         if o.cmd == "doctor": return doctor()
         if o.cmd == "help": return p.print_help()
