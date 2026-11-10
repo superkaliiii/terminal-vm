@@ -207,12 +207,19 @@ class QGA:
     def __init__(self, name, timeout=0.5):
         self.sock = connect(endpoint(name, "qga"), timeout)
         self.buf = b""
-        sync = int(time.time() * 1000) % 2**31
-        while self.call("guest-sync", id=sync) != sync:  # drop replies left over from earlier clients
-            pass
+        sync = secrets.randbelow(2 ** 31)
+        self._send("guest-sync", id=sync)
+        while self._reply() != sync:  # drop replies left over from earlier clients; one sync only: each one sent
+            pass                      # is answered, and an extra answer would be read as the next call's
+
+    def _send(self, execute, **arguments):
+        self.sock.sendall(json.dumps({"execute": execute, **({"arguments": arguments} if arguments else {})}).encode() + b"\n")
 
     def call(self, execute, **arguments):
-        self.sock.sendall(json.dumps({"execute": execute, **({"arguments": arguments} if arguments else {})}).encode() + b"\n")
+        self._send(execute, **arguments)
+        return self._reply()
+
+    def _reply(self):
         while True:
             while b"\n" not in self.buf:
                 chunk = self.sock.recv(65536)
@@ -251,6 +258,36 @@ class QGA:
 
     def read(self, path):
         return self.pull(path).decode()
+
+
+CLOCK_OFF_NS = 250_000_000  # a guest clock further than this from the host's is stepped
+
+
+def sync_clock(name, timeout=2, g=None):
+    """Set a guest's clock to the host's through its agent when it is off by more than CLOCK_OFF_NS: a guest's
+    clock stops while QEMU is paused (idle pause) and while the host sleeps, and a guest days behind refuses TLS,
+    apt and image pulls. Returns the drift in seconds that was corrected, 0 when none; OSError without an agent."""
+    own = g is None
+    g = g or QGA(name, timeout)
+    try:
+        t = g.call("guest-get-time")
+        now = time.time_ns()
+        if not isinstance(t, int) or abs(now - t) <= CLOCK_OFF_NS:
+            return 0
+        g.call("guest-set-time", time=time.time_ns())
+        return round((now - t) / 1e9, 3)
+    finally:
+        if own:
+            with contextlib.suppress(OSError, AttributeError):
+                g.sock.close()
+
+
+def _sync_after_pause(name):
+    """After cont: the guest's clock missed the pause. Best effort (no agent, a busy one: the daemon's next check)."""
+    with contextlib.suppress(OSError, RuntimeError, ValueError):
+        drift = sync_clock(name)
+        if drift:
+            event("clock_set", name, f"{drift:+} s")
 
 
 def _kv(text):
@@ -1011,9 +1048,10 @@ def qemu_args(name, m, window, vnc_port=None):
 
 def create(name, iso, os_name="linux", cpus=None, memory=None, disk=None, width=1280, height=800, layout="us",
            offline=False, product_key=None, ui_language="en-US", sandbox=False, max_cpus=None, max_memory=None,
-           project=None, image=None, node=False):
+           project=None, image=None, node=False, template=True):
     """A VM installed from an ISO, or (image) one booting an official cloud image, set up by cloud-init at its
-    first start; node: with Docker and Python 3, for terminal-ct."""
+    first start; node: with Docker and Python 3, for terminal-ct, an overlay on the node template (built once;
+    template=False: from the cloud image itself, as the template's own build)."""
     d = vm_dir(name)
     project = check_project(project or DEFAULT_PROJECT)
     p = PROFILES.get(os_name)
@@ -1050,7 +1088,9 @@ def create(name, iso, os_name="linux", cpus=None, memory=None, disk=None, width=
     if cpus > lim["cpus"] or top[1] > lim["memory_gb"]:
         raise SystemExit(f"this VM could never start within the quota ({lim['cpus']} CPUs, {lim['memory_gb']} GiB "
                          f"for its memory ceiling of {top[1]}): lower --cpus/--max-memory, or raise the quota")
-    base = cloud_image(image) if image else None  # before the folder exists: a failed download leaves nothing
+    tpl = bool(node and template)
+    # before the folder exists: a failed download (or template build) leaves nothing
+    base = node_template(image) if tpl else cloud_image(image) if image else None
     with quota_lock():
         quota_check({"disk_gb": disk})
         os.makedirs(d, mode=0o700, exist_ok=True)  # under the lock: the disk now counts for the next check
@@ -1059,7 +1099,8 @@ def create(name, iso, os_name="linux", cpus=None, memory=None, disk=None, width=
     subprocess.run([qemu_bin("qemu-img"), "create", "-f", "qcow2", *(["-F", "qcow2", "-b", base] if base else []),
                     os.path.join(d, "disk.qcow2"), f"{disk}G"], check=True, stdout=subprocess.DEVNULL)
     m = {"os": os_name, **({"iso": os.path.abspath(iso)} if not image else
-                           {"image": image, "cloud": True, "installed": True, **({"node": True} if node else {})}),
+                           {"image": image, "installed": True, **({"node": True} if node else {}),
+                            **({"template": base} if tpl else {"cloud": True})}),
          "memory_mb": memory * 1024, "cpus": cpus, "width": width,
          "height": height, "layout": layout, "offline": offline or sandbox, **({"sandbox": True} if sandbox else {}),
          "max_cpus": top[0], "max_memory_mb": top[1] * 1024, "disk_gb": disk, "project": project,
@@ -1072,14 +1113,15 @@ def create(name, iso, os_name="linux", cpus=None, memory=None, disk=None, width=
         write_answers(d, m, key, ui_language)
     if image:  # the account cloud-init makes; the guest agent is how terminal-vm and terminal-ct reach it
         m.update(user="user", password=secrets.token_urlsafe(9))
-        cloud_seed(name, m)
+        node_seed(name, m) if tpl else cloud_seed(name, m)
     with open(os.path.join(d, "machine.json"), "w") as f:
         json.dump(m, f)
     out = {"created": name, "os": os_name, "path": d, "project": project}
     if image:
         out.update(image=image, user=m["user"], password=m["password"], ready_file=m["ready_file"],
-                   note="set up by cloud-init at its first start (1-5 min, needs the internet); ready when "
-                        "ready_file exists in the guest")
+                   note=("from the node template: ready about 15 s after its first start" if tpl else
+                         "set up by cloud-init at its first start (1-5 min, needs the internet)")
+                   + "; ready when ready_file exists in the guest")
     if p["family"] == "windows":
         out.update(user=m["user"], password=m["password"], note="Windows installs unattended on first start (10-40 min)")
     print(json.dumps(out))
@@ -1154,6 +1196,9 @@ def _start(name, window=False):
     if m.get("rename"):  # a Windows clone's first run: its own computer name (it was the source's)
         subprocess.Popen([sys.executable, os.path.abspath(__file__), "_rename", name], stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=log, **detach)
+    if m.get("identity"):  # a template node's first run: its own name, account and disk size
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "_identity", name], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=log, **detach)
     for net in m.get("networks", {}):  # a second switch for the same network exits at once
         subprocess.Popen([sys.executable, os.path.abspath(__file__), "_switch", net], stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=log, **detach)
@@ -1222,6 +1267,8 @@ def pause(name, resume=False):
     q = qmp(name)
     q.cmd("cont" if resume else "stop")
     q.close()
+    if resume:
+        _sync_after_pause(name)
     print(json.dumps({"name": name, "status": "running" if resume else "paused"}))
 
 
@@ -1352,13 +1399,16 @@ def wake(name):
         return
     q = qmp(name)
     try:
-        if q.cmd("query-status")["status"] == "paused":
+        woke = q.cmd("query-status")["status"] == "paused"
+        if woke:
             q.cmd("cont")
             event("woken", name)
     finally:
         q.close()
     with contextlib.suppress(OSError):
         os.remove(_idle_marker(name))
+    if woke:
+        _sync_after_pause(name)
 
 
 def supervise(name, restart=None, idle_pause=None):
@@ -1472,7 +1522,14 @@ def _supervise_one(n, s, now, cpu):
     # not right after a use (exec and file copies hold the agent's one connection); a short wait until it answered
     if now - used > 60:
         try:
-            QGA(n, timeout=2 if s.get("agent") else 0.5).call("guest-ping")
+            g = QGA(n, timeout=2 if s.get("agent") else 0.5)
+            g.call("guest-ping")
+            if now - s.get("clock_at", 0) >= 60:  # once a minute: catches a host that slept (no event for it)
+                s["clock_at"] = now
+                with contextlib.suppress(OSError, RuntimeError, ValueError):  # a guest that cannot set it: health
+                    drift = sync_clock(n, g=g)                                # still judged by the ping alone
+                    if drift:
+                        done.append(event("clock_set", n, f"{drift:+} s"))
             if s.get("health_fails", 0) >= HEALTH_RETRIES:
                 done.append(event("healthy", n))
             s["agent"], s["health_fails"] = True, 0
@@ -3087,6 +3144,8 @@ def clone(src, new):
     m.pop("networks", None)  # each NIC's MAC is per VM: attach the clone again
     if m.get("cloud"):
         cloud_seed(new, m)
+    if m.get("template"):  # its own name, account and ready file at its first start
+        node_seed(new, m)
     if m.get("os") in GUEST_TOOLS_OS and not m.get("sandbox"):  # renamed at its first start (sandbox: no agent)
         m["rename"] = computer_name(new)
     save(new, m)
@@ -3108,7 +3167,9 @@ def reset(name):
     _stopped(name)
     disk = os.path.join(vm_dir(name), "disk.qcow2")
     info = subprocess.run([qemu_bin("qemu-img"), "info", "--output=json", disk], check=True, capture_output=True, text=True)
-    base = cloud_image(load(name)["image"]) if load(name).get("cloud") else None
+    m = load(name)
+    base = (m["template"] if os.path.isfile(m["template"]) else node_template(m["image"])) if m.get("template") \
+        else cloud_image(m["image"]) if m.get("cloud") else None
     subprocess.run([qemu_bin("qemu-img"), "create", "-f", "qcow2", *(["-F", "qcow2", "-b", base] if base else []),
                     disk + ".new", str(json.loads(info.stdout)["virtual-size"])],
                    check=True, stdout=subprocess.DEVNULL)
@@ -3120,6 +3181,9 @@ def reset(name):
     if m.get("cloud"):  # its image again, nothing to install
         m["installed"] = True
         cloud_seed(name, m)
+    if m.get("template"):
+        m.update(installed=True, template=base)
+        node_seed(name, m)
     answers = os.path.join(vm_dir(name), "answers")
     if PROFILES[m.get("os", "linux")]["family"] == "windows" and os.path.isdir(answers):
         # rewrite the answers with this version (fixes and guest tools added since creation), same
@@ -3956,6 +4020,184 @@ def cloud_seed(name, m):
         f.write("#cloud-config\n" + json.dumps(config, indent=1) + "\n")  # JSON is YAML: no quoting to get wrong
 
 
+# ---------- node templates (K8): a node boots in seconds, not minutes ----------
+# A node made from the cloud image ran cloud-init at every boot (~35 s of its ~65 s, nested KVM in WSL) and its
+# first boot installed Docker from the internet (~90 s). A template is that VM set up once (Docker, Python, the
+# guest agent), then slimmed: cloud-init and the NTP daemon off (sync_clock sets the time), DHCP without its ARP
+# probe and IPv6 wait, no boot menu delay, services started in parallel; its account, host keys and ids removed.
+# Each node is an overlay on it; its identity (host name, account, password, disk size) is set by the guest agent
+# at its first start (_identity). Measured (WSL): agent answers in ~11 s, Docker in ~12 s, from 63-66 s.
+NODE_TEMPLATE_V = 1  # raise when the slimming changes: a new template is built from the cloud image
+NODE_SLIM = {
+    "alpine": r"""set -e
+for s in cloud-init-local cloud-init cloud-config cloud-final cloud-init-hotplugd chronyd; do
+  for l in boot default; do rc-update del $s $l 2>/dev/null || true; done
+done
+printf 'auto lo\niface lo inet loopback\n\nauto eth0\niface eth0 inet dhcp\n' > /etc/network/interfaces
+grep -q '^noarp' /etc/dhcpcd.conf || printf 'noarp\nipv4only\nnoipv6rs\n' >> /etc/dhcpcd.conf
+sed -i 's/^TIMEOUT .*/TIMEOUT 1/' /boot/extlinux.conf
+sed -i '/^rc_parallel=/d' /etc/rc.conf; echo 'rc_parallel="YES"' >> /etc/rc.conf
+deluser --remove-home user 2>/dev/null || true
+""",
+    "debian": r"""set -e
+touch /etc/cloud/cloud-init.disabled
+systemctl disable chrony.service systemd-timesyncd.service 2>/dev/null || true
+systemctl mask systemd-networkd-wait-online.service 2>/dev/null || true
+if [ -f /etc/default/grub ]; then sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=0/' /etc/default/grub; update-grub 2>/dev/null || true; fi
+userdel -r user 2>/dev/null || true; rm -f /etc/sudoers.d/90-cloud-init-users
+: > /etc/machine-id; rm -f /var/lib/dbus/machine-id
+""",
+}
+NODE_SLIM_COMMON = r"""
+rm -rf /var/lib/terminal-vm /etc/ssh/ssh_host_* /root/.ash_history /root/.bash_history /var/lib/docker/engine-id
+cloud-init clean --logs --seed 2>/dev/null || true
+sync
+"""
+
+
+def node_template(kind):
+    """The node template of that kind for the newest cloud image (built once, ~2 min with the internet): its path,
+    a read-only qcow2 in STORE/images."""
+    base = cloud_image(kind)
+    folder = os.path.dirname(base)
+    dest = os.path.join(folder, f"node-{os.path.basename(base)[:-6]}-t{NODE_TEMPLATE_V}.qcow2")
+    lock, end = dest + ".lock", time.monotonic() + 1200
+    while True:  # one build at a time: two node add at once wait for the same template
+        if os.path.exists(dest):
+            return _in_use_now(dest)
+        try:
+            os.mkdir(lock)
+            break
+        except FileExistsError:
+            with contextlib.suppress(OSError):
+                if time.time() - os.path.getmtime(lock) > 1800:  # left by a killed build
+                    os.rmdir(lock)
+                    continue
+            if time.monotonic() > end:
+                raise SystemExit(f"another command is still building the {kind} node template; try again")
+            time.sleep(1)
+    tmp = f"tmpl-{kind}-{secrets.token_hex(3)}"
+    try:
+        if os.path.exists(dest):
+            return _in_use_now(dest)
+        print(f"building the {kind} node template once (about 2 min, needs the internet)", file=sys.stderr)
+        with captured(io.StringIO()):
+            create(tmp, None, image=kind, node=True, cpus=min(2, os.cpu_count()), memory=1, max_memory=1, disk=4,
+                   template=False)  # 1 GiB and no balloon headroom: a build, not a VM to grow
+            start(tmp, set_want=False)
+        ready, end = load(tmp)["ready_file"], time.monotonic() + 900
+        while True:
+            with contextlib.suppress(OSError, SystemExit):
+                if guest_run(tmp, ["test", "-f", ready], 10)["exit"] == 0:
+                    break
+            if state(tmp) == "stopped" or time.monotonic() > end:
+                raise SystemExit(f"the {kind} node template did not finish its setup (it needs the internet); "
+                                 f"see {os.path.join(vm_dir(tmp), 'qemu.log')}")
+            time.sleep(1)
+        r = guest_run(tmp, ["/bin/sh", "-c", NODE_SLIM[kind] + NODE_SLIM_COMMON], 300)
+        if r["exit"]:
+            raise SystemExit(f"slimming the {kind} node template failed: {(r['stderr'] or r['stdout'])[-300:]}")
+        with captured(io.StringIO()):
+            try:
+                stop(tmp, timeout=120)
+            except SystemExit:  # a guest ignoring ACPI: its writes were synced
+                stop(tmp, force=True)
+        part = f"{dest}.{os.getpid()}.part"
+        subprocess.run([qemu_bin("qemu-img"), "convert", "-O", "qcow2", os.path.join(vm_dir(tmp), "disk.qcow2"), part],
+                       check=True, stdout=subprocess.DEVNULL)  # standalone: the cloud image may be collected later
+        os.chmod(part, 0o444)
+        os.replace(part, dest)
+        _gc_node_templates(dest)
+        return _in_use_now(dest)
+    finally:
+        with contextlib.suppress(OSError, SystemExit), captured(io.StringIO()):
+            if os.path.isdir(vm_dir(tmp)):
+                if state(tmp) != "stopped":
+                    stop(tmp, force=True)
+                rm(tmp)
+        with contextlib.suppress(OSError):
+            for f in os.listdir(folder):
+                if f.startswith(os.path.basename(dest) + ".") and f.endswith(".part"):
+                    os.remove(os.path.join(folder, f))
+            os.rmdir(lock)
+
+
+def _gc_node_templates(keep):
+    """Older node templates of the same kind that no VM disk is built on any more."""
+    folder, kind = os.path.dirname(keep), os.path.basename(keep).split("-")[1]
+    prefix = "node-debian-13-genericcloud" if kind == "debian" else "node-generic_alpine-"
+    used = {os.path.normcase(os.path.abspath(b)) for b in
+            map(_backing, filter(os.path.isfile, (os.path.join(STORE, n, "disk.qcow2") for n in machines()))) if b}
+    for f in os.listdir(folder):
+        path = os.path.normcase(os.path.abspath(os.path.join(folder, f)))
+        if f.startswith(prefix) and f.endswith(".qcow2") and path != os.path.normcase(os.path.abspath(keep)) \
+                and path not in used:
+            with contextlib.suppress(OSError):
+                os.chmod(path, 0o600)
+                os.remove(path)
+
+
+def node_identity_script(name, m):
+    """Run as root by the guest agent at a template node's first start: its own name, account, disk size; then its
+    ready file once it has a route and Docker answers. Idempotent (a retry after a cut start)."""
+    host = name.replace("_", "-").strip("-") or "vm"
+    alpine = m["image"] == "alpine"
+    user = shlex.quote(m["user"])
+    add = (f"id {user} >/dev/null 2>&1 || adduser -D -s /bin/ash {user}" if alpine else
+           f"id {user} >/dev/null 2>&1 || useradd -m -s /bin/bash {user}; "
+           f"echo {shlex.quote(m['user'] + ' ALL=(ALL) NOPASSWD:ALL')} > /etc/sudoers.d/90-terminal-vm; "
+           f"chmod 440 /etc/sudoers.d/90-terminal-vm")
+    return f"""set -e
+IFS= read -r pw  # on stdin: never in the guest's process list
+echo {host} > /etc/hostname; hostname {host}
+grep -q " {host}$" /etc/hosts || echo "127.0.1.1 {host}" >> /etc/hosts
+{add}
+printf '%s:%s\\n' {user} "$pw" | chpasswd
+[ -s /etc/machine-id ] || {{ command -v systemd-machine-id-setup >/dev/null && systemd-machine-id-setup >/dev/null; }} || true
+ls /etc/ssh/ssh_host_*_key >/dev/null 2>&1 || ssh-keygen -A >/dev/null 2>&1 || true
+dev=$(awk '$2 == "/" {{print $1}}' /proc/mounts | tail -1); dev=$(readlink -f "$dev")
+case "$dev" in
+  *[0-9]) disk=$(echo "$dev" | sed 's/p\\?[0-9]*$//'); [ -b "$disk" ] && [ "$disk" != "$dev" ] && \\
+          {{ growpart "$disk" "${{dev##*[!0-9]}}" >/dev/null 2>&1 || true; }} ;;
+esac
+resize2fs "$dev" >/dev/null 2>&1 || true
+for i in $(seq 60); do ip route 2>/dev/null | grep -q '^default' && break; sleep 0.5; done
+for i in $(seq 120); do docker info >/dev/null 2>&1 && break; sleep 0.5; done
+docker info >/dev/null 2>&1
+mkdir -p /var/lib/terminal-vm && touch {shlex.quote(m['ready_file'])}
+"""
+
+
+def node_identity(name, wait=600):
+    """Started by start for a template node's first run: once the guest agent answers, give the guest its identity
+    (node_identity_script, its account's password on stdin), then forget the step."""
+    end, said = time.time() + wait, None
+    while time.time() < end and state(name) != "stopped":
+        m = load(name)
+        try:
+            r = guest_exec(name, "/bin/sh", ["-c", node_identity_script(name, m)], 180,
+                           stdin=(m["password"] + "\n").encode())
+            if r["exit"] == 0:
+                m = load(name); m.pop("identity", None); save(name, m)
+                return
+            err = (r["stderr"] or r["stdout"])[-300:]
+            if err != said:  # once per distinct failure (qemu.log), retried until wait
+                print(f"{name}: identity step failed: {err}", file=sys.stderr, flush=True)
+                said = err
+        except (OSError, ValueError, TypeError, KeyError):  # agent not up yet, or busy with another client
+            pass
+        time.sleep(1)
+
+
+def node_seed(name, m):
+    """A template node's own identity, set at its next start (node_identity): a new ready file (a clone's disk holds
+    its source's)."""
+    host = name.replace("_", "-").strip("-") or "vm"
+    m["instance_id"] = f"{host}-{secrets.token_hex(4)}"
+    m["ready_file"] = f"/var/lib/terminal-vm/ready-{m['instance_id']}"
+    m["identity"] = True
+
+
 def guest_tools():
     """virtio-win guest tools (VirtIO serial driver + qemu-guest-agent) for Windows 10/Server 2016 and later,
     cached; None when they cannot be fetched (the guest then works without its agent)."""
@@ -4562,6 +4804,8 @@ def main(argv=None):
         return watch((sys.argv[2:] if argv is None else argv[1:])[0])
     if (sys.argv[1:] if argv is None else argv)[:1] == ["_rename"]:  # internal: started by start for a Windows clone
         return rename_guest((sys.argv[2:] if argv is None else argv[1:])[0])
+    if (sys.argv[1:] if argv is None else argv)[:1] == ["_identity"]:  # internal: a template node's first start
+        return node_identity((sys.argv[2:] if argv is None else argv[1:])[0])
     mac_args = macos_handoff(sys.argv[1:] if argv is None else argv)
     if mac_args is not None:
         sys.exit(run_mac(mac_args))

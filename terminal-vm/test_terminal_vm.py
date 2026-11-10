@@ -995,6 +995,21 @@ class StoppedVm(unittest.TestCase):
         self.assertNotIn("cache=unsafe", " ".join(tl.qemu_args("v", m, False)))
 
 
+class GuestAgent(unittest.TestCase):
+    """The guest agent client."""
+    def test_agent_resync_after_stale_reply(self):
+        class Sock:  # the guest agent answers each request in order; an earlier client left one reply unread
+            def __init__(self): self.out = [b'{"return": 7}\n']
+            def sendall(self, data):
+                req = json.loads(data)
+                self.out.append(json.dumps({"return": req["arguments"]["id"] if req["execute"] == "guest-sync"
+                                            else {"pid": 42}}).encode() + b"\n")
+            def recv(self, n): return self.out.pop(0) if self.out else b""
+            def close(self): pass
+        with mock.patch.object(tl, "connect", lambda *a: Sock()), mock.patch.object(tl, "endpoint", lambda *a: "x"):
+            self.assertEqual(tl.QGA("a").call("guest-exec", path="/bin/true"), {"pid": 42})  # not a sync's answer
+
+
 class Supervision(unittest.TestCase):
     """The daemon's passes: restart with growing delays, guest agent health, idle pause and wake, events."""
     def setUp(self):
@@ -1062,6 +1077,34 @@ class Supervision(unittest.TestCase):
             self.assertEqual(in_thread(lambda: tl.supervise_pass(st, now=6000)), [])  # another thread waits for it
         self.assertEqual([e["event"] for e in tl.events()][-2:], ["restart_failed", "window_closed"])
         self.assertEqual(tl.events(vm="a")[0]["event"], "restarted")
+
+    def test_clock_set_after_pause_and_sleep(self):
+        test, calls = self, []
+
+        class Clock:  # a guest whose clock stopped for an hour (idle pause, host asleep)
+            def __init__(self, n, timeout=0.5): pass
+            def call(self, c, **k):
+                calls.append((c, k))
+                return test.guest_ns if c == "guest-get-time" else {}
+        self.guest_ns = time.time_ns() - 3600 * 10 ** 9
+        with mock.patch.object(tl, "QGA", Clock):
+            self.assertAlmostEqual(tl.sync_clock("a"), 3600, delta=5)
+            self.assertEqual(calls[-1][0], "guest-set-time")
+            self.assertLess(abs(calls[-1][1]["time"] - time.time_ns()), 5 * 10 ** 9)
+            self.guest_ns, n = time.time_ns() - 10 ** 8, len(calls)          # 0.1 s off: left alone
+            self.assertEqual(tl.sync_clock("a"), 0)
+            self.assertEqual([c for c, _ in calls[n:]], ["guest-get-time"])
+            self.guest_ns = time.time_ns() - 3600 * 10 ** 9                  # woken from an idle pause
+            self.states["a"] = "paused"
+            open(tl._idle_marker("a"), "w").close()
+            tl.wake("a")
+            self.assertEqual([e["event"] for e in tl.events(vm="a")][-2:], ["woken", "clock_set"])
+            self.guest_ns, st = time.time_ns() - 7200 * 10 ** 9, {}           # the host slept: the daemon's check
+            used = os.path.join(self.tmp, "a", "last_use")                   # (not right after a use: the agent's
+            os.utime(used, (time.time() - 120, time.time() - 120))           # one connection may be taken)
+            out = tl.supervise_pass(st, now=time.time())
+            self.assertEqual([e["event"] for e in out], ["clock_set"])
+            self.assertEqual(tl.supervise_pass(st, now=time.time() + 10), [])  # once a minute, not every pass
 
     def test_health_and_idle_pause(self):
         st, cpu, T = {}, {}, 100000
@@ -1359,7 +1402,7 @@ class CloudImages(unittest.TestCase):
 
     def test_debian_node(self):
         with contextlib.redirect_stdout(io.StringIO()) as out:
-            tl.create("n1", None, cpus=2, memory=2, disk=10, image="debian", node=True)
+            tl.create("n1", None, cpus=2, memory=2, disk=10, image="debian", node=True, template=False)  # its build
         reply = json.loads(out.getvalue())
         m = tl.load("n1")
         self.assertNotIn("iso", m)
@@ -1382,7 +1425,7 @@ class CloudImages(unittest.TestCase):
 
     def test_alpine_and_plain(self):
         with contextlib.redirect_stdout(io.StringIO()):
-            tl.create("a_1", None, cpus=1, memory=1, disk=4, image="alpine", node=True)
+            tl.create("a_1", None, cpus=1, memory=1, disk=4, image="alpine", node=True, template=False)
             tl.create("plain", None, cpus=1, memory=1, disk=4, image="debian")
         _, cfg, meta = self.seed("a_1")
         self.assertEqual(cfg["packages"], ["qemu-guest-agent", "docker", "python3"])
@@ -1395,6 +1438,41 @@ class CloudImages(unittest.TestCase):
         plain = self.seed("plain")[1]
         self.assertEqual(plain["packages"], ["qemu-guest-agent"])                      # not a node: just the agent
         self.assertTrue(plain["runcmd"][-1].startswith("mkdir"))                       # no Docker to wait for
+
+    def test_template_node(self):
+        tpl = os.path.join(self.tmp, "images", "node-generic_alpine-3.22.2-x86_64-bios-cloudinit-r0-ab-t1.qcow2")
+        os.makedirs(os.path.dirname(tpl)); open(tpl, "w").close()
+        info = {"virtual-size": 4 * 2 ** 30}
+
+        def run(cmd, **k):
+            self.calls.append(cmd)
+            if cmd[:2] == ["qemu-img", "create"]:
+                open(cmd[-2], "w").close()
+            return mock.Mock(stdout=json.dumps(info), returncode=0)
+        with mock.patch.object(tl, "node_template", lambda kind: tpl), mock.patch.object(tl.subprocess, "run", run), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            tl.create("n_2", None, cpus=1, memory=1, disk=12, image="alpine", node=True)
+        reply, m = json.loads(out.getvalue()), tl.load("n_2")
+        self.assertEqual((m["template"], m["identity"], m["node"]), (tpl, True, True))
+        self.assertNotIn("cloud", m)
+        self.assertIn(tpl, self.calls[-1]); self.assertIn("12G", self.calls[-1])          # an overlay, grown
+        self.assertIn("about 15 s", reply["note"])
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "n_2", "cidata")))           # no cloud-init at all
+        self.assertNotIn("vvfat", " ".join(tl.qemu_args("n_2", m, False)))
+        script = tl.node_identity_script("n_2", m)
+        for part in ("echo n-2 > /etc/hostname", "adduser -D -s /bin/ash user", "| chpasswd", "resize2fs", "docker info",
+                     "touch " + m["ready_file"]):
+            self.assertIn(part, script)
+        deb = tl.node_identity_script("d1", dict(m, image="debian"))
+        self.assertIn("useradd -m -s /bin/bash user", deb); self.assertIn("NOPASSWD", deb); self.assertIn("growpart", deb)
+        first = m["ready_file"]
+        m.pop("identity"); tl.save("n_2", m)                                                 # its first start done
+        with mock.patch.object(tl.subprocess, "run", run), mock.patch.object(tl, "state", lambda n: "stopped"), \
+                mock.patch.object(tl, "disk_in_use", lambda n: False), contextlib.redirect_stdout(io.StringIO()):
+            tl.reset("n_2")
+        m = tl.load("n_2")
+        self.assertTrue(m["identity"]); self.assertNotEqual(m["ready_file"], first)          # set up again
+        self.assertIn(tpl, self.calls[-1])                                                   # on the template again
 
     def test_new_instance_each_seed(self):
         with contextlib.redirect_stdout(io.StringIO()):
