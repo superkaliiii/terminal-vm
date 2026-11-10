@@ -3005,8 +3005,8 @@ AUTOSTART = "terminal-vm-resume"
 
 
 def autostart(on=None):
-    """Run `resume` at each logon: a Windows scheduled task (for WSL: wsl.exe running it inside the distribution,
-    kept alive while VMs run), else a systemd user service on Linux."""
+    """Run `resume` at each logon: the user's Run key on Windows (for WSL: wsl.exe running it inside the
+    distribution, kept alive while VMs run), else a systemd user service on Linux."""
     me = [sys.executable, os.path.abspath(__file__)]
     unit = os.path.expanduser(f"~/.config/systemd/user/{AUTOSTART}.service")
     env = {k: os.environ[k] for k in ("TERMINAL_VM_HOME", "TERMINAL_LINUX_HOME", "XDG_DATA_HOME") if os.environ.get(k)}
@@ -3015,11 +3015,14 @@ def autostart(on=None):
             if state(n) != "stopped" and not os.path.isfile(os.path.join(vm_dir(n), "want")):
                 want(n, "running")
     if WINDOWS or in_wsl():
-        schtasks = "schtasks.exe" if in_wsl() else "schtasks"
+        # the user's Run key, not a scheduled task: an ONLOGON task needs an elevated (administrator) process
+        reg, key = "reg.exe" if in_wsl() else "reg", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
         if on is None:
-            return {"autostart": subprocess.run([schtasks, "/Query", "/TN", AUTOSTART], capture_output=True).returncode == 0}
+            return {"autostart": subprocess.run([reg, "query", key, "/v", AUTOSTART], capture_output=True).returncode == 0}
         if not on:
-            subprocess.run([schtasks, "/Delete", "/TN", AUTOSTART, "/F"], capture_output=True)
+            subprocess.run([reg, "delete", key, "/v", AUTOSTART, "/f"], capture_output=True)
+            subprocess.run(["schtasks.exe" if in_wsl() else "schtasks", "/Delete", "/TN", AUTOSTART, "/F"],
+                           capture_output=True)  # what versions before 2026-11 made (as an administrator)
             return {"autostart": False}
         if in_wsl():  # conhost --headless: no console window at logon; wsl.exe reads a Windows command line
             cmd = "conhost.exe --headless " + subprocess.list2cmdline(
@@ -3029,13 +3032,13 @@ def autostart(on=None):
             if env:  # shortcut: a task's command line sets no variables; set them as user variables to use this
                 raise SystemExit(f"autostart on Windows uses the default store; unset {', '.join(env)} first")
             cmd = subprocess.list2cmdline(me + ["resume"])
-        if len(cmd) > 261:  # schtasks /TR limit
-            raise SystemExit(f"the task's command line is {len(cmd)} characters, schtasks takes 261: {cmd}")
-        r = subprocess.run([schtasks, "/Create", "/TN", AUTOSTART, "/SC", "ONLOGON", "/TR", cmd, "/F"],
-                           capture_output=True, text=True)
+        if len(cmd) > 260:  # what the Run key starts
+            raise SystemExit(f"the logon command line is {len(cmd)} characters, Windows takes 260: {cmd}")
+        r = subprocess.run([reg, "add", key, "/v", AUTOSTART, "/t", "REG_SZ", "/d", cmd, "/f"], capture_output=True,
+                           text=True, errors="replace")  # its messages are in the console's code page
         if r.returncode:
             raise SystemExit((r.stderr or r.stdout).strip())
-        return {"autostart": True, "task": AUTOSTART, "runs": cmd}
+        return {"autostart": True, "runs": cmd}
     if on is None:
         return {"autostart": os.path.isfile(unit)}
     if not on:
@@ -4588,7 +4591,7 @@ def doctor_checks():
               f"{SUDO}usermod -aG kvm $USER   (then log out and in again)" if os.path.exists("/dev/kvm") else None)
         if in_wsl():
             check("wsl", False, "WSL stops this distribution when no Windows program uses it, killing its VMs",
-                  "terminal-vm autostart on   (a logon task keeps it running while VMs run)", required=False)
+                  "terminal-vm autostart on   (started at each logon, it keeps WSL running while VMs run)", required=False)
     check("python", sys.version_info >= (3, 8), sys.version.split()[0], _pkg("python3"))
     standby = _standby_minutes()
     if standby is not None:

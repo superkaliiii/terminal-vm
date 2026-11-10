@@ -663,7 +663,8 @@ class StoppedVm(unittest.TestCase):
             out = tl.autostart(True)
         self.assertTrue(out["runs"].startswith("conhost.exe --headless wsl.exe -d Debian --exec env "))
         self.assertTrue(out["runs"].endswith(" resume --stay"))
-        self.assertEqual(self.calls[-1][:5], ["schtasks.exe", "/Create", "/TN", "terminal-vm-resume", "/SC"])
+        self.assertEqual(self.calls[-1][:5], ["reg.exe", "add", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                                              "/v", "terminal-vm-resume"])
         with self.assertRaisesRegex(RuntimeError, "terminal-vm autostart on"):
             tl.agent_call("autostart", {"on": True}, lambda m, c: (_ for _ in ()).throw(RuntimeError(c)))
         tl.save("v", dict(tl.load("v"), sandbox=True))

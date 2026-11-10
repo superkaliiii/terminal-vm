@@ -247,8 +247,8 @@ The server asks through MCP elicitation when the client supports it (a yes/no fo
   `resume` (no VM name) starts again the VMs that were running, within the quota, and leaves alone those stopped on
   purpose. A VM shut down from inside the guest is recorded as stopped (its watcher sees the guest's own
   shutdown); one whose QEMU was killed, or the PC cut, comes back.
-- `autostart on` runs it at each logon: on Windows (also from WSL) a scheduled task `terminal-vm-resume` (from
-  WSL: `conhost --headless wsl.exe ... resume --stay`, which keeps WSL up while VMs run); on Linux a systemd user
+- `autostart on` runs it at each logon: on Windows (also from WSL) the user's Run key `terminal-vm-resume` (no
+  administrator needed; from WSL: `conhost --headless wsl.exe ... resume --stay`, which keeps WSL up while VMs run); on Linux a systemd user
   service (at login; `loginctl enable-linger` for boot without login). `autostart off` removes it, `autostart` alone
   tells whether it is on. To turn it on:
 
