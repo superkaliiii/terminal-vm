@@ -1,6 +1,6 @@
 {
   "name": "terminal-vm",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "A separate desktop VM for computer-use agents, viewed and driven from a terminal: a CLI and an MCP server.",
   "bin": {
     "terminal-vm": "npm/terminal-vm.js"

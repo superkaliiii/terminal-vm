@@ -16,6 +16,12 @@
 
 One command and one MCP server: the same tools everywhere (`screenshot`, `click`, `move`, `drag`, `scroll`, `type`, `key`, `status`), and the host desktop is never touched.
 
+> [!NOTE]
+> **macOS: not tested on real Mac hardware yet.** Linux (and WSL) and Windows hosts are tested for real; macOS hosts and macOS guests (through
+> terminal-mac on Apple silicon) are not. macOS runs in CI only (unit tests on GitHub's macOS
+> runners); nothing has been tried on a physical Mac. Reports from Mac users are very welcome: open an issue with
+> what worked and what did not (`doctor --report` output helps).
+
 ## Highlights
 
 - **Any desktop guest**: Linux and Windows on QEMU (KVM or WHPX), macOS through terminal-mac on Apple silicon.

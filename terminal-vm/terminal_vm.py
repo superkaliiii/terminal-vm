@@ -52,7 +52,7 @@ WINDOWS = os.name == "nt"
 if not WINDOWS:
     import fcntl, termios, tty  # terminal viewer only
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 _DATA = os.environ.get("LOCALAPPDATA", os.path.expanduser("~")) if WINDOWS else \
     os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
 # VMs made before the rename to terminal-vm stay where they are: the old folder is used until a new one exists

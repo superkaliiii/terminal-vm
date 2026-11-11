@@ -10,6 +10,11 @@ A separate macOS desktop for computer-use agents, viewed and controlled from a t
 
 The guest is a separate Mac: it has its own apps, files, accounts and permissions. It does not inherit your running host apps or signed-in sessions. The VM still consumes host CPU, memory and storage.
 
+> [!NOTE]
+> **This fork has not been tested on real Mac hardware yet.** Its changes build and pass their unit tests on
+> GitHub's macOS runners only. Reports from Mac users are very welcome: open an issue with what worked and what did
+> not.
+
 ## Requirements
 
 - Apple silicon Mac, macOS 14 or later.
