@@ -34,6 +34,7 @@ Virtualization), which is also the default for `up` and `create` without `--os`.
   layout NAME [us|fr]      keyboard layout for type/key (us = QWERTY, fr = AZERTY); action ... --layout: one call
   image [--os OS] [--plan]             download the installation image only
   push NAME LOCAL GUEST | pull NAME GUEST LOCAL   files, through qemu-guest-agent
+  pool fill SRC [--size 2] | pool take SRC | pool ls | pool rm SRC   booted, paused clones handed over in ~1 s
   exec NAME --background -- PROGRAM ARGS | job NAME [ID] [--kill]   a job in the guest, then its state and output
   view NAME [--read-only]  terminal viewer (Kitty or Sixel: Windows Terminal, foot); Ctrl+] exits, Ctrl+O window
   show NAME [--read-only] | hide NAME   native window (VNC viewer)
@@ -1420,6 +1421,101 @@ def pause(name, resume=False):
     if resume:
         _sync_after_pause(name)
     print(json.dumps({"name": name, "status": "running" if resume else "paused"}))
+
+
+# ---------- warm pool ----------
+# Clones of a stopped VM, booted until their guest agent answers, then paused: `pool take` hands one over running
+# in about a second instead of a boot. Paused members keep their memory (counted in the quota as running VMs).
+# Members are the agent's (created_by agent): a pool is the user's way to give agents VMs at once.
+POOL_READY_TIMEOUT = 300
+
+
+def pool_members(src):
+    return sorted(n for n in machines() if load(n).get("pool") == src)
+
+
+def pool_fill(src, size):
+    """Up to SIZE booted and paused clones of SRC (stopped; its guest agent tells when a clone has booted)."""
+    if not 1 <= size <= 16:
+        raise SystemExit("--size: 1 to 16 VMs (each paused one keeps its memory)")
+    m = load(src)
+    if m.get("sandbox") or m.get("pool"):
+        raise SystemExit(f"{src}: a pool is made from a normal VM with a guest agent (not a sandbox, not a member)")
+    made = []
+    try:
+        for _ in range(size - len(pool_members(src))):
+            made.append(_pool_member(src))
+    except SystemExit as e:  # the quota, often: say what was made before it
+        if not made:
+            raise
+        return {"pool": src, "made": made, "ready": len(pool_members(src)), "stopped": str(e)}
+    return {"pool": src, "made": made, "ready": len(pool_members(src))}
+
+
+def _pool_member(src):
+    """One clone of SRC booted until its guest agent answers, then paused: its name."""
+    new = f"{src}-p{secrets.token_hex(3)}"
+    quiet(clone, src, new)
+    save(new, dict(load(new), pool=src, created_by="agent"))
+    try:
+        quiet(start, new)
+        end = time.time() + POOL_READY_TIMEOUT
+        while True:
+            try:
+                g = QGA(new, timeout=2)
+                g.call("guest-ping")
+                g.sock.close()
+                break
+            except (OSError, RuntimeError, ValueError):
+                if time.time() > end:
+                    raise SystemExit(f"{new}: no guest agent answered within {POOL_READY_TIMEOUT} s "
+                                     f"(install qemu-guest-agent in {src})") from None
+                time.sleep(1)
+        quiet(pause, new)
+    except BaseException:  # never a half-made member left in the pool
+        with contextlib.suppress(SystemExit, OSError):
+            quiet(stop, new, force=True)
+        with contextlib.suppress(SystemExit, OSError):
+            quiet(rm, new)
+        raise
+    event("pool_filled", new, f"from {src}")
+    return new
+
+
+def pool_take(src):
+    """A paused member of SRC's pool, out of the pool and running: its name."""
+    with quota_lock():  # two takes never get the same VM
+        ready = [n for n in pool_members(src) if state(n) == "paused"]
+        if not ready:
+            raise SystemExit(f"the pool of {src} is empty: terminal-vm pool fill {src} --size N")
+        n = ready[0]
+        m = load(n)
+        m.pop("pool")
+        save(n, m)
+    quiet(pause, n, resume=True)
+    touch_use(n)
+    event("pool_taken", n, f"from {src}")
+    return {"vm": n, "from": src, "left": len(ready) - 1}
+
+
+def pool_ls():
+    pools = {}
+    for n in machines():
+        src = load(n).get("pool")
+        if src:
+            p = pools.setdefault(src, {"ready": 0, "members": []})
+            p["members"].append(n)
+            p["ready"] += state(n) == "paused"
+    return pools
+
+
+def pool_rm(src):
+    gone = pool_members(src)
+    for n in gone:
+        with contextlib.suppress(SystemExit, OSError):
+            quiet(stop, n, force=True)
+        quiet(rm, n)
+    return {"pool": src, "removed": gone}
 
 
 # ---------- macOS guests: terminal-mac ----------
@@ -5076,6 +5172,8 @@ def agent_call(tool, a, approve, project=None):
         if desc:
             set_description("vm", vm, desc)
         return out
+    if tool == "vm_take":  # the user filled this pool for agents: its members are theirs already
+        return pool_take(vm)
     if tool == "vm_clone":
         src = load(vm)
         users = not (src.get("sandbox") or src.get("created_by") == "agent")
@@ -5192,6 +5290,9 @@ AGENT_TOOLS = [
               "sandbox": {"type": "boolean"}, "iso": {"type": "string"}, **_DESC_ARG}, ["vm"])),
     ("vm_clone", "Copy-on-write clone of a stopped VM, in seconds (install once, clone many). Both stay usable. Cloning one of the user's VMs needs their approval; the clone starts offline.",
      _schema({**_VM, "new": {"type": "string"}, **_DESC_ARG}, ["vm", "new"])),
+    ("vm_take", "A running VM at once from the warm pool of vm (booted clones the user prepared with terminal-vm "
+                "pool fill): its name, yours to manage. Faster than vm_clone + vm_start (no boot).",
+     _schema(_VM, ["vm"])),
     ("vm_start", "Start a managed VM, within the host quota (VM@PC: another PC's, within its quota)." + _MANAGED,
      _schema(_VM, ["vm"])),
     ("vm_stop", "Shut a managed VM down (force: power off at once); VM@PC: another PC's.",
@@ -5507,6 +5608,9 @@ def main(argv=None):
     inf = sub.add_parser("infra", help="the map: quota, VMs, networks and addresses, projects (and terminal-ct's)")
     inf.add_argument("--project"); inf.add_argument("--json", action="store_true")
     cl = sub.add_parser("clone"); cl.add_argument("src"); cl.add_argument("new")
+    po = sub.add_parser("pool", help="fill SRC --size N | take SRC | ls | rm SRC: booted, paused clones handed over at once")
+    po.add_argument("pool_cmd", choices=["fill", "take", "ls", "rm"]); po.add_argument("src", nargs="?")
+    po.add_argument("--size", type=int, default=2)
     cl.add_argument("--description", help="what the new one is for (one line)")
     ds = sub.add_parser("describe", help="KIND NAME [TEXT]: one line on what it is for (no TEXT: show it)")
     ds.add_argument("desc_kind", choices=DESC_KINDS); ds.add_argument("desc_name")
@@ -5604,6 +5708,12 @@ def main(argv=None):
         if o.cmd == "version": return print(f"terminal-vm {VERSION}")
         if o.cmd == "rm": return rm(o.name)
         if o.cmd == "reset": return reset(o.name)
+        if o.cmd == "pool":
+            if o.pool_cmd != "ls" and not o.src:
+                raise SystemExit(f"pool {o.pool_cmd} SRC: the stopped VM the pool is cloned from")
+            return print(json.dumps(pool_ls() if o.pool_cmd == "ls" else pool_fill(o.src, o.size)
+                                    if o.pool_cmd == "fill" else pool_take(o.src) if o.pool_cmd == "take"
+                                    else pool_rm(o.src), indent=1))
         if o.cmd == "clone":
             r = clone(o.src, o.new)
             described("vm", o.new)

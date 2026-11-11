@@ -1792,6 +1792,43 @@ class ExecCli(unittest.TestCase):
             tl.main(["exec", "n1", "--background", "--stdin", "f", "--", "cat"])
 
 
+class WarmPool(unittest.TestCase):
+    def setUp(self):
+        tl.STORE = tempfile.mkdtemp()
+        for n, pool in (("tpl", None), ("tpl-pa", "tpl"), ("tpl-pb", "tpl"), ("other", None)):
+            os.makedirs(os.path.join(tl.STORE, n))
+            tl.save(n, {"os": "linux", "cpus": 1, "memory_gb": 1, **({"pool": pool} if pool else {})})
+
+    def test_take_hands_over_a_paused_member_once(self):
+        resumed = []
+        with mock.patch.object(tl, "state", lambda n: "paused"), \
+                mock.patch.object(tl, "pause", lambda n, resume=False: resumed.append((n, resume))):
+            self.assertEqual(tl.pool_ls(), {"tpl": {"ready": 2, "members": ["tpl-pa", "tpl-pb"]}})
+            first = tl.pool_take("tpl")
+            self.assertEqual((first["vm"], first["left"]), ("tpl-pa", 1))
+            self.assertNotIn("pool", tl.load("tpl-pa"))  # out of the pool: never handed over twice
+            self.assertEqual(tl.pool_take("tpl")["vm"], "tpl-pb")
+            with self.assertRaisesRegex(SystemExit, "pool of tpl is empty"):
+                tl.pool_take("tpl")
+        self.assertEqual(resumed, [("tpl-pa", True), ("tpl-pb", True)])
+
+    def test_fill_reports_what_it_made_before_the_quota(self):
+        made = iter(["tpl-pc"])
+
+        def member(src):
+            n = next(made, None)
+            if n is None:
+                raise SystemExit("quota exceeded (memory_gb: 5 used + 1 > 5)")
+            return n
+        with mock.patch.object(tl, "_pool_member", member):
+            r = tl.pool_fill("tpl", 4)
+            self.assertEqual((r["made"], r["stopped"][:14]), (["tpl-pc"], "quota exceeded"))
+            with self.assertRaisesRegex(SystemExit, "quota"):  # nothing made: the error itself
+                tl.pool_fill("tpl", 4)
+        with self.assertRaisesRegex(SystemExit, "not a sandbox, not a member"):
+            tl.pool_fill("tpl-pa", 2)
+
+
 class CloudImageDownload(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
