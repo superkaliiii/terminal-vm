@@ -1770,6 +1770,27 @@ class ExecCli(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "PROGRAM"):
             tl.main(["exec", "n1"])
 
+    def test_background_job(self):
+        calls = []
+
+        def run(n, argv, t=60, stdin=None, detach=False):
+            calls.append((argv, detach))
+            if argv[-3:-2] and argv[2] == tl._JOB_STATE:  # the state script: answer as the guest would
+                mark = argv[4]
+                return {"exit": 0, "stdout": f"3\n{mark}out\n{mark}err\n", "stderr": ""}
+            return {"exit": 0, "stdout": "", "stderr": ""}
+        with mock.patch.object(tl, "guest_run", run), mock.patch.object(tl, "_windows", lambda n: False), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            tl.main(["exec", "n1", "--background", "--", "make", "-j4"])
+            jid = json.loads(out.getvalue())["job"]
+            self.assertEqual(calls[0], (["mkdir", "-p", f"/tmp/.tvm-jobs/{jid}"], False))
+            self.assertEqual(calls[1], (["/bin/sh", "-c", tl._JOB_RUN, f"/tmp/.tvm-jobs/{jid}", "make", "-j4"], True))
+            self.assertEqual(tl.job("n1", jid), {"job": jid, "exit": 3, "stdout": "out\n", "stderr": "err\n"})
+        with self.assertRaisesRegex(SystemExit, "8 hex"):
+            tl.job("n1", "../../etc")
+        with self.assertRaisesRegex(SystemExit, "stdin"):
+            tl.main(["exec", "n1", "--background", "--stdin", "f", "--", "cat"])
+
 
 class CloudImageDownload(unittest.TestCase):
     def setUp(self):

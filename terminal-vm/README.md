@@ -90,6 +90,7 @@ or install this folder as a Claude Code plugin (`.claude-plugin/`).
 | `start NAME [--window]`, `pause`, `resume` | lifecycle |
 | `create NAME --image debian\|alpine [--node]` | a Linux VM from an official cloud image instead of an ISO, set up unattended at its first start (see [Cloud images](#cloud-images)); `--node`: with Docker, a node for terminal-ct |
 | `exec NAME [--timeout 60] [--stdin FILE] -- PROGRAM ARGS` | run a program in the guest through its agent (no shell); JSON reply `{exit, stdout, stderr}` |
+| `exec NAME --background -- PROGRAM ARGS`, `job NAME [ID] [--kill] [--tail BYTES]` | start a job in the guest and return its id at once (builds, tests, servers: no timeout); `job` gives its exit code or state (`running`, `lost`) and the end of its output, `--kill` stops it with its children (Linux: its process group; Windows: its process tree); no ID: the jobs. They live in the guest's temp folder and end when it restarts; a job asleep for the VM's `--idle-pause` minutes is paused with it |
 | `web [--project P] [--no-open]` | web dashboard of the VMs and, when installed, terminal-ct's containers (see [Web dashboard](#web-dashboard)) |
 | `web user add NAME [--role read\|full]`, `web user ls`, `web user rm NAME`; `web --listen IP\|off [--port N]` | share the dashboard with other people or agents (see [Shared session](#shared-session)) |
 | `bench [--runs 10] [--from VM]` | timings of terminal-vm's own operations on a clone (see [Measurements](#measurements)) |

@@ -34,6 +34,7 @@ Virtualization), which is also the default for `up` and `create` without `--os`.
   layout NAME [us|fr]      keyboard layout for type/key (us = QWERTY, fr = AZERTY); action ... --layout: one call
   image [--os OS] [--plan]             download the installation image only
   push NAME LOCAL GUEST | pull NAME GUEST LOCAL   files, through qemu-guest-agent
+  exec NAME --background -- PROGRAM ARGS | job NAME [ID] [--kill]   a job in the guest, then its state and output
   view NAME [--read-only]  terminal viewer (Kitty or Sixel: Windows Terminal, foot); Ctrl+] exits, Ctrl+O window
   show NAME [--read-only] | hide NAME   native window (VNC viewer)
   action NAME screenshot|click|move|drag|scroll|type|key|wait ...
@@ -321,9 +322,9 @@ class AgentBusy(OSError):
     """No guest agent answered in time: the command never started."""
 
 
-def guest_exec(name, path, args, timeout=120, stdin=None):
+def guest_exec(name, path, args, timeout=120, stdin=None, detach=False):
     """Run a program in the guest through qemu-guest-agent (root, or SYSTEM on Windows): exit code, stdout, stderr.
-    stdin: bytes given to it."""
+    stdin: bytes given to it. detach: start it and return {"pid"} without waiting (nothing captured)."""
     # the agent serves one client at a time (a node's identity step holds it ~15 s right before its ready file
     # shows): wait for it, within the command's own time; nothing has run in the guest until it answers
     end = time.time() + min(timeout, 30)
@@ -336,8 +337,10 @@ def guest_exec(name, path, args, timeout=120, stdin=None):
                 raise AgentBusy(f"guest agent busy or silent ({e})") from None
             time.sleep(0.2)
     try:
-        pid = g.call("guest-exec", path=path, arg=args, **{"capture-output": True},
+        pid = g.call("guest-exec", path=path, arg=args, **{"capture-output": not detach},
                      **({"input-data": base64.b64encode(stdin).decode()} if stdin is not None else {}))["pid"]
+        if detach:  # shortcut: the agent keeps this pid's status until asked; a few bytes per job, gone at reboot
+            return {"pid": pid}
         end, wait = time.time() + timeout, 0.01
         while time.time() < end:
             st = g.call("guest-exec-status", pid=pid)
@@ -366,7 +369,7 @@ def guest_shell(name, command, timeout=60):
     return guest_run(name, ["/bin/sh", "-c", command], timeout)
 
 
-def guest_run(name, argv, timeout=60, stdin=None):
+def guest_run(name, argv, timeout=60, stdin=None, detach=False):
     """A program in the guest with its arguments, no shell (the exec command; terminal-ct's engine calls in a
     node): {exit, stdout, stderr}."""
     m = load(name)
@@ -376,7 +379,7 @@ def guest_run(name, argv, timeout=60, stdin=None):
         raise SystemExit(f"{name} is not running; start it: terminal-vm start {name}")
     with in_use(name):  # a long command is a use until it ends
         try:
-            return guest_exec(name, argv[0], argv[1:], timeout, stdin)
+            return guest_exec(name, argv[0], argv[1:], timeout, stdin, detach)
         except AgentBusy as e:
             raise SystemExit(f"{name}: {e}; nothing was run (install qemu-guest-agent in the guest if it has "
                              "none)") from None
@@ -384,6 +387,104 @@ def guest_run(name, argv, timeout=60, stdin=None):
             if "timed out" in str(e):
                 raise SystemExit(f"{name}: {e}; the command may still be running in the guest") from None
             raise SystemExit(f"{name}: no guest agent answered ({e}); install qemu-guest-agent in the guest") from None
+
+
+# ---------- background jobs ----------
+# A job runs in the guest under a small wrapper that keeps its pid, output and exit code in a folder of the guest
+# (Linux /tmp/.tvm-jobs, Windows %SystemRoot%\Temp\tvm-jobs): it outlives terminal-vm and the agent's connection.
+# Linux: setsid (when there) gives it its own process group, so kill reaches its children; Windows: taskkill /T.
+# shortcut: finished jobs' output stays in the guest's temp folder until the guest clears it
+_JOB_ID = re.compile(r"[0-9a-f]{8}")
+_JOB_RUN = ('d=$0; command -v setsid >/dev/null && set -- setsid "$@"; "$@" >"$d/out" 2>"$d/err" </dev/null & '
+            'echo $! >"$d/pid"; wait $!; echo $? >"$d/exit.new" && mv "$d/exit.new" "$d/exit"')
+_JOB_STATE = ('d=$0; if [ -f "$d/exit" ]; then cat "$d/exit"; elif [ ! -d "$d" ]; then echo gone; '
+              'elif [ ! -f "$d/pid" ]; then echo starting; elif kill -0 "$(cat "$d/pid")" 2>/dev/null; '
+              'then echo running; else echo lost; fi; printf %s "$1"; tail -c "$2" "$d/out" 2>/dev/null; '
+              'printf %s "$1"; tail -c "$2" "$d/err" 2>/dev/null')
+_WIN_JOBS = "$env:SystemRoot\\Temp\\tvm-jobs"
+# Windows: the job's state, then the last TAIL bytes of out and err (opened shared: the job may still write them)
+_WIN_STATE = ('if (Test-Path "$d\\exit") { $s = (Get-Content "$d\\exit" -Raw).Trim() } '
+              'elseif (-not (Test-Path $d)) { $s = "gone" } elseif (-not (Test-Path "$d\\pid")) { $s = "starting" } '
+              'elseif (Get-Process -Id (Get-Content "$d\\pid" -Raw).Trim() -EA SilentlyContinue) { $s = "running" } '
+              'else { $s = "lost" }; '
+              # the job wrote in the console's code page (OEM); the reply goes out in UTF-8
+              '$oem = [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage); '
+              'function T($f) { if (-not (Test-Path $f)) { return "" }; '
+              '$fs = [IO.File]::Open($f, "Open", "Read", "ReadWrite"); '
+              'try { $n = [Math]::Min($fs.Length, TAIL); $fs.Seek(-$n, "End") | Out-Null; $b = New-Object byte[] $n; '
+              '$fs.Read($b, 0, $n) | Out-Null; $oem.GetString($b) } finally { $fs.Close() } }; '
+              '$o = $s + "MARK" + (T "$d\\out") + "MARK" + (T "$d\\err"); '
+              '[Console]::OutputEncoding = [Text.Encoding]::UTF8; [Console]::Out.Write($o)')
+
+
+def _ps(script):
+    """powershell.exe's argv for a script (encoded: nothing to quote through the agent)."""
+    return ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+            base64.b64encode(script.encode("utf-16-le")).decode()]
+
+
+def _windows(name):
+    return PROFILES[load(name).get("os", "linux")]["family"] == "windows"
+
+
+def exec_background(name, argv=None, command=None):
+    """Start a program (argv, no shell) or a shell command (sh -c; PowerShell on Windows) in the guest and return its
+    job id at once; job() follows it."""
+    if not (argv or command):
+        raise SystemExit("exec NAME --background -- PROGRAM [ARGS]")
+    jid = secrets.token_hex(4)
+    if _windows(name):
+        d = f"{_WIN_JOBS}\\{jid}"
+        script = command if command is not None else "& " + " ".join("'" + x.replace("'", "''") + "'" for x in argv)
+        # no progress records: with stderr redirected they come out as CLIXML noise
+        inner = base64.b64encode(("$ProgressPreference = 'SilentlyContinue'; " + script).encode("utf-16-le")).decode()
+        r = guest_run(name, _ps(f'New-Item -ItemType Directory -Force "{d}" | Out-Null'), 60)
+        if r["exit"]:  # here, not in the job: a failure shows now
+            raise SystemExit(f"{name}: could not prepare the job: {r['stderr'].strip()[:300]}")
+        # $p.Handle: without it, ExitCode stays empty once the process has ended
+        guest_run(name, _ps(
+            f'$d = "{d}"; $p = Start-Process powershell.exe -PassThru -ArgumentList "-NoProfile","-NonInteractive",'
+            f'"-OutputFormat","Text","-EncodedCommand","{inner}" -RedirectStandardOutput "$d\\out" -RedirectStandardError "$d\\err"; '
+            '$null = $p.Handle; Set-Content "$d\\pid" $p.Id; $p.WaitForExit(); '
+            'Set-Content "$d\\exit.new" $p.ExitCode; Move-Item -Force "$d\\exit.new" "$d\\exit"'), 60, detach=True)
+    else:
+        d = f"/tmp/.tvm-jobs/{jid}"
+        r = guest_run(name, ["mkdir", "-p", d], 60)
+        if r["exit"]:  # here, not in the job: a failure shows now
+            raise SystemExit(f"{name}: could not prepare the job: {r['stderr'].strip()[:300]}")
+        guest_run(name, ["/bin/sh", "-c", _JOB_RUN, d, *(argv or ["/bin/sh", "-c", command])], 60, detach=True)
+    return {"job": jid, "state": "running"}
+
+
+def job(name, jid=None, kill=False, tail=65536):
+    """A background job's state (an exit code, running, lost if its wrapper died) and the end of its stdout and
+    stderr; no id: the guest's jobs."""
+    if jid is not None and (not isinstance(jid, str) or not _JOB_ID.fullmatch(jid)):
+        raise SystemExit("a job id is 8 hex digits, as exec --background printed it")
+    win, tail = _windows(name), max(1, min(int(tail), 1 << 20))
+    if jid is None:
+        r = guest_run(name, _ps(f'Get-ChildItem -Name "{_WIN_JOBS}" -EA SilentlyContinue') if win else
+                      ["/bin/sh", "-c", "ls /tmp/.tvm-jobs 2>/dev/null"], 60)
+        return {"jobs": sorted(j for j in r["stdout"].split() if _JOB_ID.fullmatch(j))}
+    mark = f"--tvm-{secrets.token_hex(8)}--"  # splits state, stdout and stderr; no output can guess it
+    if win:
+        d = f"{_WIN_JOBS}\\{jid}"
+        kill_ps = (f'$k = Get-Content "{d}\\pid" -EA SilentlyContinue; '
+                   'if ($k) { taskkill /T /F /PID $k.Trim() | Out-Null }; ') if kill else ""
+        r = guest_run(name, _ps(kill_ps + f'$d = "{d}"; ' +
+                                _WIN_STATE.replace("TAIL", str(tail)).replace("MARK", mark)), 60)
+    else:
+        d = f"/tmp/.tvm-jobs/{jid}"
+        if kill:  # the job's group first (setsid), else the program alone
+            guest_run(name, ["/bin/sh", "-c", 'p=$(cat "$0/pid" 2>/dev/null) || exit 0; '
+                             'kill -TERM -"$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null; true', d], 60)
+        r = guest_run(name, ["/bin/sh", "-c", _JOB_STATE, d, mark, str(tail)], 60)
+    parts = r["stdout"].split(mark)
+    if len(parts) != 3 or parts[0].strip() == "gone":
+        raise SystemExit(f"no job {jid} in {name} (jobs end when the guest restarts)")
+    state = parts[0].strip()
+    return {"job": jid, **({"exit": int(state)} if state.lstrip("-").isdigit() else {"state": state}),
+            "stdout": parts[1], "stderr": parts[2]}
 
 
 # ---------- projects ----------
@@ -5067,8 +5168,12 @@ TOOLS = [
              "stable: seconds without change (default 1); timeout: default 30. A blinking cursor can keep it from settling.",
      _schema({"stable": _N, "timeout": _N})),
     ("exec", "Run a shell command in the guest through its guest agent (Linux: sh -c as root; Windows: PowerShell as "
-             "SYSTEM) and return its exit code, stdout and stderr. Not in sandboxes (no guest agent).",
-     _schema({"command": {"type": "string"}, "timeout": _N}, ["command"])),
+             "SYSTEM) and return its exit code, stdout and stderr. Not in sandboxes (no guest agent). background: "
+             "return at once with a job id (builds, tests, servers: no timeout), then follow it with job.",
+     _schema({"command": {"type": "string"}, "timeout": _N, "background": {"type": "boolean"}}, ["command"])),
+    ("job", "A background job of exec: its exit code (or state: running, lost) and the end of its stdout and stderr. "
+            "kill: stop it with its children. No job: the guest's job ids.",
+     _schema({"job": {"type": "string"}, "kill": {"type": "boolean"}, "tail": {"type": "integer"}})),
 ]
 INPUT_TOOLS = {"click", "move", "drag", "scroll", "type", "key"}
 _VM, _NET = {"vm": {"type": "string"}}, {"net": {"type": "string"}}
@@ -5146,8 +5251,8 @@ def image(data):
     return {"type": "image", "data": base64.b64encode(data).decode(), "mimeType": "image/png"}
 
 
-REMOTE_TOOLS = {"screenshot", "click", "move", "drag", "scroll", "type", "key", "status", "wait", "exec", "vm_start",
-                "vm_stop"}
+REMOTE_TOOLS = {"screenshot", "click", "move", "drag", "scroll", "type", "key", "status", "wait", "exec", "job",
+                "vm_start", "vm_stop"}
 
 
 def remote_vm(name):
@@ -5180,7 +5285,7 @@ def remote_tool(tool, a, name, approve, project, ok):
         approve(f"Let the agent use your VM {vm} on {pc} (its screen, start and stop)?",
                 f"terminal-ct --host {pc} vm view {vm}   (or do it yourself)")
         ok.add(name)
-    if tool == "exec" and row.get("created_by") != "agent" and name + " exec" not in ok:  # root: as on this PC
+    if tool in ("exec", "job") and row.get("created_by") != "agent" and name + " exec" not in ok:  # root: as here
         approve(f"Let the agent run commands as root (SYSTEM) inside your VM {vm} on {pc}?",
                 f"terminal-ct --host {pc} vm exec {vm} -- COMMAND   (or run the commands yourself)")
         ok.add(name + " exec")
@@ -5306,7 +5411,7 @@ def mcp(name, project=None):
                     in_scope(vm, project)  # every call: a VM moved to another project leaves this agent's reach
                 if vm != name and tool not in AGENT_NAMES:  # screen tools on another VM: only one this agent manages
                     managed(vm)
-                if tool == "exec" and vm not in shell_ok:  # root (SYSTEM) in the guest: more than its screen
+                if tool in ("exec", "job") and vm not in shell_ok:  # root (SYSTEM) in the guest: more than its screen
                     if load(vm).get("created_by") != "agent":
                         approve(f"Let the agent run commands as root (SYSTEM) inside your VM {vm}?",
                                 f"terminal-vm mcp {vm}   (or run the commands yourself)")
@@ -5328,6 +5433,8 @@ def mcp(name, project=None):
                        (lambda t: dict(t, vms=[v for v in t["vms"] if under(project_of(load(v["name"])), project)],
                                        quota=scoped_quota(project)) if project else t)(top())
                        if tool == "top" else
+                       exec_background(vm, command=a["command"]) if tool == "exec" and a.get("background") else
+                       job(vm, a.get("job"), bool(a.get("kill")), a.get("tail", 65536)) if tool == "job" else
                        guest_shell(vm, a["command"], max(1.0, min(float(a.get("timeout", 60)), 600))) if tool == "exec" else
                        act(vm, tool, a))
                 record(tool, a, vm)
@@ -5436,6 +5543,10 @@ def main(argv=None):
     ex = sub.add_parser("exec", help="NAME [--timeout S] [--stdin FILE] -- PROGRAM ARGS: run it in the guest (agent)")
     ex.add_argument("name"); ex.add_argument("--timeout", type=float, default=60)
     ex.add_argument("--stdin", help="file given to the program as its standard input")
+    ex.add_argument("--background", action="store_true", help="return at once with a job id (see job)")
+    jb = sub.add_parser("job", help="NAME [ID] [--kill]: a background job's state and output (no ID: the jobs)")
+    jb.add_argument("name"); jb.add_argument("id", nargs="?"); jb.add_argument("--kill", action="store_true")
+    jb.add_argument("--tail", type=int, default=65536, help="bytes of output")
     ex.add_argument("argv", nargs="*")  # after --: options of the program, not of exec
     ne = sub.add_parser("net"); nsub = ne.add_subparsers(dest="net_cmd", required=True)
     nsub.add_parser("create").add_argument("net"); nsub.add_parser("rm").add_argument("net")
@@ -5517,10 +5628,15 @@ def main(argv=None):
         if o.cmd == "web": return print(json.dumps(web_cli(o.web_args, o.role, not o.no_open, o.project, o.listen,
                                                             o.port), indent=1))
         if o.cmd == "bench": return print(json.dumps(bench(max(1, o.runs), o.src), indent=1))
+        if o.cmd == "job": return print(json.dumps(job(o.name, o.id, o.kill, o.tail)))
         if o.cmd == "exec":
             argv = o.argv  # argparse has dropped the -- itself
             if not argv:
                 raise SystemExit("exec NAME -- PROGRAM [ARGS]")
+            if o.background:
+                if o.stdin:
+                    raise SystemExit("--background takes no --stdin: push the file and read it from the job")
+                return print(json.dumps(exec_background(o.name, argv)))
             data = None
             if o.stdin:
                 with open(o.stdin, "rb") as f:
@@ -5553,6 +5669,11 @@ def main(argv=None):
             given = json.loads(o.json_args)
             if not isinstance(given, dict):
                 raise ValueError("--json: a JSON object of the tool's arguments")
+            if o.tool == "exec" and given.get("background"):
+                return print(json.dumps(exec_background(o.name, command=str(given.get("command", "")))))
+            if o.tool == "job":
+                return print(json.dumps(job(o.name, given.get("job"), bool(given.get("kill")),
+                                            given.get("tail", 65536))))
             if o.tool == "exec":
                 print(json.dumps(guest_shell(o.name, str(given.get("command", "")),
                                              max(1.0, min(float(given.get("timeout", 60)), 600)))))
