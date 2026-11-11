@@ -187,6 +187,18 @@ The same file runs on Windows 10/11 and Windows Server hosts with Python 3.8+ an
 
 Small infrastructures without administrator rights: `net create lab`, then `net attach VM lab` on stopped VMs (each gets a NIC with a stable MAC and a suggested address in 10.77.N.0/24), `net ls`, `net detach VM lab`, `net rm lab`. A network is a small learning switch (Python, UDP on the loopback interface) that `start` launches when a VM on it starts and that exits a minute or two after the last one stops; each NIC is a QEMU `dgram` socket plugged into it, the same on Linux, macOS and Windows hosts (QEMU >= 7.2). VMs on it reach each other, never the LAN or the internet (a local process could send to or read from the switch port). There is no DHCP: set the suggested addresses in the guests, or run a DHCP server in one of them. Internet access is QEMU's NAT, per VM: `internet NAME on|off` (stopped VM); a sandboxed VM stays offline unless the user turns it on for it. Bridging VMs onto the real LAN needs a one-time administrator setup and is not included yet. Verified: two Tiny Core guests on an isolated network ping each other (0% loss) and cannot reach the internet (Linux host under WSL, 2-6 ms); on a Windows host, a guest's ARP and pings cross the switch both ways to a test peer, and broadcasts reach every member. Networks made before the switch: `net rm` and `net create` them again.
 
+**Allowlist (not recommended unless you know what you are doing; off by default).** `internet NAME allow
+pypi.org '*.github.com' host:port` (stopped VM, Linux and macOS hosts: QEMU for Windows cannot do it) keeps QEMU's
+NAT but with `restrict=on`, so nothing leaves the guest, and one way out: `10.0.2.100:3128`, where each guest
+connection starts a small proxy on this PC (`guestfwd ... cmd:`) that reaches only those hosts (ports 80 and 443
+unless a port is given; a listed name that resolves to a private address is refused). It understands CONNECT and
+plain `GET https://...` (busybox wget). `exec` and jobs get `http(s)_proxy`; the daemon also writes them into the
+guest once its agent answers (Linux: `/etc/profile.d`, `/etc/environment`, apt; Windows: machine variables and
+WinHTTP) and takes them away after `internet NAME on|off`. Decisions go to `STORE/NAME/egress.log`. It fails
+closed: a program that ignores the proxy has no internet. Not recommended because only programs that honor the
+proxy get out and an allowed host can still carry any data out. A cloud VM must have started once online first
+(cloud-init installs its guest agent from the internet). Not offered to agents through MCP.
+
 ## Quota
 
 One quota covers everything the host runs, so neither people nor agents can overload it. `quota` shows the limits and their use (also an MCP tool, read-only); only the user changes them: `quota --cpus N --memory GiB --disk GiB --vms N`. Defaults come from the host: cores - 1, 75% of RAM, half of the disk space VMs can have, 8 running VMs.

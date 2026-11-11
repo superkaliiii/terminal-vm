@@ -34,6 +34,7 @@ Virtualization), which is also the default for `up` and `create` without `--os`.
   layout NAME [us|fr]      keyboard layout for type/key (us = QWERTY, fr = AZERTY); action ... --layout: one call
   image [--os OS] [--plan]             download the installation image only
   push NAME LOCAL GUEST | pull NAME GUEST LOCAL   files, through qemu-guest-agent
+  internet NAME allow HOST...   not recommended: only these hosts, through a proxy (Linux and macOS hosts)
   pool fill SRC [--size 2] | pool take SRC | pool ls | pool rm SRC   booted, paused clones handed over in ~1 s
   exec NAME --background -- PROGRAM ARGS | job NAME [ID] [--kill]   a job in the guest, then its state and output
   view NAME [--read-only]  terminal viewer (Kitty or Sixel: Windows Terminal, foot); Ctrl+] exits, Ctrl+O window
@@ -338,7 +339,10 @@ def guest_exec(name, path, args, timeout=120, stdin=None, detach=False):
                 raise AgentBusy(f"guest agent busy or silent ({e})") from None
             time.sleep(0.2)
     try:
-        pid = g.call("guest-exec", path=path, arg=args, **{"capture-output": not detach},
+        env = {}
+        with contextlib.suppress(SystemExit, OSError, ValueError):  # a name without machine.json: no allowlist
+            env = {"env": PROXY_ENV} if load(name).get("allow") else {}
+        pid = g.call("guest-exec", path=path, arg=args, **{"capture-output": not detach}, **env,
                      **({"input-data": base64.b64encode(stdin).decode()} if stdin is not None else {}))["pid"]
         if detach:  # shortcut: the agent keeps this pid's status until asked; a few bytes per job, gone at reboot
             return {"pid": pid}
@@ -1170,7 +1174,8 @@ def qemu_args(name, m, window, vnc_port=None):
             *(["-drive", f"if=virtio,driver=vvfat,dir={os.path.join(d, 'cidata').replace(',', ',,')},label=cidata,rw=off"]
               if m.get("cloud") else []),
             *(["-usb"] if p["usb"] == "uhci" else ["-device", p["usb"]]), "-device", "usb-tablet",
-            "-nic", "none" if m.get("offline") or (sandbox and not m.get("internet")) else f"user,model={p['nic']}",
+            "-nic", "none" if m.get("offline") or (sandbox and not m.get("internet")) else f"user,model={p['nic']}"
+            + (_egress_nic(name, m["allow"]) if m.get("allow") else ""),
             *net_args(m, p["nic"]),
             *([] if sandbox else ["-device", "virtio-serial-pci",
                                   "-chardev", "socket,path=" + os.path.join(d, "qga.sock") + ",server=on,wait=off,id=qga0",
@@ -1779,6 +1784,15 @@ def _supervise_one(n, s, now, cpu):
             if s.get("health_fails", 0) >= HEALTH_RETRIES:
                 done.append(event("healthy", n))
             s["agent"], s["health_fails"] = True, 0
+            seen = os.path.join(vm_dir(n), "agent_seen")  # a cloud VM set up: an allowlist cannot stop that now
+            if not os.path.exists(seen):
+                with contextlib.suppress(OSError):
+                    open(seen, "w").close()
+            if bool(m.get("allow")) != bool(m.get("proxy_env")):
+                g.sock.close()  # the agent serves one client at a time: guest_proxy opens its own
+                with contextlib.suppress(OSError, RuntimeError, ValueError, SystemExit):
+                    if guest_proxy(n, m):
+                        done.append(event("proxy_set" if m.get("allow") else "proxy_removed", n))
         except (OSError, RuntimeError, ValueError):
             if s.get("agent") and now - s["since"] > HEALTH_GRACE:
                 s["health_fails"] = s.get("health_fails", 0) + 1
@@ -2958,10 +2972,14 @@ def net_attach(name, net, attach=True):
             "note": "no DHCP on this network: set this address in the guest"}
 
 
-def set_internet(name, value=None):
-    """Show or change NAT internet access. For a sandboxed VM, turning it on is the user's approval."""
+def set_internet(name, value=None, allow=None):
+    """Show or change NAT internet access. For a sandboxed VM, turning it on is the user's approval. allow: a list
+    of hosts instead (not recommended, EGRESS_WARNING)."""
     m = load(name)
+    if allow is not None:
+        return internet_allow(name, allow)
     if value:
+        m.pop("allow", None)
         if state(name) != "stopped":
             raise SystemExit(f"{name} is running; stop it first: terminal-vm stop {name}")
         on = value == "on"
@@ -2971,7 +2989,166 @@ def set_internet(name, value=None):
             m["internet"] = True  # approved by the user for this sandboxed VM
         save(name, m)
     sandbox_blocks = m.get("sandbox") and not m.get("internet")
+    if m.get("allow"):
+        return {"vm": name, "internet": "allowlist", "allow": m["allow"], "proxy": f"http://{EGRESS_ADDR}"}
     return {"vm": name, "internet": not m.get("offline") and not sandbox_blocks}
+
+
+# ---------- allowlist (not recommended) ----------
+# `internet NAME allow HOST...`: QEMU's user network with restrict=on (nothing leaves the guest) and one way out,
+# EGRESS_ADDR, where each guest connection starts `terminal-vm _egress` on this PC (guestfwd cmd:), a proxy that
+# reaches only the listed hosts. The guest is given HTTP(S)_PROXY by its agent (the daemon, once it answers; exec and
+# jobs get it too). Fails closed: a program that ignores the proxy has no internet.
+EGRESS_ADDR = "10.0.2.100:3128"
+_ALLOW = re.compile(r"(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*(:[0-9]{1,5})?")
+EGRESS_WARNING = ("not recommended unless you know what you are doing: only programs that honor HTTP(S)_PROXY get "
+                  "out, and an allowed host can still carry any data out (uploads, a code host, a paste site)")
+PROXY_ENV = [f"{k}=http://{EGRESS_ADDR}" for k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")] + \
+    ["no_proxy=localhost,127.0.0.1", "NO_PROXY=localhost,127.0.0.1"]
+
+
+def internet_allow(name, hosts):
+    hosts = [h.lower() for h in hosts]
+    bad = [h for h in hosts if not _ALLOW.fullmatch(h) or ":" in h and not 0 < int(h.rsplit(":", 1)[1]) < 65536]
+    if not hosts or bad:
+        raise SystemExit("internet NAME allow HOST...: host names (pypi.org, *.github.com, host:port)"
+                         + (f", not {', '.join(bad)}" if bad else ""))
+    if WINDOWS:  # QEMU for Windows has no guestfwd cmd:
+        raise SystemExit("an allowlist for VMs needs a Linux or macOS host (QEMU for Windows cannot start the proxy)")
+    if state(name) != "stopped":
+        raise SystemExit(f"{name} is running; stop it first: terminal-vm stop {name}")
+    m = load(name)
+    if m.get("cloud") and not os.path.exists(os.path.join(vm_dir(name), "agent_seen")):
+        raise SystemExit(f"{name} has not been set up yet: cloud-init installs its guest agent from the internet at "
+                         f"the first start. Start it once online (terminal-vm start {name}, wait for exec to answer), "
+                         "stop it, then set the allowlist")
+    m.update(allow=hosts, offline=False)
+    if m.get("sandbox"):
+        m["internet"] = True  # the user's approval, as internet on
+    save(name, m)
+    return {"vm": name, "internet": "allowlist", "allow": hosts, "proxy": f"http://{EGRESS_ADDR}",
+            "warning": EGRESS_WARNING}
+
+
+def _egress_nic(name, hosts):
+    """The NIC options that make the proxy the only way out (QEMU doubles commas in option values)."""
+    cmd = " ".join(shlex.quote(x) for x in (sys.executable, os.path.abspath(__file__), "_egress", name, *hosts))
+    return f",restrict=on,guestfwd=tcp:{EGRESS_ADDR}-cmd:{cmd.replace(',', ',,')}"
+
+
+def _allowed(host, port, allow):
+    host = host.lower().rstrip(".")
+    for a in allow:
+        h, _, p = a.partition(":")
+        if (int(p) != port) if p else port not in (80, 443):
+            continue
+        if host == h or h.startswith("*.") and (host.endswith(h[1:]) or host == h[2:]):
+            return h
+    return None
+
+
+def egress_stdio(name, allow):
+    """One guest connection on stdin/stdout (started by QEMU per connection): an HTTP CONNECT or plain HTTP request
+    to an allowed host is carried there; anything else gets 403. Decisions go to the VM's egress.log."""
+    import select
+    def log(line):
+        with contextlib.suppress(OSError):
+            with open(os.path.join(vm_dir(name), "egress.log"), "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {line}\n")
+    head = b""
+    while b"\r\n\r\n" not in head:
+        d = os.read(0, 4096)
+        if not d or len(head) > 65536:
+            return
+        head += d
+    method, target = head.split(b"\r\n", 1)[0].decode("latin-1").split(" ")[:2]
+    if method == "CONNECT":
+        host, _, port = target.rpartition(":")
+    else:  # absolute form: http://, or https:// (busybox wget): then this end makes the TLS, certificate checked
+        scheme = target.split("://", 1)[0].lower() if "://" in target else ""
+        rest = target.split("://", 1)[1].split("/", 1)[0] if scheme in ("http", "https") else ""
+        host, _, port = rest.rpartition(":") if ":" in rest else (rest, "", "443" if scheme == "https" else "80")
+    host, port = host.strip("[]"), int(port or 0)
+    h = _allowed(host, port, allow)
+    if not h:
+        log(f"deny {host}:{port}")
+        return os.write(1, b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    sock = None
+    with contextlib.suppress(OSError):
+        for fam, typ, proto, _, addr in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM):
+            # a listed name never reaches this PC's LAN; a listed address is taken as meant
+            if h == host and h.replace(".", "").isdigit() or ipaddress.ip_address(addr[0].split("%")[0]).is_global:
+                sock = socket.create_connection(addr[:2], 10)
+                break
+    if sock is None:
+        log(f"fail {host}:{port}")
+        return os.write(1, b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    log(f"allow {host}:{port}")
+    body = head.split(b"\r\n\r\n", 1)[1]
+    if method != "CONNECT" and scheme == "https":
+        try:
+            sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+        except (OSError, ValueError) as e:
+            log(f"fail {host}:{port} {e}")
+            return os.write(1, b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    if method == "CONNECT":
+        os.write(1, b"HTTP/1.1 200 Connection established\r\n\r\n")
+        sock.sendall(body)
+    else:  # the upstream is fixed: later requests on this connection go there too
+        sock.sendall(head)
+    guest_open = True  # the guest may only half-close after its request (busybox wget): the answer still comes
+    try:
+        while True:
+            # a TLS socket may hold decrypted bytes select cannot see
+            r = [sock] if getattr(sock, "pending", lambda: 0)() else \
+                select.select([0, sock] if guest_open else [sock], [], [], 300)[0]
+            if not r:
+                return
+            if 0 in r:
+                d = os.read(0, 65536)
+                if not d:
+                    guest_open = False
+                    if not isinstance(sock, ssl.SSLSocket):  # its shutdown drops TLS: raw bytes would follow
+                        sock.shutdown(socket.SHUT_WR)
+                else:
+                    sock.sendall(d)
+            if sock in r:
+                d = sock.recv(65536)
+                if not d:
+                    return
+                os.write(1, d)
+    except OSError:
+        return
+    finally:
+        sock.close()
+
+
+def guest_proxy(name, m):
+    """The guest's proxy settings made to match its allowlist (set, or taken away when it ended), through its agent."""
+    want = bool(m.get("allow"))
+    if want == bool(m.get("proxy_env")):
+        return False
+    if PROFILES[m.get("os", "linux")]["family"] == "windows":
+        val = f"'http://{EGRESS_ADDR}'" if want else "$null"
+        guest_ps(name, "".join(f"[Environment]::SetEnvironmentVariable('{k}', {val}, 'Machine'); "
+                               for k in ("HTTP_PROXY", "HTTPS_PROXY"))
+                 + (f"netsh winhttp set proxy {EGRESS_ADDR} | Out-Null" if want else "netsh winhttp reset proxy | Out-Null"), 60)
+    else:
+        lines = "".join(f"export {e}\n" for e in PROXY_ENV)
+        script = ("rm -f /etc/profile.d/tct-proxy.sh /etc/apt/apt.conf.d/95tct-proxy; "
+                  "[ -f /etc/environment ] && sed -i '/^\\(http\\|https\\|HTTP\\|HTTPS\\|no\\|NO\\)_proxy=/d' /etc/environment; ")
+        if want:
+            script += (f"printf %s {shlex.quote(lines)} > /etc/profile.d/tct-proxy.sh; "
+                       f"printf '%s\\n' {' '.join(shlex.quote(e) for e in PROXY_ENV)} >> /etc/environment; "
+                       f"[ -d /etc/apt/apt.conf.d ] && printf 'Acquire::http::Proxy \"http://{EGRESS_ADDR}\";\\n"
+                       f"Acquire::https::Proxy \"http://{EGRESS_ADDR}\";\\n' > /etc/apt/apt.conf.d/95tct-proxy; true")
+        r = guest_exec(name, "/bin/sh", ["-c", script], 60)
+        if r["exit"]:
+            raise OSError(f"proxy settings: {r['stderr'].strip()[:200]}")
+    m = load(name)
+    m["proxy_env"] = want
+    save(name, m)
+    return True
 
 
 def net_args(m, nic):
@@ -5558,6 +5735,9 @@ def mcp(name, project=None):
 # ---------- CLI ----------
 
 def main(argv=None):
+    if (sys.argv[1:] if argv is None else argv)[:1] == ["_egress"]:  # internal: QEMU starts it per guest connection
+        a = sys.argv[2:] if argv is None else argv[1:]
+        return egress_stdio(a[0], [h.lower() for h in a[1:]])
     if (sys.argv[1:] if argv is None else argv)[:1] == ["_switch"]:  # internal: started by start for its networks
         return net_switch((sys.argv[2:] if argv is None else argv[1:])[0])
     if (sys.argv[1:] if argv is None else argv)[:1] == ["_watch"]:  # internal: started by start for each VM
@@ -5659,7 +5839,9 @@ def main(argv=None):
     nsub.add_parser("ls")
     for c in ("attach", "detach"):
         x = nsub.add_parser(c); x.add_argument("name"); x.add_argument("net")
-    it = sub.add_parser("internet"); it.add_argument("name"); it.add_argument("value", nargs="?", choices=["on", "off"])
+    it = sub.add_parser("internet"); it.add_argument("name")
+    it.add_argument("value", nargs="?", choices=["on", "off", "allow"])
+    it.add_argument("hosts", nargs="*", help="with allow (not recommended): the only hosts it reaches, through a proxy")
     qu = sub.add_parser("quota")
     for k, h in (("cpus", "running vCPUs"), ("memory", "GiB of running VMs' memory ceilings"),
                  ("disk", "GiB of virtual disks"), ("vms", "running VMs")):
@@ -5757,7 +5939,11 @@ def main(argv=None):
             for e in events(o.n, o.vm):
                 print(json.dumps(e))
             return
-        if o.cmd == "internet": return print(json.dumps(set_internet(o.name, o.value)))
+        if o.cmd == "internet":
+            if o.value != "allow" and o.hosts:
+                raise SystemExit("internet NAME allow HOST...: hosts go with allow")
+            return print(json.dumps(set_internet(o.name, None if o.value == "allow" else o.value,
+                                                 o.hosts if o.value == "allow" else None)))
         if o.cmd == "net":
             if o.net_cmd == "create":
                 r = net_create(o.net, o.project)

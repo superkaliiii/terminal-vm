@@ -1829,6 +1829,37 @@ class WarmPool(unittest.TestCase):
             tl.pool_fill("tpl-pa", 2)
 
 
+class Allowlist(unittest.TestCase):
+    def setUp(self):
+        tl.STORE = tempfile.mkdtemp()
+        os.makedirs(os.path.join(tl.STORE, "c"))
+        tl.save("c", {"os": "linux", "cloud": True, "cpus": 1, "memory_gb": 1})
+
+    def test_rules_and_preconditions(self):
+        allow = ["pypi.org", "*.github.com", "git.example.org:2222"]
+        self.assertEqual(tl._allowed("PyPI.org.", 443, allow), "pypi.org")
+        self.assertIsNone(tl._allowed("pypi.org", 22, allow))          # 80 and 443 only, unless a port is listed
+        self.assertEqual(tl._allowed("github.com", 80, allow), "*.github.com")
+        self.assertIsNone(tl._allowed("evilgithub.com", 443, allow))   # a suffix match is on a dot
+        self.assertEqual(tl._allowed("git.example.org", 2222, allow), "git.example.org")
+        for bad in ([], ["http://x"], ["x.org:0"]):
+            with self.assertRaisesRegex(SystemExit, "allow HOST"):
+                tl.internet_allow("c", bad)
+        with mock.patch.object(tl, "WINDOWS", False), mock.patch.object(tl, "state", lambda n: "stopped"):
+            with self.assertRaisesRegex(SystemExit, "not been set up yet"):  # cloud-init needs the internet once
+                tl.internet_allow("c", ["pypi.org"])
+            open(os.path.join(tl.STORE, "c", "agent_seen"), "w").close()
+            self.assertEqual(tl.internet_allow("c", ["pypi.org"])["internet"], "allowlist")
+            self.assertEqual(tl.set_internet("c")["allow"], ["pypi.org"])
+            tl.set_internet("c", "on")
+            self.assertNotIn("allow", tl.load("c"))
+        with mock.patch.object(tl, "WINDOWS", True), self.assertRaisesRegex(SystemExit, "Linux or macOS host"):
+            tl.internet_allow("c", ["pypi.org"])
+        nic = tl._egress_nic("c", ["a.org", "b,c"])
+        self.assertTrue(nic.startswith(",restrict=on,guestfwd=tcp:10.0.2.100:3128-cmd:"))
+        self.assertIn("_egress c a.org b,,c", nic)                     # QEMU's commas doubled
+
+
 class CloudImageDownload(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
