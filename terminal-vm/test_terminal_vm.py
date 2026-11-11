@@ -796,6 +796,14 @@ class StoppedVm(unittest.TestCase):
                       first)   # one more, with every property QEMU listed for that slot
         self.assertEqual(out["guest_memory_gb"], 3.0)
 
+    def test_state_of_a_silent_qemu(self):
+        """QEMU alive but its monitor silent (frozen, or busy): unresponsive, never stopped (a node's containers
+        would move away, the daemon would start it a second time)."""
+        from unittest import mock
+        for err, want in ((tl.QMPNoAnswer("silent"), "unresponsive"), (RuntimeError("no socket"), "stopped")):
+            with mock.patch.object(tl, "qmp", side_effect=err):
+                self.assertEqual(tl.state("v"), want)
+
     def test_net_switch(self):
         tl.net_create("lab")
         sw, v, w, x = (socket.socket(socket.AF_INET, socket.SOCK_DGRAM) for _ in range(4))

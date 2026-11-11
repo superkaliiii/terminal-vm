@@ -149,16 +149,20 @@ def load(name):
 
 # ---------- QMP ----------
 
+class QMPNoAnswer(RuntimeError):
+    """QEMU is there (its socket takes the connection) but its monitor does not answer: busy, or QEMU frozen."""
+
+
 class QMP:
-    def __init__(self, addr):
-        end = time.monotonic() + 10
+    def __init__(self, addr, wait=10):
+        end = time.monotonic() + wait
         while True:
             try:
-                self.sock = connect(addr, 10)
+                self.sock = connect(addr, wait)
                 break
             except BlockingIOError:  # EAGAIN: QEMU's one waiting place is taken; not "stopped" (state() said so)
                 if time.monotonic() > end:
-                    raise RuntimeError("QMP busy (other commands are using this VM)") from None
+                    raise QMPNoAnswer("QMP busy (other commands are using this VM)") from None
                 time.sleep(0.05)
             except OSError as e:
                 raise RuntimeError("VM is not running (cannot reach its QMP socket)") from e
@@ -168,7 +172,7 @@ class QMP:
             self.cmd("qmp_capabilities")
         except OSError as e:
             self.sock.close()
-            raise RuntimeError("QMP busy or not answering (another command is using this VM)") from e
+            raise QMPNoAnswer("QMP busy or not answering (another command is using this VM)") from e
 
     def _recv(self):
         while b"\n" not in self.buf:
@@ -196,14 +200,16 @@ class QMP:
         self.sock.close()
 
 
-def qmp(name):
-    return QMP(endpoint(name, "qmp"))
+def qmp(name, wait=10):
+    return QMP(endpoint(name, "qmp"), wait)
 
 
 def state(name):
-    """running / paused / stopped, without raising."""
+    """running / paused / stopped / unresponsive (QEMU alive, its monitor silent: frozen or busy), without raising."""
     try:
-        q = qmp(name)
+        q = qmp(name, 3)  # short: a silent monitor is "unresponsive" now, not "stopped"; ls stays quick
+    except QMPNoAnswer:
+        return "unresponsive"
     except RuntimeError:
         return "stopped"
     try:
