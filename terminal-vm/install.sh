@@ -1,14 +1,14 @@
 #!/bin/sh
 # terminal-vm installer for Linux, macOS and WSL: the tool, what it needs (after one confirmation), the command on
 # the PATH, and Claude Code's MCP server and skill when Claude Code is there. No root for the tool itself.
-#   curl -fsSL https://raw.githubusercontent.com/superkaliiii/terminal-mac-inspection/unified/terminal-vm/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/superkaliiii/terminal-vm/main/terminal-vm/install.sh | sh
 #   sh install.sh [--yes] [--no-deps] [--no-mcp] [--prefix DIR] [--update] [--uninstall]
 set -eu
 TOOL=terminal-vm
 FILE=terminal_vm.py
 SKILL=skills/terminal-vm/SKILL.md
 STOREVAR=TERMINAL_VM_HOME
-ARCHIVE=${TERMINAL_VM_ARCHIVE:-https://github.com/superkaliiii/terminal-mac-inspection/archive/refs/heads/unified.tar.gz}
+ARCHIVE=${TERMINAL_VM_ARCHIVE:-https://github.com/superkaliiii/terminal-vm/archive/refs/heads/main.tar.gz}
 SUBDIR=terminal-vm  # where FILE sits in that archive
 PYMIN=8             # Python 3.PYMIN or later
 needs() {           # the packages this tool needs that are missing here, for package manager $1

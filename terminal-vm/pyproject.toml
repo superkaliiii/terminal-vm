@@ -14,7 +14,7 @@ keywords = ["vm", "qemu", "mcp", "agents", "computer-use", "desktop"]
 classifiers = ["Programming Language :: Python :: 3", "Environment :: Console", "Topic :: System :: Emulators"]
 
 [project.urls]
-Homepage = "https://github.com/superkaliiii/terminal-mac-inspection/tree/unified/terminal-vm"
+Homepage = "https://github.com/superkaliiii/terminal-vm"
 
 [project.scripts]
 terminal-vm = "terminal_vm:main"

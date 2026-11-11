@@ -4,7 +4,7 @@
 
 Please report vulnerabilities privately through GitHub:
 **Security → Report a vulnerability** on this repository
-([private vulnerability reporting](https://github.com/superkaliiii/terminal-mac-inspection/security/advisories/new)).
+([private vulnerability reporting](https://github.com/superkaliiii/terminal-vm/security/advisories/new)).
 Do not open a public issue for a security problem.
 
 Include the tool and its version (`terminal-vm version`, `terminal-mac --version`), the host OS, the steps that

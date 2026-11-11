@@ -1,198 +1,415 @@
-# terminal-mac
+<div align="center">
 
-[![](https://img.shields.io/static/v1?label=Sponsor&message=%E2%9D%A4&logo=GitHub&color=%23fe8e86)](https://github.com/sponsors/govijr)
-<a href="https://buymeacoffee.com/govijr" target="_blank"><img src="https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png" alt="Buy Me A Coffee" style="height: 21px !important;width: 108px !important;box-shadow: 0px 3px 2px 0px rgba(190, 190, 190, 0.5) !important;-webkit-box-shadow: 0px 3px 2px 0px rgba(190, 190, 190, 0.5) !important;" ></a>
+# terminal-vm
 
+**A separate desktop VM for computer-use agents, viewed and driven from a terminal.**
 
-A separate macOS desktop for computer-use agents, viewed and controlled from a terminal.
+[![CI](https://github.com/superkaliiii/terminal-vm/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/superkaliiii/terminal-vm/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.8%2B-3776ab?logo=python&logoColor=white)
+![Dependencies](https://img.shields.io/badge/dependencies-QEMU%20only-brightgreen)
+![Guests](https://img.shields.io/badge/guests-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey)
 
-`terminal-mac` is an early release candidate for Apple silicon. Apple Virtualization runs a real macOS guest. A bundled helper **inside that guest** captures its screen and posts input events. A terminal viewer streams that screen using Kitty or iTerm2 graphics. Agent commands use the same helper without moving the physical Mac's pointer or changing its clipboard.
+[Install](#install-and-run) · [Agents](#use-with-agents) · [Commands](#commands) · [Cloud images](#cloud-images) ·
+[Windows guests](#windows-guests) · [Supervision](#supervision) · [Web dashboard](#web-dashboard) · [Measurements](#measurements)
 
-The guest is a separate Mac: it has its own apps, files, accounts and permissions. It does not inherit your running host apps or signed-in sessions. The VM still consumes host CPU, memory and storage.
+</div>
+
+One command and one MCP server: the same tools everywhere (`screenshot`, `click`, `move`, `drag`, `scroll`, `type`, `key`, `status`), and the host desktop is never touched.
 
 > [!NOTE]
-> **This fork has not been tested on real Mac hardware yet.** Its changes build and pass their unit tests on
-> GitHub's macOS runners only. Reports from Mac users are very welcome: open an issue with what worked and what did
-> not.
+> **macOS: not tested on real Mac hardware yet.** Linux (and WSL) and Windows hosts are tested for real; macOS hosts and macOS guests (through
+> terminal-mac on Apple silicon) are not. macOS runs in CI only (unit tests on GitHub's macOS
+> runners); nothing has been tried on a physical Mac. Reports from Mac users are very welcome: open an issue with
+> what worked and what did not (`doctor --report` output helps).
+
+## Highlights
+
+- **Any desktop guest**: Linux and Windows on QEMU (KVM or WHPX), macOS through terminal-mac on Apple silicon.
+- **Unattended setup**: Debian live in one command (`up`), Windows answer files, official Debian/Alpine cloud images.
+- **In the terminal**: an interactive viewer (Kitty graphics or Sixel) that leaves agents working while you watch.
+- **Clones in under a second** (copy-on-write), snapshots with memory, file copies through the guest agent.
+- **Supervision**: restarts, health checks, idle pause and wake, events; quota and live resources.
+- **Agents first**: an MCP server with authority rules, an `infra` map read in one call, a one-line description on
+  every VM, network and project, projects with notes, an agent skill, a web dashboard shared
+  with read-only or full users, and VMs driven from another PC through [terminal-ct](https://github.com/superkaliiii/terminal-conteneur).
+
+| Host | Linux guests | Windows guests | macOS guests |
+|---|---|---|---|
+| Linux (QEMU + KVM) | yes | yes | no |
+| Windows (QEMU + WHPX) | yes | yes | no |
+| Mac, Apple silicon | planned (ARM) | planned (Windows 11 ARM) | yes, through terminal-mac |
+
+macOS runs only on Apple hardware (Apple's licence; Apple Virtualization needs Apple silicon). On a Mac, terminal-vm hands macOS VMs to [terminal-mac](https://github.com/govijr/terminal-mac) with the arguments unchanged: `up` and `create` without `--os` (or with `--os macos`), and any command naming one of terminal-mac's VMs, `mcp NAME` included. `ls` lists both. Set `TERMINAL_MAC_BIN` if terminal-mac is not on the PATH.
+
+For Linux and Windows guests, the host drives QEMU over QMP (only the optional guest agent runs inside): `screendump` captures the screen, `input-send-event` / `send-key` inject input through a virtual USB tablet and keyboard. The host desktop is never touched. One Python file, standard library only.
 
 ## Requirements
 
-- Apple silicon Mac, macOS 14 or later.
-- No development tools are needed for a prebuilt release. Maintainers need Xcode 16 or later / Swift 6 to build.
-- Internet on first run to download macOS directly from Apple, or an existing compatible `.ipsw`.
-- Space for the cached restore image and a growing VM disk (64 GiB logical size by default).
-- Ghostty, Kitty or iTerm2 for the inline viewer. Other terminals can use the native VM window and agent CLI. tmux passthrough and automatic terminal splits are not implemented.
+- Linux host with KVM (`/dev/kvm` accessible: `sudo usermod -aG kvm $USER`), QEMU >= 7.1, Python >= 3.8.
+  Debian/Ubuntu: `sudo apt install qemu-system-x86 qemu-utils python3`
+- Optional: `qemu-system-gui` (window at install time), `tigervnc-viewer` (`show`), a terminal with inline images for `view`: Kitty, Ghostty, WezTerm (Kitty graphics) or Windows Terminal >= 1.22, foot, mlterm (Sixel).
+- A guest with USB tablet support (any current distribution).
 
 ## Install and run
 
+Linux, macOS and WSL:
+
 ```sh
-curl -fsSL https://github.com/govijr/terminal-mac/releases/latest/download/get.sh | bash
+curl -fsSL https://raw.githubusercontent.com/superkaliiii/terminal-vm/main/terminal-vm/install.sh | sh
 ```
 
-The installer downloads the latest release and verifies its SHA-256 before installing. You can also extract a release ZIP and run `bash install.sh` from it.
+Windows:
 
-The installer places one launcher in `~/.local/bin` and the bundled runtime under `~/.local/lib/terminal-mac`. Add `~/.local/bin` to your PATH to use simply `terminal-mac`. It needs no administrator rights and does not edit your shell configuration. `bash install.sh --prefix /absolute/path` selects another location.
+```powershell
+irm https://raw.githubusercontent.com/superkaliiii/terminal-vm/main/terminal-vm/install.ps1 | iex
+```
 
-Running `terminal-mac` in an interactive terminal starts the guided flow. `terminal-mac up` does the same explicitly. It automatically downloads/caches a compatible Apple restore image, installs a virtual Mac, boots it and checks the guest helper. Later runs reuse the existing VM and reconnect. Unsupported terminals get the native desktop window.
+One command does it all: what is missing (Python, QEMU, KVM access; on Windows QEMU and the Windows Hypervisor
+Platform) after one confirmation, `terminal-vm` on the PATH, and, when Claude Code is installed, its MCP server and
+skill. Options: `--yes`, `--no-deps`, `--no-mcp`, `--update`, `--uninstall` (VMs stay); on Windows `-Yes`, ... or
+`TERMINAL_VM_INSTALL="-Yes"` before `irm`. Other ways: `pipx install terminal-vm` / `uvx terminal-vm`,
+`npm i -g terminal-vm`, `.deb` and `.rpm` (`packaging/build.sh`), Homebrew (from the first public release).
+`terminal-vm doctor` gives the fix for each known problem; `doctor --report` writes a masked report for an issue.
 
-**Current status:** early release candidate. Releases are self-signed (no Apple notarization), which the curl installer doesn't need. Live guest acceptance on a clean Mac is still pending.
+```sh
+terminal-vm up        # downloads Debian live XFCE (SHA-256 verified), creates, boots, opens the viewer
+```
+
+`up --plan` previews the steps. `create NAME [--iso PATH] [--cpus 4 --memory 4 --disk 32 --width 1280 --height 800 --layout us|fr --offline]` customises a new VM.
 
 ## Use with agents
 
-terminal-mac gives agents computer use in a separate virtual Mac, through MCP tools (`screenshot`, `click`, `drag`, `scroll`, `type`, `key`, `status`) and a skill that teaches the observe → act → verify loop.
-
-**Claude Code**, with the MCP server and skill in one plugin:
-
-```text
-/plugin install terminal-mac --marketplace govijr/terminal-mac
-```
-
-Or add them separately:
+The installer declares the MCP server and skill for Claude Code when it is there. By hand, or for another client:
 
 ```sh
-claude mcp add terminal-mac -- terminal-mac mcp
-terminal-mac skills install                 # → ~/.claude/skills/terminal-mac/SKILL.md
+claude mcp add -s user terminal-vm -- terminal-vm mcp default
+terminal-vm skills install            # ~/.claude/skills/terminal-vm/SKILL.md
 ```
 
-**Other MCP clients** (Cursor, VS Code, Codex, Windsurf…): paste the output of `terminal-mac mcp --config` into the client's MCP settings. Use `terminal-mac mcp NAME` for a VM other than `default`.
+or install this folder as a Claude Code plugin (`.claude-plugin/`).
 
-**Any agent with a skills folder:** `terminal-mac skills install --dir PATH`, or `npx skills add govijr/terminal-mac --skill terminal-mac`. In an `AGENTS.md`, a line like "Before using the virtual Mac, run `terminal-mac skills get`" gives the agent instructions that match the installed version.
+## Commands
 
-The tools only drive the guest helper. They never touch your own desktop. When the guest is at its login screen, they say so, so the agent can ask you to sign in.
+| Command | |
+|---|---|
+| `ls`, `status NAME`, `doctor`, `help`, `version` | list VMs, state + screen + logged-in users, host checks |
+| `start NAME [--window]`, `pause`, `resume` | lifecycle |
+| `create NAME --image debian\|alpine [--node]` | a Linux VM from an official cloud image instead of an ISO, set up unattended at its first start (see [Cloud images](#cloud-images)); `--node`: with Docker, a node for terminal-ct |
+| `exec NAME [--timeout 60] [--stdin FILE] -- PROGRAM ARGS` | run a program in the guest through its agent (no shell); JSON reply `{exit, stdout, stderr}` |
+| `exec NAME --background -- PROGRAM ARGS`, `job NAME [ID] [--kill] [--tail BYTES]` | start a job in the guest and return its id at once (builds, tests, servers: no timeout); `job` gives its exit code or state (`running`, `lost`) and the end of its output, `--kill` stops it with its children (Linux: its process group; Windows: its process tree); no ID: the jobs. They live in the guest's temp folder and end when it restarts; a job asleep for the VM's `--idle-pause` minutes is paused with it |
+| `web [--project P] [--no-open]` | web dashboard of the VMs and, when installed, terminal-ct's containers (see [Web dashboard](#web-dashboard)) |
+| `web user add NAME [--role read\|full]`, `web user ls`, `web user rm NAME`; `web --listen IP\|off [--port N]` | share the dashboard with other people or agents (see [Shared session](#shared-session)) |
+| `bench [--runs 10] [--from VM]` | timings of terminal-vm's own operations on a clone (see [Measurements](#measurements)) |
+| `daemon run\|start\|stop\|status`, `supervise NAME [--restart always\|never] [--idle-pause MIN]`, `events [-n 50] [--vm V]` | supervision: restarts, health, idle pause, events (see [Supervision](#supervision)) |
+| `resume [--stay]`, `autostart [on\|off]` | start again the VMs that were running before a restart; at each logon (see [Restarts](#restarts)) |
+| `infra [--project P] [--json]` | the map: this PC's quota, every VM (state, ceiling and use, networks and addresses, description, creator, managed), networks and members, projects, and terminal-ct's map when installed (see [Projects](#projects)) |
+| `describe vm\|net\|project NAME [TEXT\|--clear]` | one line on what it is for (no TEXT: show it); `--description TEXT` on `create`, `clone`, `net create` |
+| `project ls`, `project show [P]`, `project notes [P [TEXT]]`, `project move NAME P`; `create --project P` | projects (see [Projects](#projects)) |
+| `stop NAME [--timeout 60]` / `--force` | asks the guest and waits; reports a guest showing a confirmation dialog |
+| `rm NAME` / `reset NAME` | delete a stopped VM / give it a blank disk of the same size (reinstalls on the next start, Windows answers kept) |
+| `clone SRC NEW` | copy-on-write copy of a stopped VM in under a second: install once, clone many (Windows Server 2025 clone ready in 0.3 s + 28 s boot instead of a 37-min install). SRC's disk moves to a read-only base in `.bases/` of the store and SRC becomes an overlay on it too, so both keep running and changing independently; clones of an unchanged SRC share one base, and a base is deleted with its last VM (`rm`/`reset`). SRC must have no snapshots (they would stay in the base). Clones keep SRC's account. A Windows clone with the guest agent takes its own computer name (from the VM name) at its first start, without a reboot: about 30 s after the agent answers, its session logs off and back on automatically; NetBIOS is turned off in it (the old name would stay registered until a reboot), names resolve through DNS/LLMNR |
+| `pool fill SRC [--size 2]`, `pool take SRC`, `pool ls`, `pool rm SRC` | a warm pool: clones of a stopped SRC booted until their guest agent answers, then paused (they keep their memory, counted in the quota); `take` hands one over running in about 0.4 s instead of a boot (measured: Alpine cloud VM, take 0.41 s, first `exec` 0.36 s after it). Members are for agents (`created_by: agent`; MCP `vm_take`); `fill` stops at the quota and says what it made; refill with `fill` again |
+| `snapshot NAME save\|load\|rm TAG`, `snapshot NAME ls` | qcow2 snapshots: whole machine with memory while running, disk only while stopped |
+| `display NAME --width W --height H` | screen size at the next start |
+| `layout NAME [us\|fr]` | show or change the keyboard layout used by `type`/`key` (us = QWERTY, fr = AZERTY), even while running; `action ... --layout` overrides it for one call |
+| `image [--os OS] [--plan]` | download the installation image only |
+| `push NAME LOCAL GUEST` / `pull NAME GUEST LOCAL` | copy files through qemu-guest-agent (must be installed in the guest) |
+| `view NAME [--read-only]` | interactive terminal viewer (keyboard, mouse, wheel): Kitty graphics, else Sixel (adaptive 255-colour palette, text kept legible when shrunk), else the VNC window; centred, follows resizes, redraws only what changed; Ctrl+] exits, Ctrl+O opens the window |
+| `show NAME [--read-only]` / `hide NAME` | native window through VNC (unix socket); `--read-only` needs TigerVNC |
+| `action NAME screenshot\|click\|move\|drag\|scroll\|type\|key\|wait ...` | one action, JSON reply; `screenshot --no-wake` only looks (a paused VM stays paused, an idle one keeps counting) |
+| `mcp [NAME] [--project P]` | stdio MCP server (also exposes `wait`: until the screen stops changing; with `screenshot: true` an action returns the screen once it has changed, up to 1.5 s) |
+| `skills get\|path\|install` | agent skill |
 
-## One-time guest setup
+The viewer has its own QMP monitor, so agents keep working while someone watches.
 
-The first run opens the virtual Mac's window. Complete macOS setup and create its user account. Inside the guest, open Finder → `/Volumes/My Shared Files/tools` → `TerminalMacGuest.app` once. The helper installs itself in the guest's `~/Applications`, launches that installed copy and registers for future guest logins, subject to macOS approval.
+Under WSL, the distribution can be stopped when no WSL terminal is open, which kills its VMs (a Windows install cut short leaves an unbootable disk: `reset NAME`, then `start NAME`). Keep one open, e.g. `wsl -d Debian -- sleep infinity`; `doctor` warns about it. The WSL disk grows inside the Windows drive while `df` in WSL shows its virtual size: keep ~20 GB free on the Windows drive per Windows guest, or the distribution fails with I/O errors. 
 
-Use its two buttons to grant **Screen Recording** and **Accessibility** inside the guest. Reopen it if macOS asks. If needed, its **Guest Login Items** button opens the startup setting. The host needs neither privacy permission. Once both guest permissions are ready, the CLI automatically continues to the terminal desktop.
+## Cloud images
 
-This is guided setup, not an unattended guest installation. Apple documents automatic account provisioning for macOS 27 guests; this build targets the APIs available in the installed macOS 26 SDK and does not implement that newer flow. See [Apple's provisioning documentation](https://developer.apple.com/documentation/virtualization/vzmacguestprovisioningoptions).
+`create NAME --image debian|alpine [--node]` boots an official cloud image (Debian 13 `genericcloud`, or Alpine's
+`bios-cloudinit` image), already installed: no ISO, no setup screens.
+- The image is downloaded once into `images/` of the store and checked against the SHA-512 list its project
+  publishes; the VM's disk is an overlay on it, grown to `--disk`. Offline, the newest cached image is used.
+- cloud-init sets it up at the first start from a FAT disk labelled `cidata` (QEMU's `vvfat`, so Windows hosts need
+  nothing more): host name = VM name, a `user` account (password in the reply and in `machine.json`), the guest
+  agent; `--node` adds Docker and Python 3. It needs the internet for those packages.
+- It is ready when its `ready_file` (in the reply) exists in the guest (with `--node`, once Docker answers).
+- `clone` and `reset` set the copy up again (new instance id); `reset` starts from the image.
+
+### Nodes in seconds
+
+A node (`--node`) is not set up by cloud-init each time: terminal-vm builds a **node template** once per kind and
+cloud image (`images/node-...-t1.qcow2`, read only; Alpine 436 MB, about 2 min, Debian about 4 min, with the
+internet), then every node is an overlay on it.
+- The template is the cloud image set up once (Docker, Python 3, the guest agent), then slimmed: cloud-init and the
+  NTP daemon off (terminal-vm sets the clock), DHCP without its ARP probe and IPv6 wait, no boot menu delay,
+  services started in parallel; its account, SSH host keys and machine ids removed.
+- A node's own identity is set by the guest agent at its first start: host name, `user` account and password (sent
+  on stdin, never in the guest's process list), root file system grown to `--disk`, new SSH host keys; then its
+  ready file, once it has a route and Docker answers. `clone` and `reset` do it again.
+- A newer cloud image (or a new template version) builds a new template; older ones go when no VM (nor a clone's
+  base) is built on them. A clone gets new SSH host keys, machine id and Docker id. Templates, like cloud images,
+  are a cache outside the disk quota (0.4-1 GB each).
+- One build at a time per kind (others wait for it); a build that was killed is taken over by the next `create`,
+  and its leftover `tmpl-*` VM removed. A node whose identity step fails is never reported ready
+  (`identity_failed` event, details in its `qemu.log`).
+
+| WSL with nested KVM | from the cloud image | node template |
+|---|---:|---:|
+| Alpine node, first start to ready | 91 s | **9.6 s** |
+| Alpine, later start to Docker answering | 66 s | **5 s** |
+| Debian node, first start to ready | ~120 s | **9.1 s** |
+| Debian, later start to Docker answering | — | 11 s |
+| clone of a node, start to ready under its own name | — | 10-12 s |
+
+Where the time went before: the boot menu waited 10 s, cloud-init ran at every boot (~35 s), DHCP probed the
+address and waited for IPv6 (~6 s).
+
+## Windows guests
+
+`--os` picks a hardware profile that each Windows version drives with its built-in drivers, and an answer file that installs it unattended (local administrator with automatic logon, OOBE skipped). `create` prints the generated user and password.
+
+| `--os` | Machine | Disk | Network | Display | USB | Key | Notes |
+|---|---|---|---|---|---|---|---|
+| `winxp` | i440fx | IDE | rtl8139 | Cirrus | UHCI | **required** | `winnt.sif` on a virtual floppy; 32-bit ISO; generic `qemu64` CPU |
+| `win7` | q35 | AHCI | e1000 | std VGA | EHCI | optional | no xHCI driver in Windows 7 |
+| `win8` | q35 | AHCI | e1000 | std VGA | xHCI | **required** | Setup refuses to continue without a key |
+| `win10`, `win11` | q35 | AHCI | e1000e | std VGA | xHCI | default: Microsoft's public KMS client key for Pro (installs, does not activate) | Windows 11: TPM, Secure Boot and CPU checks bypassed with Setup's LabConfig keys |
+| `win2016` … `win2025` | q35 | AHCI | e1000e | std VGA | xHCI | none (evaluation media) | image 2: Standard with Desktop Experience |
 
 ```sh
-terminal-mac up work                  # another virtual Mac
-terminal-mac up --ipsw /path/mac.ipsw  # use a local image
-terminal-mac up --no-view             # wait for agent readiness, then return JSON
-terminal-mac up --detach              # install/boot, return without waiting for guest setup
-terminal-mac up --plan                # show steps without network access or disk changes
+terminal-vm up srv --os win2025            # downloads Microsoft's evaluation ISO, installs unattended
+terminal-vm create w11 --os win11 --iso Win11_24H2_French_x64.iso --ui-language fr-FR --layout fr
+terminal-vm create xp --os winxp --iso xp-sp3.iso --product-key XXXXX-XXXXX-XXXXX-XXXXX-XXXXX
 ```
 
-The first download may take time; packaging cannot eliminate downloading and installing macOS. The image cache is reused, and URLSession resume data is retained after recoverable network failures. A hard process kill may require the current download to restart. An incomplete installation with recorded hardware can be retried by `up` using a compatible restore image; an already installed VM is never reinstalled by `up`.
+Only Windows Server 2025 evaluation media is downloaded automatically (straight from Microsoft); other versions need your own ISO and licence. `--ui-language` must be the ISO's language (default `en-US`), `--layout` sets the keyboard. Characters outside the keyboard layout are typed with Windows' hex Unicode entry (Alt, numpad +, hex code), enabled by the answer file. Windows 10/11 and Server 2016+ guests get the VirtIO serial driver and qemu-guest-agent at first logon (Fedora's virtio-win guest tools 0.1.302, ~31 MB, downloaded once over HTTPS and SHA-256 pinned, served from the answers drive), so `status` reports the logged-in user and `push`/`pull` work as on Linux. Older Windows, or a host that cannot download them, works without the agent (users reported as unknown, no file copy). Until the first clean `stop`, an installing Windows VM boots with its vCPU ceiling when the quota has room, and the first logon ends by logging off and back on automatically (2 minutes) instead of rebooting (8 minutes of "Updates are underway" on Server 2025). The answer file also sets the host's time zone (read with `tzutil`, from WSL too; UTC on other Linux hosts) with a local-time clock, and keeps Server Manager from opening full screen at every logon on Windows Server. Under KVM, Windows guests get Hyper-V enlightenments: on Server 2025, boot to the guest agent went from 30 to 19 s and idle CPU from 240 % to 40 %.
 
-## Build from source
+## Windows hosts
+
+The same file runs on Windows 10/11 and Windows Server hosts with Python 3.8+ and QEMU (`winget install SoftwareFreedomConservancy.QEMU`). Enable the Windows Hypervisor Platform for speed (as administrator: `Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform`, then restart); without it QEMU falls back to slow emulation. `doctor` checks both. QMP and the guest agent use unix sockets in the VM's folder under your profile, as on Linux, so other users cannot reach them (Windows 10 1803+ and QEMU >= 7.2; Python reaches them through Winsock). VNC listens on a random localhost port behind a password generated at each start, which `show` prints for the viewer's prompt. Snapshots of a running VM are refused by QEMU on Windows hosts (no dirty-memory tracking): stop the VM first, then `snapshot NAME save TAG` (disk only). `view` draws the guest inside Windows Terminal (Sixel, keyboard and mouse through VT input), centred and scaled to the window, redrawing only what changed. Windows Terminal reports the mouse by cell only; on a Windows host the viewer refines it with the host cursor position, so the two pointers line up (the guest needs an absolute pointer: Windows and current Linux desktops have one, TinyCore's Xvesa does not). For the sharpest image, shrink the font (Ctrl+-) until the window holds the guest screen at 1:1 (about 103x39 cells for 1024x768). Other Windows terminals (WezTerm included) pass no images through ConPTY: `view` opens a VNC window there (TigerVNC), or use `start NAME --window`. Use `terminal-vm.cmd` from this folder as the launcher.
+
+## Networks
+
+Small infrastructures without administrator rights: `net create lab`, then `net attach VM lab` on stopped VMs (each gets a NIC with a stable MAC and a suggested address in 10.77.N.0/24), `net ls`, `net detach VM lab`, `net rm lab`. A network is a small learning switch (Python, UDP on the loopback interface) that `start` launches when a VM on it starts and that exits a minute or two after the last one stops; each NIC is a QEMU `dgram` socket plugged into it, the same on Linux, macOS and Windows hosts (QEMU >= 7.2). VMs on it reach each other, never the LAN or the internet (a local process could send to or read from the switch port). There is no DHCP: set the suggested addresses in the guests, or run a DHCP server in one of them. Internet access is QEMU's NAT, per VM: `internet NAME on|off` (stopped VM); a sandboxed VM stays offline unless the user turns it on for it. Bridging VMs onto the real LAN needs a one-time administrator setup and is not included yet. Verified: two Tiny Core guests on an isolated network ping each other (0% loss) and cannot reach the internet (Linux host under WSL, 2-6 ms); on a Windows host, a guest's ARP and pings cross the switch both ways to a test peer, and broadcasts reach every member. Networks made before the switch: `net rm` and `net create` them again.
+
+**Allowlist (not recommended unless you know what you are doing; off by default).** `internet NAME allow
+pypi.org '*.github.com' host:port` (stopped VM, Linux and macOS hosts: QEMU for Windows cannot do it) keeps QEMU's
+NAT but with `restrict=on`, so nothing leaves the guest, and one way out: `10.0.2.100:3128`, where each guest
+connection starts a small proxy on this PC (`guestfwd ... cmd:`) that reaches only those hosts (ports 80 and 443
+unless a port is given; a listed name that resolves to a private address is refused). It understands CONNECT and
+plain `GET https://...` (busybox wget). `exec` and jobs get `http(s)_proxy`; the daemon also writes them into the
+guest once its agent answers (Linux: `/etc/profile.d`, `/etc/environment`, apt; Windows: machine variables and
+WinHTTP) and takes them away after `internet NAME on|off`. Decisions go to `STORE/NAME/egress.log`. It fails
+closed: a program that ignores the proxy has no internet. Not recommended because only programs that honor the
+proxy get out and an allowed host can still carry any data out. A cloud VM must have started once online first
+(cloud-init installs its guest agent from the internet). Not offered to agents through MCP.
+
+## Quota
+
+One quota covers everything the host runs, so neither people nor agents can overload it. `quota` shows the limits and their use (also an MCP tool, read-only); only the user changes them: `quota --cpus N --memory GiB --disk GiB --vms N`. Defaults come from the host: cores - 1, 75% of RAM, half of the disk space VMs can have, 8 running VMs.
+
+| Counted | When |
+|---|---|
+| vCPUs of running VMs | `start`, `resources --cpus` (more CPUs on a running VM) |
+| memory **ceilings** of running VMs (what QEMU may use: a guest can refuse to give memory back through the balloon) | `start` |
+| virtual disk sizes (what guests can fill) | `create`, `clone` |
+| running VMs | `start` |
+
+Every check runs under a host-wide lock, so two commands cannot both pass and then both start. A VM's default ceiling never exceeds the quota. VMs already above the disk quota still start; new disks wait for room. Under WSL, `df` reports the virtual disk of the distribution, not the Windows drive: the default counts the free space of `C:` too (where WSL keeps it unless moved); if the distribution lives on another drive, set `--disk`.
+
+`top` (also an MCP tool) lists every running VM's real use of the host, QEMU's CPU % of one core and resident memory, read from `/proc` or the Windows process API, next to its allotment and ceiling, followed by the quota.
+
+## Resources
+
+Each VM has a ceiling of CPUs and memory: its template's (`--os`: 8 CPUs and 16 GiB, Windows XP 2 and 3), never above the host, or `create --max-cpus N --max-memory GiB`. Within it, `resources NAME --cpus N --memory GiB` (MCP tool `resources`, so agents size their own VM) changes what the VM uses, live where QEMU and the guest allow it:
+
+| | Live | Otherwise |
+|---|---|---|
+| Memory | up and down, through a VirtIO balloon: the VM boots with its ceiling and gives back what is above its allocation. Linux guests, and Windows 10/11 and Server 2016+ with the guest tools | next start (Windows XP/7/8, or no balloon driver) |
+| CPUs | added on Linux guests (`-smp N,maxcpus=MAX`); qemu-guest-agent brings them online, else the reply says how | removal, and Windows guests (Standard editions cannot add CPUs live): next start |
+
+Verified: Server 2025 went 4 → 2 → 5 GiB without restarting (QEMU's balloon report followed); Debian 13 went from 4 to 6 CPUs live (online once brought up).
+
+## Sandbox
+
+`create NAME --sandbox` (or `sandbox NAME on` for a stopped VM) isolates a VM for an untrusted agent. Only the screen and input reach the guest:
+
+| | Sandbox |
+|---|---|
+| Network | none (`-nic none`) |
+| Guest agent, `push`/`pull` | no agent channel; file copy refused |
+| Disk | writes discarded at every stop (`snapshot=on`): each run starts from the same state. Prepare that state with sandbox off, or `snapshot NAME load TAG` while stopped. A Windows install still writes for real until it is finished |
+| QEMU | seccomp on Linux hosts (`-sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny`); QEMU for Windows has none |
+| MCP | screen and input tools only (as always); every call, failures included, is appended to `actions.log` in the VM folder |
+| Snapshots | refused while running (they would be discarded) |
+
+Not covered: running QEMU under a dedicated system user (needs administrator setup) and host-side CPU or I/O quotas. Verified on Windows Server 2025 in WSL: no network adapter in the guest, a folder created during a run gone after restart, actions logged.
+
+## Agent authority
+
+Through MCP an agent can build a small infrastructure on its own, within the quota: `vm_list`, `vm_create`, `vm_clone`, `vm_start`, `vm_stop`, `vm_remove`, `vm_snapshot`, `vm_resources`, `vm_internet`, `net_list`, `net_create`, `net_remove`, `net_attach`, `net_detach`. The screen tools take an optional `vm` to drive another VM it manages. It manages **sandboxed VMs and the VMs it created** (`created_by: agent` in `machine.json`, set by `vm_create`/`vm_clone`; only the CLI changes it). The user's other VMs and networks stay out of reach.
+
+| Needs the user's approval | CLI the agent is told to ask for otherwise |
+|---|---|
+| internet for a VM | `internet NAME on` |
+| raising a ceiling, or `vm_create` with `max_memory_gb` above the default | `resources NAME --max-cpus N --max-memory GiB` |
+| downloading an installation image | `image --os OS` |
+| plugging a VM into a network the user created | `net attach VM NET` |
+| `vm_clone` of one of the user's VMs (the clone starts offline) | `clone SRC NEW` |
+| `vm_remove`, `snapshot load\|rm` on a sandboxed VM the user created | `rm NAME`, `snapshot NAME load\|rm TAG` |
+
+The server asks through MCP elicitation when the client supports it (a yes/no form); otherwise, or on refusal, the tool fails and names the command. `vm_create` takes only images already in `images/` of the store (never a host path), creates a sandbox by default, and leaves a non-sandboxed VM offline. Every infrastructure call, failures included, is appended to the project's `agent.log` (`STORE/.projects/P/`). The `exec` tool runs a shell command in the guest through qemu-guest-agent (Linux: `sh -c` as root; Windows: PowerShell as SYSTEM; not in sandboxes, which have no guest agent): on the server's own VM, or on another VM the agent manages. Verified under WSL: an agent with MCP alone created two sandboxed Tiny Core VMs and a network, configured them, pinged one from the other (0% loss), then removed everything.
+
+## Restarts
+
+- `start` and `stop` record what each VM should be doing (`want` in its folder). After the PC (or WSL) restarts,
+  `resume` (no VM name) starts again the VMs that were running, within the quota, and leaves alone those stopped on
+  purpose. A VM shut down from inside the guest is recorded as stopped (its watcher sees the guest's own
+  shutdown); one whose QEMU was killed, or the PC cut, comes back.
+- `autostart on` runs it at each logon: on Windows (also from WSL) the user's Run key `terminal-vm-resume` (no
+  administrator needed; from WSL: `conhost --headless wsl.exe ... resume --stay`, which keeps WSL up while VMs run); on Linux a systemd user
+  service (at login; `loginctl enable-linger` for boot without login). `autostart off` removes it, `autostart` alone
+  tells whether it is on. To turn it on:
+
+  ```sh
+  # from Windows, terminal-vm in WSL (Claude Code: prefix with ! to run it in the session)
+  wsl -d Debian -- python3 /path/to/terminal_vm.py autostart on
+  # Windows host, or Linux, or inside WSL
+  python3 terminal_vm.py autostart on
+  ```
+- Containers inside a VM: install [terminal-ct](https://github.com/superkaliiii/terminal-conteneur) in the guest and
+  run `terminal-ct autostart on` there (as the guest's user); with the VM itself on autostart, its containers come
+  back too. Its containers can sit under the VM's project: `TERMINAL_CT_PROJECT=lab/<vm>` in the guest.
+- Agents: the MCP tool `autostart` shows the setting and turns it on or off with the user's approval; with `vm`,
+  it does that for terminal-ct inside that Linux VM (run as the logged-in user through the guest agent), also with
+  approval.
+
+## Supervision
+
+`start` also starts the supervision daemon (`terminal-vm daemon run|start|stop|status`; one per store, it ends by
+itself 10 minutes after the last VM that should run). Every 5 s it:
+
+- starts again a VM that should run but stopped without a guest shutdown (QEMU crashed or was killed: checked on
+  the disk's lock, or on Windows QEMU's process, since QMP answers one client at a time), after 5 s,
+  then 10, 20... up to 5 min between tries while it keeps failing (counted again from 5 s once it stayed up 10 min);
+  a refusal (quota) is retried the same way. `supervise NAME --restart never` leaves such a VM down; closing the
+  window of a VM started with `--window` stops it for good. The daemon and `start`, `stop`, `rm`, `reset`,
+  `clone` and `snapshot` take a per-VM lock, so a restart never runs across one of them.
+- pings the guest agent of running VMs: `unhealthy` after 3 misses in a row (not in the first 5 minutes, not in
+  the minute after a use, only for VMs whose agent answered once), `healthy` when it answers again. Reported, not
+  acted on: a VM holds state.
+- pauses a VM nobody used for its `supervise NAME --idle-pause MINUTES` (no screen action, `exec`, file copy,
+  open `view`, or VNC client such as `show`) that is not computing either (QEMU under 20 % of a core; an idle guest
+  costs it 4-12 %). The next use wakes it at once (`stop` too); a pause by the user (`pause`) stays. Off by
+  default (`--idle-pause 0`).
+- keeps guest clocks on the host's: a guest's clock stops while QEMU is paused and while the host sleeps, and a
+  guest hours behind refuses TLS, `apt` and image pulls. Through the guest agent, the clock is set again after a
+  wake or `resume`, and checked once a minute (which catches a host that slept); stepped only when more than
+  0.25 s off (`clock_set` events), either way (a guest ahead goes back). Measured: 20 s paused, back to 0 s off at
+  once. Node templates have no NTP daemon: a node nobody supervises (`TERMINAL_VM_DAEMON=0`) catches up only at its
+  next resume or start.
+
+What it does goes to `STORE/events.log` (`events [-n 50] [--vm V]`: `restarted`, `restart_failed`, `unhealthy`,
+`healthy`, `idle_paused`, `woken`, `clock_set`, `window_closed`, `supervise_failed`, `daemon_started`/`stopped`), in
+terminal-ct's line format (`vm` where it has `container`). Linux guests also
+give unused memory back to the host while they run (virtio-balloon with free page reporting). Measured (WSL,
+TinyCore): QEMU killed -> running again in 3 s; idle pause and wake by a screenshot as described.
+`TERMINAL_VM_DAEMON=0` turns supervision off.
+
+## Web dashboard
+
+`terminal-vm web [--project P] [--no-open]` starts the daemon if needed and opens its dashboard in the browser
+(from WSL, the Windows one): VMs (state, project, CPU and memory, start, stop, force stop, screen thumbnails and a
+larger refreshed view), the quota, the events, and [terminal-ct](https://github.com/superkaliiii/terminal-conteneur)'s
+containers and stacks when it is installed (on the PATH, or `TERMINAL_CT="python3 /path/terminal_ct.py"`): its
+`dash --json`, logs, start, stop, restart, remove, scale, the stack editor and its screenshots, all through its
+command line. It is the same dashboard as `terminal-ct web` (one block of code, identical in both tools).
+
+- Served by the supervision daemon on 127.0.0.1 only, port `TERMINAL_VM_WEB_PORT` (default 7172; terminal-ct uses
+  7171, so both run side by side). The daemon stays up while a dashboard is open.
+- Every API call needs the token of `STORE/web.token` (owner only, kept across restarts), passed by `web` in the URL
+  fragment; other Host names are refused.
+- Thumbnails are not a use: watching a VM does not keep it from its idle pause; its larger view neither. Use `view`
+  or `show` to work with it.
+
+### Shared session
+
+The same block as terminal-ct's (see its README, "Shared session"):
+- `web user add NAME --role read|full` prints NAME's token once (only its SHA-256 is kept, `STORE/web.users.json`,
+  owner only); `read` sees VMs, screens, logs and events but acts on nothing, `full` acts too. `web user ls`,
+  `web user rm NAME`.
+- `web --listen IP [--port N]` also serves the dashboard over HTTPS on that address (default port 7182), with a
+  certificate for that IP whose fingerprint `web user add` prints; `--listen off` stops. Never 0.0.0.0.
+- Who is there shows on the page; actions, refusals and failures go to `STORE/.web/actions.log`.
+
+### VMs of another PC
+
+terminal-ct on a central PC drives this PC's VMs through its agent (or SSH) when terminal-vm is on the login PATH
+there, in `~/.local/bin`, or in `TERMINAL_VM`: terminal-ct's dashboard lists them as `VM@PC`, and
+`terminal-ct --host PC vm ARGS` runs any terminal-vm command here. Its thumbnails use `screenshot --no-wake` and
+only for running VMs. This tool's own dashboard (7172) shows this PC's VMs only.
+
+The MCP server reaches them too, as `vm: "VM@PC"` (terminal-ct on this PC, the other PC added with `terminal-ct host
+add`): the screen tools, `exec`, `vm_start` and `vm_stop`, under the same rules as here: an agent's own and
+sandboxed VMs freely, the user's after their approval (once per session; a root shell asks again). Creating,
+cloning and removing stay on that PC (`terminal-ct --host PC vm ...`). `action VM TOOL --json '{...}'` takes a
+tool's MCP arguments as they are; `ls` marks the VMs an agent created (`created_by`).
+
+## Measurements
+
+`terminal-vm bench [--runs 10] [--from VM]` times terminal-vm's own operations on a copy-on-write clone of a
+stopped VM (default `t2`; the clone `bench-*` is removed after, the VM itself is never started): clone, start,
+screenshot, pause, resume, `ls`, the dashboard's data, forced stop, rm. Median, min and max per step;
+[`bench/results.json`](terminal-vm/bench/results.json) keeps the runs. In WSL with KVM (TinyCore guest), medians: clone 69 ms,
+start 122 ms (QEMU running, not the guest booted), screenshot 16 ms, pause 4 ms, resume 1 ms, `ls` 2 ms, dashboard
+data 509 ms (mostly `top`'s 0.5 s CPU sample), forced stop 6 ms, rm 48 ms.
+
+## Projects
+
+- A project groups VMs and networks (`create --project P`, `net create NET --project P`; otherwise
+  `TERMINAL_VM_PROJECT`, else `default`) with their notes and agent log (`STORE/.projects/P/`). Sub-projects are
+  paths (`lab/web`, up to 4 levels); whoever has `lab` also has `lab/web`. `project move NAME P` only relabels.
+- `mcp --project P`: the agent sees and reaches only P's VMs and networks (and its sub-projects'), creates and clones
+  into P or below; outside P nothing is listed and nothing can be approved, so each agent keeps to its own project.
+  Its `quota` and `top` show the room left and its project's use, not the other projects'; a name taken elsewhere
+  is just "not available".
+- An agent starts with `infra` (the map: this PC's quota with what is free, every VM with its state, ceiling and
+  use, networks and addresses, description, creator and `managed`, each network with its members, the projects,
+  and terminal-ct's containers, nodes and other PCs when it is installed), then resumes with `project_status`
+  (VMs and networks with what each should be doing, notes, latest actions with errors); `notes_write` keeps notes
+  for the next session. The server says so at connection (MCP `instructions`).
+- Descriptions: one line (at most 200 printable characters) on a VM, network or project (`describe`,
+  `--description` at creation, MCP `describe` and a `description` argument on `vm_create`, `vm_clone`,
+  `net_create`), in `STORE/descriptions.json`: changeable at any time, never inherited by a clone, gone with the
+  object; shown in `ls`, `net ls`, `project show`, `infra` and the web dashboard. An agent describes its own VMs
+  and networks (and its server's project) freely; the user's need their approval.
+
+## Keyboard layouts and text
+
+`type` sends key presses in the guest's layout (`--layout us|fr` at creation, stored per VM, changed with `layout NAME us|fr`; the MCP `type` and `key` tools also take an optional `layout`). It must match the layout active in the guest. Characters outside the layout use Ctrl+Shift+U Unicode entry (GTK/Qt apps). Key chords name letters as the guest layout prints them (`ctrl+a` on an AZERTY guest presses the physical Q key).
+
+## Login detection
+
+With `qemu-guest-agent` installed in the guest, `status` reports the active graphical session's user by reading systemd-logind's state files through the agent (read-only, nothing executed). The MCP server refuses input actions only when the guest is definitely at a login screen; without the agent, the state is reported as unknown.
+
+## Tests
 
 ```sh
-bash scripts/build.sh
-./dist/terminal-mac doctor
+cd terminal-vm && python3 -m unittest -v   # layouts, viewer input parsing, QMP and guest-agent protocol against fake servers
 ```
 
-The build creates `dist/TerminalMac.app`, including `TerminalMacGuest.app`, and the `dist/terminal-mac` launcher. Virtualization needs the host executable's `com.apple.security.virtualization` entitlement; use the packaged launcher instead of the unsigned Swift build product.
+## Repository layout
 
-It is signed with the self-signed "Govijr Code Signing" identity when your keychain has it (`bash scripts/create-signing-identity.sh` makes one), and ad-hoc otherwise. A stable identity keeps the guest helper's permissions across rebuilds; ad-hoc builds need them granted again. [RELEASING.md](RELEASING.md) covers signing and publishing.
+| Path | What |
+|---|---|
+| [`terminal-vm/`](terminal-vm) | terminal-vm: one Python file (`terminal_vm.py`), its tests, installers and packages |
+| [`skills/`](skills) | agent skills (Claude Code) |
+| [`Sources/`](Sources), [`Tests/`](Tests), [`scripts/`](scripts) | terminal-mac (Swift): the macOS guest on Apple silicon that terminal-vm hands macOS VMs to; see [terminal-mac.md](terminal-mac.md) |
 
-## Create your first Mac
+terminal-mac started as [govijr/terminal-mac](https://github.com/govijr/terminal-mac) (MIT), the idea this project
+grew from; its code is kept here with its copyright notice.
 
-```sh
-# Show the URL and version without downloading anything:
-./dist/terminal-mac image
+## License
 
-# Explicitly download Apple's latest supported restore image (several GB):
-./dist/terminal-mac image --output /tmp/RestoreImage.ipsw
-
-# Install macOS. The disk is sparse, and the IPSW is not copied into the VM bundle.
-./dist/terminal-mac create default --ipsw /tmp/RestoreImage.ipsw
-./dist/terminal-mac start default --window
-```
-
-Complete macOS Setup Assistant in the VM window and create a guest account. Inside the guest:
-
-1. Open Finder → `/Volumes/My Shared Files/tools`.
-2. Open `TerminalMacGuest.app`. It installs itself to the guest's `~/Applications` and opens the installed copy.
-3. Use the helper's buttons to grant **Screen Recording** and **Accessibility** in the guest's System Settings. Reopen the helper if macOS asks. The host does not need either permission.
-4. Keep the guest logged in and the helper running. It registers itself for guest login; approve that setting if macOS requests it.
-
-On the host:
-
-```sh
-./dist/terminal-mac action default status
-./dist/terminal-mac hide default
-./dist/terminal-mac view default
-```
-
-The viewer supports typing, left/right clicks, double and triple clicks, dragging, scrolling, arrows and common control keys. **Ctrl+G** opens a palette of Mac shortcuts (Spotlight, Mission Control, copy/paste, close/quit and more), because terminals keep ⌘ for themselves. **Ctrl+]** exits the viewer while the VM keeps running. Closing the native VM window hides it and also leaves the VM running.
-
-The guest helper keeps a ScreenCaptureKit stream open while a viewer is watching. It sends a frame only when the screen changes (up to 30 fps), already sized to the pixels the terminal draws, as lossless lz4-compressed pixels. Kitty and Ghostty receive those frames through shared memory rather than the pty. An idle desktop costs nothing, and the stream stops 15 seconds after the viewer leaves. From build 4 on, the guest helper updates itself: within 30 seconds of a newer build appearing in the shared tools folder, it installs that build and relaunches. Helpers from build 3 and earlier still work but poll full screenshots, and the header shows "snapshots". Update those once by opening `/Volumes/My Shared Files/tools/TerminalMacGuest.app` in the guest. Releases are signed with one unchanging self-signed certificate, so the guest keeps its Screen Recording and Accessibility approvals across updates.
-
-Agents can drive the guest through an MCP server: `claude mcp add terminal-mac -- "$PWD/dist/terminal-mac" mcp default`. See [docs/AGENT.md](docs/AGENT.md).
-
-New VMs use a 2x HiDPI display (for example 2560×1600 pixels at 220 ppi for the default 1280×800 points), so text stays sharp on Retina terminals. Switch a stopped VM with `terminal-mac display default --hidpi` or `--standard`.
-
-The automounted volume is supplied by macOS virtio-fs. If it is absent, check the guest's macOS version and the VM log; this prototype has no fallback guest transport.
-
-## Give an agent computer control
-
-```sh
-./dist/terminal-mac action default screenshot --output /tmp/guest.png
-./dist/terminal-mac action default click 640 400
-./dist/terminal-mac action default type 'Hello from the agent'
-./dist/terminal-mac action default key cmd+space
-./dist/terminal-mac action default key return
-./dist/terminal-mac action default scroll --dy -300 --x 640 --y 400
-```
-
-Commands return JSON and a nonzero exit status on failure. Screenshots return a local host PNG path. Coordinates start at the top-left and match the screenshot's dimensions; screenshots use guest display points to keep input coordinates consistent on Retina displays. `snapshot` is currently a screenshot alias, not an accessibility-tree snapshot.
-
-The agent instructions are in [docs/AGENT.md](docs/AGENT.md). No global agent settings are modified.
-
-## Lifecycle and resources
-
-```sh
-./dist/terminal-mac ls
-./dist/terminal-mac status default
-./dist/terminal-mac pause default
-./dist/terminal-mac resume default
-./dist/terminal-mac show default
-./dist/terminal-mac stop default          # request a normal guest shutdown
-./dist/terminal-mac stop default --force  # immediate power-off; unsaved guest work can be lost
-```
-
-Customize a new VM with `--cpus 4 --memory 4 --disk 64 --width 1280 --height 800` (width and height are in points; add `--standard` for a 1x display). CPU, memory and disk arguments are logical CPUs, GiB and GiB respectively. `--offline` omits the guest network device; the shared-folder control channel still works, though some macOS setup workflows may require networking.
-
-VM data lives in `~/Library/Application Support/terminal-mac/machines/NAME/`. `TERMINAL_MAC_HOME` overrides the data root. Each VM has an exclusive file lock, a sparse disk, hardware identity, auxiliary boot storage, `machine.json`, a private host-control mailbox, the guest exchange directory, and `runtime.log`. A VM boot runs as a separate background process. Lifecycle commands must use the same `TERMINAL_MAC_HOME` as the process that started it.
-
-An interrupted or failed installation leaves its directory and `installed: false` for diagnosis. It is never silently overwritten. To retry, ensure no installer/VM is running, move that incomplete directory aside, then create the VM again. There is deliberately no destructive VM-delete command yet.
-
-## Host control (no guest helper)
-
-`terminal-mac create NAME --host-control` (or `up NAME --host-control`, or `control NAME --host` on a stopped VM) drives the guest from the VM process instead of the guest helper. Screenshots, frames and input go through the VM's own display, so nothing is installed in the guest, no guest permissions are needed, and agents can operate the login window and Setup Assistant. The MCP tools, `action` and `view` work unchanged.
-
-It uses Virtualization's built-in VNC server, which is **private Apple API** (the same one `tart --vnc-experimental` uses): a future macOS may remove or change it. `terminal-mac doctor` reports `hostControlAvailable`, and `control NAME --guest` switches back. The VNC server gets a random password per boot, known only to the VM process; host control attaches no shared folders to the guest. Typed text is sent as X11 keysyms and Command as Super, so non-US guest keyboard layouts and some shortcuts may behave differently than with the helper.
-
-`stop NAME` now waits up to `--timeout` seconds (default 60) for the guest to shut down and fails with a hint when it does not, for example when the guest shows a confirmation dialog.
-
-## Isolation model
-
-- Host input and screen APIs are not used for agent actions. The helper refuses to run unless `hw.model` starts with `VirtualMac`. That check prevents accidental host execution; it is not hardware attestation or a defense against a compromised host.
-- The guest sees two explicit shares: `control` (read/write, containing request/reply JSON and screenshots) and `tools` (read-only helper app). Host home, project folders, clipboard, microphone, and camera are not attached.
-- There is no remote-control network listener. The flat mailbox pins its directory, rejects symlinks, hardlinks and nonregular files on reads, bounds message sizes, checks request IDs, and expires pending actions. The host never executes guest-provided content.
-- Default NAT networking permits guest internet access and may reach services on the host or local network. This is **not** a network-isolated or hardened hostile-code environment. `--offline` removes that network path.
-- A logged-out/locked guest, missing helper, denied guest permissions, or paused VM prevents normal computer use. TCC grants are interactive guest setup, not bypassed by the CLI.
-
-VM cloning, rollback checkpoints, accessibility snapshots, fully unattended guest setup, terminal splits and tmux transport remain future work. The native Virtualization framework does not itself render a Mac into a terminal or offer an agent input API; this project supplies the guest transport and terminal presentation layers.
-
-## Development and validation
-
-```sh
-CLANG_MODULE_CACHE_PATH=/tmp/terminal-mac-modules \
-SWIFTPM_MODULECACHE_OVERRIDE=/tmp/terminal-mac-modules \
-swift test --disable-sandbox --scratch-path /tmp/terminal-mac-build \
-  --cache-path /tmp/terminal-mac-cache \
-  --config-path /tmp/terminal-mac-config --security-path /tmp/terminal-mac-security
-```
-
-Tests cover mailbox round trips, expiry and cleanup, file-boundary defenses, name/option validation, fragmented UTF-8 and terminal input sequences. These are automated protocol checks, not evidence that a guest was installed, booted, granted permissions, or controlled successfully. See [docs/VALIDATION.md](docs/VALIDATION.md) for recorded results and the live checklist.
-
-References: [terminal-browser](https://terminal-browser.com/), [Apple's macOS virtualization sample](https://developer.apple.com/documentation/virtualization/running-macos-in-a-virtual-machine-on-apple-silicon), [VZVirtualMachineView](https://developer.apple.com/documentation/virtualization/vzvirtualmachineview), [ScreenCaptureKit](https://developer.apple.com/documentation/screencapturekit).
-
-## Sponsor
-
-terminal-mac is free and maintained in my own time. [Sponsoring](https://github.com/sponsors/govijr) keeps it that way.
+MIT: see [LICENSE](LICENSE).

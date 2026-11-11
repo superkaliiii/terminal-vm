@@ -9,7 +9,7 @@ CLASS=TerminalVm                                # its Homebrew formula class
 FILE=terminal_vm.py
 SKILL=skills/terminal-vm/SKILL.md
 SUMMARY="A separate desktop VM for computer-use agents, viewed and driven from a terminal (CLI + MCP server)"
-HOMEPAGE=https://github.com/superkaliiii/terminal-mac-inspection/tree/unified/terminal-vm
+HOMEPAGE=https://github.com/superkaliiii/terminal-vm
 LICENSE_ID=MIT
 DEB_DEPENDS="python3 (>= 3.8), qemu-system-x86, qemu-utils"
 DEB_RECOMMENDS="openssl"

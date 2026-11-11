@@ -1,13 +1,13 @@
 # terminal-vm installer for Windows: the tool, what it needs (Python, QEMU, the Windows Hypervisor Platform) after one
 # confirmation, the command on the PATH, and Claude Code's MCP server and skill when Claude Code is there.
-#   irm https://raw.githubusercontent.com/superkaliiii/terminal-mac-inspection/unified/terminal-vm/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/superkaliiii/terminal-vm/main/terminal-vm/install.ps1 | iex
 #   powershell -ExecutionPolicy Bypass -File install.ps1 [-Yes] [-NoDeps] [-NoMcp] [-Update] [-Uninstall]
 # Through irm | iex options cannot be passed: set TERMINAL_VM_INSTALL="-Yes -NoMcp" (for example) first.
 param([switch]$Yes, [switch]$NoDeps, [switch]$NoMcp, [switch]$Update, [switch]$Uninstall)
 $Tool = "terminal-vm"
 $File = "terminal_vm.py"
 $Skill = "skills\terminal-vm\SKILL.md"
-$Archive = if ($env:TERMINAL_VM_ARCHIVE) { $env:TERMINAL_VM_ARCHIVE } else { "https://github.com/superkaliiii/terminal-mac-inspection/archive/refs/heads/unified.zip" }
+$Archive = if ($env:TERMINAL_VM_ARCHIVE) { $env:TERMINAL_VM_ARCHIVE } else { "https://github.com/superkaliiii/terminal-vm/archive/refs/heads/main.zip" }
 $SubDir = "terminal-vm"
 $PyMin = 8
 $WinPython = $true  # it runs on Windows itself
